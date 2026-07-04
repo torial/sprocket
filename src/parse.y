@@ -277,6 +277,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
   QUERY KEY OF OFFSET PRAGMA RAISE RECURSIVE RELEASE REPLACE RESTRICT ROW ROWS
   ROLLBACK SAVEPOINT TEMP TRIGGER VACUUM VIEW VIRTUAL WITH WITHOUT
   NULLS FIRST LAST
+  CALL PROCEDURE
 %ifdef SQLITE_OMIT_COMPOUND_SELECT
   EXCEPT INTERSECT UNION
 %endif SQLITE_OMIT_COMPOUND_SELECT
@@ -1845,6 +1846,73 @@ cmd ::= DROP TRIGGER ifexists(NOERR) fullname(X). {
   sqlite3DropTrigger(pParse,X,NOERR);
 }
 %endif  !SQLITE_OMIT_TRIGGER
+
+/////////////////////// The CREATE PROCEDURE command //////////////////////////
+// Stored procedures (fork extension).  The body reuses the trigger_cmd_list
+// machinery: a procedure body is a list of INSERT/UPDATE/DELETE/SELECT
+// statements represented as TriggerStep objects.  PSM control-flow statements
+// are added to this nonterminal family in a later phase.
+//
+%ifndef SQLITE_OMIT_PROCEDURE
+
+cmd ::= createkw temp(T) PROCEDURE ifnotexists(NOERR) nm(B) dbnm(Z)
+        LP procparams(P) RP BEGIN proc_cmd_list(S) END(E). {
+  Token all;
+  all.z = (Z.n==0 ? B.z : Z.z);
+  all.n = (int)(E.z - all.z) + E.n;
+  sqlite3FinishProc(pParse, &B, &Z, P, S, T, NOERR, &all);
+#ifdef SQLITE_DEBUG
+  assert( pParse->isCreate ); /* Set by createkw reduce action */
+  pParse->isCreate = 0;       /* But, should not be set for CREATE PROCEDURE */
+#endif
+}
+
+// A procedure body statement is anything a trigger body accepts, plus
+// the CALL statement (procedures may invoke other procedures).
+//
+%type proc_cmd_list {TriggerStep*}
+%destructor proc_cmd_list {sqlite3DeleteTriggerStep(pParse->db, $$);}
+proc_cmd_list(A) ::= proc_cmd_list(A) proc_cmd(X) SEMI. {
+  A->pLast->pNext = X;
+  A->pLast = X;
+}
+proc_cmd_list(A) ::= proc_cmd(A) SEMI. {
+  A->pLast = A;
+}
+
+%type proc_cmd {TriggerStep*}
+%destructor proc_cmd {sqlite3DeleteTriggerStep(pParse->db, $$);}
+proc_cmd(A) ::= trigger_cmd(A).
+proc_cmd(A) ::= CALL fullname(X) LP exprlist(Y) RP. {
+  A = sqlite3ProcCallStep(pParse, X, Y);
+}
+proc_cmd(A) ::= CALL fullname(X). {
+  A = sqlite3ProcCallStep(pParse, X, 0);
+}
+
+%type procparams {ProcParamList*}
+%destructor procparams {sqlite3ProcParamListDelete(pParse->db, $$);}
+procparams(A) ::= .  {A = 0;}
+procparams(A) ::= nm(X) typetoken(Y). {
+  A = sqlite3ProcParamAppend(pParse, 0, &X, &Y);
+}
+procparams(A) ::= procparams(A) COMMA nm(X) typetoken(Y). {
+  A = sqlite3ProcParamAppend(pParse, A, &X, &Y);
+}
+
+//////////////////////// DROP PROCEDURE statement /////////////////////////////
+cmd ::= DROP PROCEDURE ifexists(NOERR) fullname(X). {
+  sqlite3DropProc(pParse, X, NOERR);
+}
+
+///////////////////////////// The CALL statement //////////////////////////////
+cmd ::= CALL fullname(X) LP exprlist(Y) RP. {
+  sqlite3CallProc(pParse, X, Y);
+}
+cmd ::= CALL fullname(X). {
+  sqlite3CallProc(pParse, X, 0);
+}
+%endif  !SQLITE_OMIT_PROCEDURE
 
 //////////////////////// ATTACH DATABASE file AS name /////////////////////////
 %ifndef SQLITE_OMIT_ATTACH

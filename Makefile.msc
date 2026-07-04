@@ -1295,7 +1295,7 @@ LIBOBJS0 = vdbe.lo parse.lo alter.lo analyze.lo attach.lo auth.lo \
          memdb.lo memjournal.lo \
          mutex.lo mutex_noop.lo mutex_unix.lo mutex_w32.lo \
          notify.lo opcodes.lo os.lo os_kv.lo os_unix.lo os_win.lo \
-         pager.lo pcache.lo pcache1.lo pragma.lo prepare.lo printf.lo \
+         pager.lo pcache.lo pcache1.lo pragma.lo prepare.lo printf.lo proc.lo \
          random.lo resolve.lo rowset.lo rtree.lo \
          sqlite3session.lo select.lo sqlite3rbu.lo status.lo stmt.lo \
          table.lo threads.lo tokenize.lo treeview.lo trigger.lo \
@@ -1389,6 +1389,7 @@ SRC01 = \
   $(TOP)\src\pragma.c \
   $(TOP)\src\prepare.c \
   $(TOP)\src\printf.c \
+  $(TOP)\src\proc.c \
   $(TOP)\src\random.c \
   $(TOP)\src\resolve.c \
   $(TOP)\src\rowset.c \
@@ -2185,6 +2186,9 @@ prepare.lo:	$(TOP)\src\prepare.c $(HDR)
 
 printf.lo:	$(TOP)\src\printf.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\printf.c
+
+proc.lo:	$(TOP)\src\proc.c $(HDR)
+	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\proc.c
 
 random.lo:	$(TOP)\src\random.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\random.c

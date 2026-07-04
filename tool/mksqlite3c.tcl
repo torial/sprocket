@@ -451,6 +451,7 @@ set flist {
    loadext.c
    pragma.c
    prepare.c
+   proc.c
    select.c
    table.c
    trigger.c

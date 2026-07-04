@@ -1375,6 +1375,9 @@ typedef struct Subquery Subquery;
 typedef struct SrcItem SrcItem;
 typedef struct SrcList SrcList;
 typedef struct sqlite3_str StrAccum; /* Internal alias for sqlite3_str */
+typedef struct Proc Proc;
+typedef struct ProcParam ProcParam;
+typedef struct ProcParamList ProcParamList;
 typedef struct Table Table;
 typedef struct TableLock TableLock;
 typedef struct Token Token;
@@ -1509,6 +1512,7 @@ struct Schema {
   Hash tblHash;        /* All tables indexed by name */
   Hash idxHash;        /* All (named) indices indexed by name */
   Hash trigHash;       /* All triggers indexed by name */
+  Hash procHash;       /* All stored procedures indexed by name */
   Hash fkeyHash;       /* All foreign keys by referenced table name */
   Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
   u8 file_format;      /* Schema format version for this file */
@@ -3810,6 +3814,26 @@ struct TriggerPrg {
   u32 aColmask[2];        /* Masks of old.*, new.* columns accessed */
 };
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/*
+** One instance of this structure is created for each stored procedure
+** whose body is compiled while coding a CALL statement.  All such
+** objects are stored in the linked list headed at Parse.pProcPrg (on
+** the toplevel Parse) and deleted once statement compilation completes.
+** The list is what makes recursive and mutually-recursive CALLs
+** compile: an entry is linked in *before* its body is coded, so a
+** recursive reference finds the (in-progress) SubProgram instead of
+** recursing forever.
+*/
+typedef struct ProcPrg ProcPrg;
+struct ProcPrg {
+  Proc *pProc;            /* Procedure this program was coded from */
+  ProcPrg *pNext;         /* Next entry in Parse.pProcPrg list */
+  SubProgram *pProgram;   /* Program implementing the procedure body */
+  int nResCol;            /* Result columns, or -1 if no result rows */
+};
+#endif
+
 /*
 ** The yDbMask datatype for the bitmask of all attached databases.
 */
@@ -3941,6 +3965,11 @@ struct Parse {
   Parse *pToplevel;    /* Parse structure for main program (or NULL) */
   Table *pTriggerTab;  /* Table triggers are being coded for */
   TriggerPrg *pTriggerPrg;  /* Linked list of coded triggers */
+#ifndef SQLITE_OMIT_PROCEDURE
+  ProcPrg *pProcPrg;   /* Linked list of coded procedure bodies */
+  Proc *pProcCoding;   /* Procedure whose body is being coded, if any */
+  int iProcParamBase;  /* First mem cell holding procedure parameters */
+#endif
   ParseCleanup *pCleanup;   /* List of cleanup operations to run after parse */
 
   /**************************************************************************
@@ -4180,6 +4209,41 @@ struct TriggerStep {
   char *zSpan;         /* Original SQL text of this command */
   TriggerStep *pNext;  /* Next in the link-list */
   TriggerStep *pLast;  /* Last element in link-list. Valid for 1st elem only */
+};
+
+/*
+** Stored procedures (fork extension).  Procedure bodies are represented
+** as TriggerStep lists so that the trigger fixer/codegen machinery can be
+** reused.  Stored procedures require the trigger machinery; omitting
+** triggers omits procedures.
+*/
+#if defined(SQLITE_OMIT_TRIGGER) && !defined(SQLITE_OMIT_PROCEDURE)
+# define SQLITE_OMIT_PROCEDURE 1
+#endif
+
+/* One declared parameter of a stored procedure */
+struct ProcParam {
+  char *zName;          /* Parameter name */
+  char *zType;          /* Declared type, or NULL if none given */
+};
+
+/* The parameter list of a stored procedure */
+struct ProcParamList {
+  int nParam;           /* Number of parameters */
+  ProcParam *a;         /* Array of parameters */
+};
+
+/*
+** Each stored procedure is an instance of the following structure, stored
+** in the Schema.procHash hash table and persisted as a 'proc' row in the
+** sqlite_schema table.  The compiled-SubProgram cache (Proc.pCompiled) is
+** added in a later phase.
+*/
+struct Proc {
+  char *zName;              /* Name of the procedure */
+  ProcParamList *pParams;   /* Declared parameters, or NULL if none */
+  TriggerStep *pBody;       /* Linked list of body statements */
+  Schema *pSchema;          /* Schema containing the procedure */
 };
 
 /*
@@ -5284,6 +5348,23 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
 # define sqlite3ParseToplevel(p) p
 # define sqlite3IsToplevel(p) 1
 # define sqlite3TriggerColmask(A,B,C,D,E,F,G) 0
+#endif
+
+#ifndef SQLITE_OMIT_PROCEDURE
+  void sqlite3FinishProc(Parse*,Token*,Token*,ProcParamList*,TriggerStep*,
+                         int,int,Token*);
+  void sqlite3DropProc(Parse*, SrcList*, int);
+  void sqlite3CallProc(Parse*, SrcList*, ExprList*);
+  void sqlite3DeleteProc(sqlite3*, Proc*);
+  void sqlite3UnlinkAndDeleteProc(sqlite3*, int, const char*);
+  ProcParamList *sqlite3ProcParamAppend(Parse*,ProcParamList*,Token*,Token*);
+  void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
+  Proc *sqlite3FindProc(Parse*, const char*, const char*);
+  TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
+  void sqlite3VdbeTransferColumnNames(Vdbe*, Vdbe*, int);
+#else
+# define sqlite3DeleteProc(A,B)
+# define sqlite3UnlinkAndDeleteProc(A,B,C)
 #endif
 
 int sqlite3JoinType(Parse*, Token*, Token*, Token*);

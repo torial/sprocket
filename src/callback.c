@@ -509,6 +509,16 @@ void sqlite3SchemaClear(void *p){
   }
 
   sqlite3HashClear(&temp2);
+#ifndef SQLITE_OMIT_PROCEDURE
+  {
+    Hash tempProc = pSchema->procHash;
+    sqlite3HashInit(&pSchema->procHash);
+    for(pElem=sqliteHashFirst(&tempProc); pElem; pElem=sqliteHashNext(pElem)){
+      sqlite3DeleteProc(&xdb, (Proc*)sqliteHashData(pElem));
+    }
+    sqlite3HashClear(&tempProc);
+  }
+#endif
   sqlite3HashInit(&pSchema->tblHash);
   for(pElem=sqliteHashFirst(&temp1); pElem; pElem=sqliteHashNext(pElem)){
     Table *pTab = sqliteHashData(pElem);
@@ -540,6 +550,7 @@ Schema *sqlite3SchemaGet(sqlite3 *db, Btree *pBt){
     sqlite3HashInit(&p->tblHash);
     sqlite3HashInit(&p->idxHash);
     sqlite3HashInit(&p->trigHash);
+    sqlite3HashInit(&p->procHash);
     sqlite3HashInit(&p->fkeyHash);
     p->enc = SQLITE_UTF8;
   }

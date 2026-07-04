@@ -749,6 +749,33 @@ static int lookupName(
     }
   }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+  /* If an unqualified name matches no column and this expression is being
+  ** resolved inside a stored-procedure body, check the procedure's
+  ** parameters.  Parameters resolve to fixed memory cells (TK_REGISTER).
+  ** Columns deliberately shadow parameters: this branch runs only after
+  ** every column lookup has failed.  */
+  if( cnt==0 && zTab==0 && pParse->pProcCoding ){
+    ProcParamList *pPL = pParse->pProcCoding->pParams;
+    if( pPL ){
+      int iP;
+      for(iP=0; iP<pPL->nParam; iP++){
+        if( sqlite3StrICmp(pPL->a[iP].zName, zCol)==0 ) break;
+      }
+      if( iP<pPL->nParam ){
+        cnt = 1;
+        pNC = pTopNC;  /* Attribute the match to the innermost context so
+                       ** the nRef bookkeeping at lookupname_end terminates */
+        pExpr->iTable = pParse->iProcParamBase + iP;
+        pExpr->iColumn = -1;
+        memset(&pExpr->y, 0, sizeof(pExpr->y));
+        pExpr->op2 = TK_ID;
+        eNewExprOp = TK_REGISTER;
+      }
+    }
+  }
+#endif
+
   /*
   ** cnt==0 means there was not match.
   ** cnt>1 means there were two or more matches.

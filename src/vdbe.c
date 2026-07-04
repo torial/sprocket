@@ -7239,6 +7239,22 @@ case OP_DropTrigger: {
   break;
 }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/* Opcode: DropProc P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the stored procedure named P4 in database P1.  This is called after
+** the corresponding 'proc' row has been deleted from the sqlite_schema
+** table in order to keep the internal representation of the schema
+** consistent with what is on disk.
+*/
+case OP_DropProc: {
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  sqlite3UnlinkAndDeleteProc(db, pOp->p1, pOp->p4.z);
+  break;
+}
+#endif
+
 
 #ifndef SQLITE_OMIT_INTEGRITY_CHECK
 /* Opcode: IntegrityCk P1 P2 P3 P4 P5

@@ -164,6 +164,11 @@ struct Keyword {
 #else
 #  define RETURNING  0x00400000
 #endif
+#ifdef SQLITE_OMIT_PROCEDURE
+#  define PROCEDURE  0
+#else
+#  define PROCEDURE  0x01000000
+#endif
 #ifndef SQLITE_ENABLE_ORDERED_SET_AGGREGATES
 #  define ORDERSET   0
 #else
@@ -192,6 +197,7 @@ static Keyword aKeywordTable[] = {
   { "BEGIN",            "TK_BEGIN",        ALWAYS,           1      },
   { "BETWEEN",          "TK_BETWEEN",      ALWAYS,           5      },
   { "BY",               "TK_BY",           ALWAYS,           10     },
+  { "CALL",             "TK_CALL",         PROCEDURE,        1      },
   { "CASCADE",          "TK_CASCADE",      FKEY,             1      },
   { "CASE",             "TK_CASE",         ALWAYS,           5      },
   { "CAST",             "TK_CAST",         CAST,             5      },
@@ -281,6 +287,7 @@ static Keyword aKeywordTable[] = {
   { "PRAGMA",           "TK_PRAGMA",       PRAGMA,           0      },
   { "PRECEDING",        "TK_PRECEDING",    WINDOWFUNC,       3      },
   { "PRIMARY",          "TK_PRIMARY",      ALWAYS,           1      },
+  { "PROCEDURE",        "TK_PROCEDURE",    PROCEDURE,        1      },
   { "QUERY",            "TK_QUERY",        EXPLAIN,          0      },
   { "RAISE",            "TK_RAISE",        TRIGGER,          1      },
   { "RANGE",            "TK_RANGE",        WINDOWFUNC,       3      },

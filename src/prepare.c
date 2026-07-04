@@ -828,6 +828,15 @@ static int sqlite3Prepare(
     sqlite3DbFree(db, pT);
   }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+  /* Delete any ProcPrg structures allocated while parsing this statement. */
+  while( sParse.pProcPrg ){
+    ProcPrg *pP = sParse.pProcPrg;
+    sParse.pProcPrg = pP->pNext;
+    sqlite3DbFree(db, pP);
+  }
+#endif
+
 end_prepare:
 
   sqlite3ParseObjectReset(&sParse);

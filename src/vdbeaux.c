@@ -2910,6 +2910,37 @@ int sqlite3VdbeSetColName(
   return rc;
 }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/*
+** Copy the result-column count and column names from pFrom to pTo.
+**
+** This is used when coding a CALL statement: the column names of the
+** procedure's result SELECT are established on the temporary Vdbe used
+** to compile the body sub-program, then transferred to the Vdbe of the
+** CALL statement itself so that sqlite3_column_count() and
+** sqlite3_column_name() report them.
+*/
+void sqlite3VdbeTransferColumnNames(Vdbe *pTo, Vdbe *pFrom, int nCol){
+  int i;
+  int bNamed = (pFrom->nResColumn==nCol && pFrom->aColName!=0);
+  sqlite3VdbeSetNumCols(pTo, nCol);
+  for(i=0; i<nCol; i++){
+    const char *z = 0;
+    if( bNamed ){
+      z = (const char*)sqlite3_value_text(&pFrom->aColName[i]);
+    }
+    if( z ){
+      sqlite3VdbeSetColName(pTo, i, COLNAME_NAME, z, SQLITE_TRANSIENT);
+    }else{
+      /* Rows produced by a nested CALL only: no names were established
+      ** on the sub-program Vdbe, so synthesize positional ones. */
+      char *zGen = sqlite3MPrintf(pTo->db, "column%d", i+1);
+      sqlite3VdbeSetColName(pTo, i, COLNAME_NAME, zGen, SQLITE_DYNAMIC);
+    }
+  }
+}
+#endif /* !defined(SQLITE_OMIT_PROCEDURE) */
+
 /*
 ** A read or write transaction may or may not be active on database handle
 ** db. If a transaction is active, commit it. If there is a

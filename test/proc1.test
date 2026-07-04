@@ -1,0 +1,194 @@
+# 2026-07-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Test cases for stored procedures (fork extension): CREATE PROCEDURE,
+# DROP PROCEDURE, and CALL name resolution.  Execution of procedure
+# bodies is tested in proc2.test.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc1
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+# 1.x: CREATE PROCEDURE DDL and sqlite_schema round-trip
+#
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER, b TEXT);
+  CREATE PROCEDURE p1(uid INTEGER, label TEXT)
+  BEGIN
+    INSERT INTO t1 VALUES(uid, label);
+    SELECT * FROM t1;
+  END;
+  SELECT type, name, tbl_name, rootpage FROM sqlite_schema WHERE type='proc';
+} {proc p1 {} 0}
+
+do_execsql_test 1.1 {
+  SELECT sql FROM sqlite_schema WHERE name='p1';
+} {{CREATE PROCEDURE p1(uid INTEGER, label TEXT)
+  BEGIN
+    INSERT INTO t1 VALUES(uid, label);
+    SELECT * FROM t1;
+  END}}
+
+do_catchsql_test 1.2 {
+  CREATE PROCEDURE p1(x) BEGIN SELECT 1; END;
+} {1 {procedure p1 already exists}}
+
+do_execsql_test 1.3 {
+  CREATE PROCEDURE IF NOT EXISTS p1(x) BEGIN SELECT 1; END;
+  SELECT count(*) FROM sqlite_schema WHERE type='proc';
+} {1}
+
+do_execsql_test 1.4 {
+  CREATE PROCEDURE p2() BEGIN SELECT 1; END;
+  CREATE PROCEDURE p3(a INTEGER, b2 VARCHAR(10), c) BEGIN SELECT 1; END;
+  SELECT name FROM sqlite_schema WHERE type='proc' ORDER BY name;
+} {p1 p2 p3}
+
+do_catchsql_test 1.5 {
+  CREATE PROCEDURE pdup(a, B TEXT, A INTEGER) BEGIN SELECT 1; END;
+} {1 {duplicate parameter name: A}}
+
+do_catchsql_test 1.6 {
+  CREATE PROCEDURE sqlite_p(a) BEGIN SELECT 1; END;
+} {1 {object name reserved for internal use: sqlite_p}}
+
+# 2.x: CALL name resolution and argument-count checking.  Execution is
+# phase 2; for now a resolved CALL reports "not yet implemented".
+#
+do_catchsql_test 2.0 {
+  CALL nosuch(1);
+} {1 {no such procedure: nosuch}}
+
+do_catchsql_test 2.1 {
+  CALL p1(1);
+} {1 {procedure p1 expects 2 arguments but 1 was supplied}}
+
+do_catchsql_test 2.2 {
+  CALL p2(1);
+} {1 {procedure p2 expects 0 arguments but 1 was supplied}}
+
+do_execsql_test 2.3 {
+  CALL p1(1, 'one');
+} {1 one}
+
+do_execsql_test 2.4 {
+  CALL p2();
+} {1}
+
+# CALL without parentheses is accepted for zero-argument procedures
+do_execsql_test 2.5 {
+  CALL p2;
+} {1}
+
+do_execsql_test 2.6 {
+  DELETE FROM t1;
+} {}
+
+# 3.x: PROCEDURE and CALL remain non-reserved keywords
+#
+do_execsql_test 3.0 {
+  CREATE TABLE call(procedure TEXT);
+  INSERT INTO call VALUES('ok');
+  SELECT procedure FROM call;
+} {ok}
+
+do_execsql_test 3.1 {
+  DROP TABLE call;
+} {}
+
+# 4.x: DROP PROCEDURE
+#
+do_execsql_test 4.0 {
+  DROP PROCEDURE p3;
+  SELECT name FROM sqlite_schema WHERE type='proc' ORDER BY name;
+} {p1 p2}
+
+do_catchsql_test 4.1 {
+  DROP PROCEDURE nosuch;
+} {1 {no such procedure: nosuch}}
+
+do_execsql_test 4.2 {
+  DROP PROCEDURE IF EXISTS nosuch;
+} {}
+
+# 5.x: persistence across close/reopen (schema reload path)
+#
+db close
+sqlite3 db test.db
+
+do_execsql_test 5.0 {
+  SELECT name FROM sqlite_schema WHERE type='proc' ORDER BY name;
+} {p1 p2}
+
+do_catchsql_test 5.1 {
+  CALL p1(1);
+} {1 {procedure p1 expects 2 arguments but 1 was supplied}}
+
+do_execsql_test 5.2 {
+  DROP PROCEDURE p2;
+  SELECT name FROM sqlite_schema WHERE type='proc' ORDER BY name;
+} {p1}
+
+# 6.x: TEMP procedures
+#
+do_execsql_test 6.0 {
+  CREATE TEMP PROCEDURE tp1(x) BEGIN SELECT x; END;
+  SELECT name FROM sqlite_temp_schema WHERE type='proc';
+} {tp1}
+
+do_catchsql_test 6.1 {
+  CREATE TEMP PROCEDURE main.tp2(x) BEGIN SELECT 1; END;
+} {1 {temporary procedure may not have qualified name}}
+
+# TEMP procedure shadows a same-named persistent one (TEMP searched first)
+do_execsql_test 6.2 {
+  CREATE TEMP PROCEDURE p1() BEGIN SELECT 'temp one'; END;
+  SELECT count(*) FROM sqlite_temp_schema WHERE type='proc' AND name='p1';
+} {1}
+do_catchsql_test 6.3 {
+  CALL p1(1);
+} {1 {procedure p1 expects 0 arguments but 1 was supplied}}
+do_execsql_test 6.4 {
+  DROP PROCEDURE p1;
+  SELECT count(*) FROM sqlite_temp_schema WHERE type='proc' AND name='p1';
+} {0}
+do_catchsql_test 6.5 {
+  CALL p1(1);
+} {1 {procedure p1 expects 2 arguments but 1 was supplied}}
+
+# 7.x: procedures in ATTACH-ed databases
+#
+forcedelete test2.db
+do_execsql_test 7.0 {
+  ATTACH 'test2.db' AS aux;
+  CREATE PROCEDURE aux.ap1(x) BEGIN SELECT x; END;
+  SELECT name FROM aux.sqlite_schema WHERE type='proc';
+} {ap1}
+
+do_catchsql_test 7.1 {
+  CALL aux.ap1(1, 2);
+} {1 {procedure ap1 expects 1 argument but 2 were supplied}}
+
+do_catchsql_test 7.2 {
+  CALL main.ap1(1);
+} {1 {no such procedure: main.ap1}}
+
+do_execsql_test 7.3 {
+  DROP PROCEDURE aux.ap1;
+  SELECT count(*) FROM aux.sqlite_schema WHERE type='proc';
+} {0}
+
+finish_test

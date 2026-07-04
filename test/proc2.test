@@ -1,0 +1,247 @@
+# 2026-07-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Test cases for stored procedure execution: CALL with parameters,
+# result-set streaming, multi-statement bodies, atomicity, and
+# recursion.  DDL and name resolution are covered by proc1.test.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc2
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+# 1.x: basic execution -- writes, parameters, result sets
+#
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER, b TEXT);
+  CREATE PROCEDURE ins1(x INTEGER, y TEXT)
+  BEGIN
+    INSERT INTO t1 VALUES(x, y);
+  END;
+  CALL ins1(1, 'one');
+  CALL ins1(2, 'two');
+  SELECT * FROM t1 ORDER BY a;
+} {1 one 2 two}
+
+# A procedure with no SELECT returns no rows
+do_execsql_test 1.1 {
+  CALL ins1(3, 'three');
+} {}
+
+# Bare SELECTs stream rows; parameters work in expressions
+do_execsql_test 1.2 {
+  CREATE PROCEDURE topn(n INTEGER)
+  BEGIN
+    SELECT a, b FROM t1 ORDER BY a DESC LIMIT n;
+  END;
+  CALL topn(2);
+} {3 three 2 two}
+
+do_execsql_test 1.3 {
+  CALL topn(1+1-1);
+} {3 three}
+
+# Column names come from the procedure's SELECT
+do_test 1.4 {
+  db eval {CALL topn(1)} val break
+  set val(*)
+} {a b}
+
+# Multiple row-producing SELECTs stream in sequence
+do_execsql_test 1.5 {
+  CREATE PROCEDURE both()
+  BEGIN
+    SELECT min(a), 'min' FROM t1;
+    SELECT max(a), 'max' FROM t1;
+  END;
+  CALL both();
+} {1 min 3 max}
+
+# Mismatched result shapes are an error at prepare time
+do_execsql_test 1.6 {
+  CREATE PROCEDURE misshape()
+  BEGIN
+    SELECT a FROM t1;
+    SELECT a, b FROM t1;
+  END;
+} {}
+do_catchsql_test 1.7 {
+  CALL misshape();
+} {1 {all row-producing SELECT statements in procedure misshape must have the same number of result columns}}
+
+# Parameter values of every type round-trip
+do_execsql_test 1.8 {
+  CREATE PROCEDURE echo3(x, y, z)
+  BEGIN
+    SELECT typeof(x), y, hex(z);
+  END;
+  CALL echo3(NULL, 2.5, x'abcd');
+} {null 2.5 ABCD}
+
+do_execsql_test 1.9 {
+  CALL echo3('a''b', -1, x'ff00');
+} {text -1 FF00}
+
+# 2.x: parameters vs columns -- columns win inside FROM contexts
+#
+do_execsql_test 2.0 {
+  CREATE TABLE shadow(x INTEGER);
+  INSERT INTO shadow VALUES(99);
+  CREATE PROCEDURE shady(x INTEGER)
+  BEGIN
+    SELECT x FROM shadow;   -- column x, not param x
+    SELECT x;               -- param x (no row context)
+  END;
+  CALL shady(7);
+} {99 7}
+
+# 3.x: atomicity -- a failure part-way through the body undoes the
+# whole CALL
+#
+do_execsql_test 3.0 {
+  CREATE TABLE t3(a INTEGER PRIMARY KEY);
+  INSERT INTO t3 VALUES(10);
+  CREATE PROCEDURE burn2(v1 INTEGER, v2 INTEGER)
+  BEGIN
+    INSERT INTO t3 VALUES(v1);
+    INSERT INTO t3 VALUES(v2);
+  END;
+} {}
+do_catchsql_test 3.1 {
+  CALL burn2(11, 10);
+} {1 {UNIQUE constraint failed: t3.a}}
+do_execsql_test 3.2 {
+  SELECT * FROM t3 ORDER BY a;
+} {10}
+do_execsql_test 3.3 {
+  BEGIN;
+  INSERT INTO t3 VALUES(20);
+} {}
+do_catchsql_test 3.4 {
+  CALL burn2(21, 20);
+} {1 {UNIQUE constraint failed: t3.a}}
+do_execsql_test 3.5 {
+  COMMIT;
+  SELECT * FROM t3 ORDER BY a;
+} {10 20}
+
+# 4.x: procedures calling procedures
+#
+do_execsql_test 4.0 {
+  CREATE PROCEDURE inner1(v INTEGER)
+  BEGIN
+    INSERT INTO t1 VALUES(v, 'from inner');
+  END;
+  CREATE PROCEDURE outer1(v INTEGER)
+  BEGIN
+    CALL inner1(v);
+    CALL inner1(v+1);
+  END;
+  DELETE FROM t1;
+  CALL outer1(100);
+  SELECT * FROM t1 ORDER BY a;
+} {100 {from inner} 101 {from inner}}
+
+# Unbounded recursion hits the depth limit at runtime
+do_execsql_test 4.1 {
+  CREATE PROCEDURE forever()
+  BEGIN
+    CALL forever();
+  END;
+} {}
+do_catchsql_test 4.2 {
+  CALL forever();
+} {1 {too many levels of trigger recursion}}
+
+# Rows produced only via a nested CALL still stream out, with
+# synthesized column names
+do_execsql_test 4.3 {
+  CREATE PROCEDURE innersel(v INTEGER) BEGIN SELECT v*2, v*3; END;
+  CREATE PROCEDURE outersel(v INTEGER) BEGIN CALL innersel(v); END;
+  CALL outersel(5);
+} {10 15}
+do_test 4.4 {
+  db eval {CALL outersel(1)} val break
+  set val(*)
+} {column1 column2}
+
+# Result-shape mismatch across a CALL boundary is caught at prepare
+do_execsql_test 4.5 {
+  CREATE PROCEDURE outerbad()
+  BEGIN
+    SELECT 1;
+    CALL innersel(2);
+  END;
+} {}
+do_catchsql_test 4.6 {
+  CALL outerbad();
+} {1 {all row-producing SELECT statements in procedure outerbad must have the same number of result columns}}
+
+# 5.x: procedures and transactions/reuse
+#
+# Repeated use of one prepared CALL (no recompilation)
+do_test 5.0 {
+  set res {}
+  db eval {DELETE FROM t1;}
+  for {set i 0} {$i < 3} {incr i} {
+    db eval {CALL ins1($i, 'loop')}
+  }
+  db eval {SELECT count(*) FROM t1} c break
+  set c(count(*))
+} {3}
+
+# CALL inside an explicit transaction sees and keeps its effects
+do_execsql_test 5.1 {
+  BEGIN;
+  CALL ins1(50, 'tx');
+  ROLLBACK;
+  SELECT count(*) FROM t1 WHERE a=50;
+} {0}
+
+# 6.x: schema-cookie invalidation -- dropping and recreating a
+# procedure between CALLs through the same connection works
+#
+do_execsql_test 6.0 {
+  CREATE PROCEDURE swapme()
+  BEGIN
+    SELECT 'first version';
+  END;
+  CALL swapme();
+} {{first version}}
+do_execsql_test 6.1 {
+  DROP PROCEDURE swapme;
+  CREATE PROCEDURE swapme()
+  BEGIN
+    SELECT 'second version';
+  END;
+  CALL swapme();
+} {{second version}}
+
+# Dropping a table used by a procedure: error surfaces at CALL time
+do_execsql_test 6.2 {
+  CREATE TABLE doomed(x);
+  CREATE PROCEDURE usesdoomed()
+  BEGIN
+    SELECT * FROM doomed;
+  END;
+  DROP TABLE doomed;
+} {}
+# (the DbFixer qualifies table references inside stored bodies, hence
+# the schema prefix in the message)
+do_catchsql_test 6.3 {
+  CALL usesdoomed();
+} {1 {no such table: main.doomed}}
+
+finish_test

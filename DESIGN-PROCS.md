@@ -2,7 +2,19 @@
 
 **Fork baseline:** SQLite 3.53.3 (tag `version-3.53.3`, check-in `d4c0e51e4aeb`)
 **Branch:** `stored-procs`
-**Status:** design approved by Sean 2026-07-04; scope decisions recorded below.
+**Status:** design approved by Sean 2026-07-04. Phase 1 (DDL/schema) and phase 2 (CALL
+execution, STREAM verified live) implemented; `veryquick` green at phase 1
+(0/392,805). Phase 3 (PSM control flow) next.
+
+**Deviations from the original design, discovered during implementation:**
+- Body validation (including result-shape checks) happens at first *prepare* of a
+  CALL, not at CREATE PROCEDURE time — consistent with SQLite's trigger philosophy
+  (bodies may reference tables created later). §5's "enforced at CREATE" is dropped.
+- Proc-to-proc CALL landed in phase 2, not phase 3: the `proc_cmd` grammar family
+  (= `trigger_cmd` + CALL) exists from the start, and result shapes merge across
+  CALL boundaries at compile time.
+- The resolver hook (§4) also landed in phase 2 — parameters are variables, and the
+  body can't reference them without it.
 
 ## 1. Goals and non-goals
 
@@ -179,7 +191,9 @@ CALL) — the isolation layer. Existing files touched, kept minimal:
 | `src/prepare.c` | accept `type='proc'` rows in `sqlite3InitCallback` |
 | `src/build.c` | `sqlite3SchemaClear` frees procHash; DROP plumbing hook |
 | `src/resolve.c` | one guarded lookup branch for proc variables |
-| `src/vdbe.c` | expected: none for SPOOL; possibly relax one assert for STREAM |
+| `src/vdbe.c` | `OP_DropProc` opcode; possibly relax one assert for STREAM |
+| `src/complete.c` | `sqlite3_complete()`: `CREATE PROCEDURE` reuses the trigger ";END;" states (found in phase 1: without this, shells split multi-line bodies at the first interior semicolon) |
+| `src/shell.c.in` | `.dump` type whitelist gains `'proc'` (`.schema` needed no change) |
 | `Makefile.msc`, `main.mk`, `Makefile.in`, `tool/mksqlite3c.tcl` | add `proc.c` |
 
 `SQLITE_OMIT_PROCEDURE` compile guard from day one, both as upstream etiquette and as a

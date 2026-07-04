@@ -214,6 +214,19 @@ int sqlite3_complete(const char *zSql){
               }
               break;
             }
+            case 'p': case 'P': {
+#ifndef SQLITE_OMIT_PROCEDURE
+              /* CREATE PROCEDURE bodies end with ";END;" exactly like
+              ** CREATE TRIGGER bodies, so PROCEDURE reuses tkTRIGGER. */
+              if( nId==9 && sqlite3StrNICmp(zSql, "procedure", 9)==0 ){
+                token = tkTRIGGER;
+              }else
+#endif
+              {
+                token = tkOTHER;
+              }
+              break;
+            }
             case 't': case 'T': {
               if( nId==7 && sqlite3StrNICmp(zSql, "trigger", 7)==0 ){
                 token = tkTRIGGER;
