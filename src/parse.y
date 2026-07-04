@@ -277,7 +277,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
   QUERY KEY OF OFFSET PRAGMA RAISE RECURSIVE RELEASE REPLACE RESTRICT ROW ROWS
   ROLLBACK SAVEPOINT TEMP TRIGGER VACUUM VIEW VIRTUAL WITH WITHOUT
   NULLS FIRST LAST
-  CALL PROCEDURE
+  CALL PROCEDURE DECLARE ELSEIF LEAVE LOOP RETURN WHILE
 %ifdef SQLITE_OMIT_COMPOUND_SELECT
   EXCEPT INTERSECT UNION
 %endif SQLITE_OMIT_COMPOUND_SELECT
@@ -1888,6 +1888,49 @@ proc_cmd(A) ::= CALL fullname(X) LP exprlist(Y) RP. {
 }
 proc_cmd(A) ::= CALL fullname(X). {
   A = sqlite3ProcCallStep(pParse, X, 0);
+}
+
+// PSM statements: variables, control flow, and error signalling
+//
+proc_cmd(A) ::= DECLARE nm(X) typetoken(Y). {
+  A = sqlite3ProcDeclareStep(pParse, &X, &Y, 0);
+}
+proc_cmd(A) ::= DECLARE nm(X) typetoken(Y) DEFAULT expr(E). {
+  A = sqlite3ProcDeclareStep(pParse, &X, &Y, E);
+}
+proc_cmd(A) ::= SET nm(X) EQ expr(E). {
+  A = sqlite3ProcSetStep(pParse, &X, E);
+}
+proc_cmd(A) ::= IF expr(C) THEN proc_cmd_list(T) proc_if_tail(E) END IF. {
+  A = sqlite3ProcIfStep(pParse, C, T, E);
+}
+%type proc_if_tail {TriggerStep*}
+%destructor proc_if_tail {sqlite3DeleteTriggerStep(pParse->db, $$);}
+proc_if_tail(A) ::= . {A = 0;}
+proc_if_tail(A) ::= ELSE proc_cmd_list(X). {A = X;}
+proc_if_tail(A) ::= ELSEIF expr(C) THEN proc_cmd_list(T) proc_if_tail(E). {
+  A = sqlite3ProcIfStep(pParse, C, T, E);
+}
+proc_cmd(A) ::= WHILE expr(C) DO proc_cmd_list(B) END WHILE. {
+  A = sqlite3ProcWhileStep(pParse, C, B);
+}
+proc_cmd(A) ::= LOOP proc_cmd_list(B) END LOOP. {
+  A = sqlite3ProcWhileStep(pParse, 0, B);
+}
+proc_cmd(A) ::= LEAVE. {
+  A = sqlite3ProcSimpleStep(pParse, TK_LEAVE);
+}
+proc_cmd(A) ::= RETURN. {
+  A = sqlite3ProcSimpleStep(pParse, TK_RETURN);
+}
+proc_cmd(A) ::= RAISE LP IGNORE RP. {
+  A = sqlite3ProcRaiseStep(pParse, OE_Ignore, 0);
+}
+proc_cmd(A) ::= RAISE LP raisetype(T) COMMA expr(Z) RP. {
+  A = sqlite3ProcRaiseStep(pParse, T, Z);
+}
+proc_cmd(A) ::= scanpt(B) select(X) scanpt(E) INTO idlist(Y). {
+  A = sqlite3ProcSelectIntoStep(pParse, X, Y, B, E);
 }
 
 %type procparams {ProcParamList*}

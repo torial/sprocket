@@ -28,6 +28,11 @@ void sqlite3DeleteTriggerStep(sqlite3 *db, TriggerStep *pTriggerStep){
     sqlite3UpsertDelete(db, pTmp->pUpsert);
     sqlite3SrcListDelete(db, pTmp->pSrc);
     sqlite3DbFree(db, pTmp->zSpan);
+#ifndef SQLITE_OMIT_PROCEDURE
+    sqlite3DbFree(db, pTmp->zVar);
+    sqlite3DeleteTriggerStep(db, pTmp->pThen);
+    sqlite3DeleteTriggerStep(db, pTmp->pElse);
+#endif
 
     sqlite3DbFree(db, pTmp);
   }

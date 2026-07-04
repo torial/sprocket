@@ -6,6 +6,26 @@
 execution, STREAM verified live) implemented; `veryquick` green at phase 1
 (0/392,805). Phase 3 (PSM control flow) next.
 
+**Phase 3 (PSM language) implemented 2026-07-04.** Semantics settled during
+implementation:
+
+- `SELECT ... INTO` is **first-row-wins** (all-NULL when the query returns no rows) —
+  Sean's decision 2026-07-04; MySQL-style multi-row strictness is a phase 4+ option.
+  Compiled as a row-value subquery (`sqlite3CodeSubselect`), which supplies the
+  LIMIT-capping, NULL-init, and column-count checking for free.
+- **`OP_Once` staleness**: uncorrelated subqueries normally compile under `OP_Once`,
+  caching their result for a whole frame invocation — wrong inside WHILE/LOOP bodies.
+  All PSM-managed expressions, and every DML subquery inside a loop, are marked
+  `EP_VarSelect` to force per-iteration evaluation. Known remaining gap: an
+  uncorrelated **FROM-clause subquery** inside a loop body still materializes once
+  per CALL (its caching is not controlled by an Expr flag); rare pattern, documented
+  limitation.
+- `RAISE` is a PSM *statement* compiled directly in proc.c; the expression form of
+  RAISE inside a SELECT remains trigger-only (upstream check untouched).
+- Variables are hoisted to one flat scope per body; declared types are currently
+  documentation (values keep dynamic types). Parameters are assignable locals.
+- `LOOP` is represented as a WHILE step with a NULL condition.
+
 **Deviations from the original design, discovered during implementation:**
 - Body validation (including result-shape checks) happens at first *prepare* of a
   CALL, not at CREATE PROCEDURE time — consistent with SQLite's trigger philosophy

@@ -1,0 +1,345 @@
+# 2026-07-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Test cases for the PSM procedural language inside stored procedure
+# bodies: DECLARE/SET, IF/ELSEIF/ELSE, WHILE, LOOP/LEAVE, SELECT INTO,
+# RETURN, and RAISE.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix psm1
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+# 1.x: DECLARE and SET
+#
+do_execsql_test 1.0 {
+  CREATE PROCEDURE p1()
+  BEGIN
+    DECLARE x INTEGER;
+    SELECT x;              -- NULL before assignment
+  END;
+  CALL p1();
+} {{}}
+
+do_execsql_test 1.1 {
+  CREATE PROCEDURE p2()
+  BEGIN
+    DECLARE x INTEGER DEFAULT 7;
+    DECLARE y TEXT DEFAULT 'hi';
+    DECLARE z;             -- no type, no default
+    SELECT x, y, z;
+  END;
+  CALL p2();
+} {7 hi {}}
+
+do_execsql_test 1.2 {
+  CREATE PROCEDURE p3(a INTEGER)
+  BEGIN
+    DECLARE b INTEGER DEFAULT 10;
+    SET b = b + a;
+    SET a = 0;             -- parameters are assignable locals
+    SELECT a, b;
+  END;
+  CALL p3(5);
+} {0 15}
+
+# SET with a scalar subquery
+do_execsql_test 1.3 {
+  CREATE TABLE t1(v INTEGER);
+  INSERT INTO t1 VALUES(11),(22),(33);
+  CREATE PROCEDURE p4()
+  BEGIN
+    DECLARE m;
+    SET m = (SELECT max(v) FROM t1);
+    SELECT m;
+  END;
+  CALL p4();
+} {33}
+
+do_catchsql_test 1.4 {
+  CREATE PROCEDURE pbad1()
+  BEGIN
+    SET nosuch = 1;
+    SELECT 1;
+  END;
+  CALL pbad1();
+} {1 {no such variable: nosuch}}
+
+do_catchsql_test 1.5 {
+  CREATE PROCEDURE pbad2(x INTEGER)
+  BEGIN
+    DECLARE x TEXT;        -- collides with parameter
+    SELECT 1;
+  END;
+  CALL pbad2(1);
+} {1 {duplicate variable name: x}}
+
+# 2.x: IF / ELSEIF / ELSE
+#
+do_execsql_test 2.0 {
+  CREATE PROCEDURE grade(score INTEGER)
+  BEGIN
+    IF score >= 90 THEN SELECT 'A';
+    ELSEIF score >= 80 THEN SELECT 'B';
+    ELSEIF score >= 70 THEN SELECT 'C';
+    ELSE SELECT 'F';
+    END IF;
+  END;
+  CALL grade(95);
+} {A}
+do_execsql_test 2.1 { CALL grade(85); } {B}
+do_execsql_test 2.2 { CALL grade(71); } {C}
+do_execsql_test 2.3 { CALL grade(10); } {F}
+
+# NULL condition takes the ELSE branch
+do_execsql_test 2.4 { CALL grade(NULL); } {F}
+
+# IF without ELSE, condition false: nothing runs
+do_execsql_test 2.5 {
+  CREATE TABLE log1(m TEXT);
+  CREATE PROCEDURE maybe_log(f INTEGER)
+  BEGIN
+    IF f THEN INSERT INTO log1 VALUES('yes'); END IF;
+  END;
+  CALL maybe_log(0);
+  SELECT count(*) FROM log1;
+} {0}
+do_execsql_test 2.6 {
+  CALL maybe_log(1);
+  SELECT * FROM log1;
+} {yes}
+
+# 3.x: WHILE
+#
+do_execsql_test 3.0 {
+  CREATE PROCEDURE fact(n INTEGER)
+  BEGIN
+    DECLARE r INTEGER DEFAULT 1;
+    DECLARE i INTEGER DEFAULT 1;
+    WHILE i <= n DO
+      SET r = r * i;
+      SET i = i + 1;
+    END WHILE;
+    SELECT r;
+  END;
+  CALL fact(10);
+} {3628800}
+
+do_execsql_test 3.1 { CALL fact(0); } {1}
+
+# WHILE with a subquery condition re-evaluates every iteration
+do_execsql_test 3.2 {
+  CREATE TABLE queue(id INTEGER PRIMARY KEY, done INT DEFAULT 0);
+  INSERT INTO queue(id) VALUES(1),(2),(3);
+  CREATE PROCEDURE drain()
+  BEGIN
+    WHILE EXISTS (SELECT 1 FROM queue WHERE done=0) DO
+      UPDATE queue SET done=1
+       WHERE id=(SELECT min(id) FROM queue WHERE done=0);
+    END WHILE;
+    SELECT count(*) FROM queue WHERE done=1;
+  END;
+  CALL drain();
+} {3}
+
+# 4.x: LOOP and LEAVE
+#
+do_execsql_test 4.0 {
+  CREATE PROCEDURE count5()
+  BEGIN
+    DECLARE i INTEGER DEFAULT 0;
+    LOOP
+      SET i = i + 1;
+      IF i >= 5 THEN LEAVE; END IF;
+    END LOOP;
+    SELECT i;
+  END;
+  CALL count5();
+} {5}
+
+# LEAVE exits only the innermost loop
+do_execsql_test 4.1 {
+  CREATE PROCEDURE nested()
+  BEGIN
+    DECLARE i INTEGER DEFAULT 0;
+    DECLARE total INTEGER DEFAULT 0;
+    WHILE i < 3 DO
+      SET i = i + 1;
+      LOOP
+        SET total = total + 1;
+        LEAVE;
+      END LOOP;
+    END WHILE;
+    SELECT i, total;
+  END;
+  CALL nested();
+} {3 3}
+
+do_catchsql_test 4.2 {
+  CREATE PROCEDURE badleave()
+  BEGIN
+    LEAVE;
+  END;
+  CALL badleave();
+} {1 {LEAVE used outside of a LOOP or WHILE}}
+
+# 5.x: SELECT ... INTO
+#
+do_execsql_test 5.0 {
+  CREATE PROCEDURE stats()
+  BEGIN
+    DECLARE lo INTEGER;
+    DECLARE hi INTEGER;
+    SELECT min(v), max(v) FROM t1 INTO lo, hi;
+    SELECT lo, hi;
+  END;
+  CALL stats();
+} {11 33}
+
+# First row wins when the query returns several
+do_execsql_test 5.1 {
+  CREATE PROCEDURE firstrow()
+  BEGIN
+    DECLARE x INTEGER;
+    SELECT v FROM t1 ORDER BY v DESC INTO x;
+    SELECT x;
+  END;
+  CALL firstrow();
+} {33}
+
+# Empty result: target variables become NULL
+do_execsql_test 5.2 {
+  CREATE PROCEDURE norows()
+  BEGIN
+    DECLARE x INTEGER DEFAULT 99;
+    SELECT v FROM t1 WHERE v > 1000 INTO x;
+    SELECT x;
+  END;
+  CALL norows();
+} {{}}
+
+do_catchsql_test 5.3 {
+  CREATE PROCEDURE badinto()
+  BEGIN
+    DECLARE x;
+    SELECT 1, 2 INTO x;
+  END;
+  CALL badinto();
+} {1 {SELECT INTO has 2 result columns but 1 target variable}}
+
+do_catchsql_test 5.4 {
+  CREATE PROCEDURE badinto2()
+  BEGIN
+    SELECT 1 INTO nosuchvar;
+  END;
+  CALL badinto2();
+} {1 {no such variable: nosuchvar}}
+
+# INTO inside a WHILE re-reads current data each iteration
+do_execsql_test 5.5 {
+  CREATE TABLE accum(n INTEGER);
+  INSERT INTO accum VALUES(0);
+  CREATE PROCEDURE spin()
+  BEGIN
+    DECLARE cur INTEGER DEFAULT 0;
+    WHILE cur < 3 DO
+      UPDATE accum SET n = n + 1;
+      SELECT n FROM accum INTO cur;
+    END WHILE;
+    SELECT cur;
+  END;
+  CALL spin();
+} {3}
+
+# 6.x: RETURN
+#
+do_execsql_test 6.0 {
+  CREATE TABLE log6(m TEXT);
+  CREATE PROCEDURE early(flag INTEGER)
+  BEGIN
+    INSERT INTO log6 VALUES('before');
+    IF flag THEN RETURN; END IF;
+    INSERT INTO log6 VALUES('after');
+  END;
+  CALL early(1);
+  SELECT * FROM log6;
+} {before}
+do_execsql_test 6.1 {
+  DELETE FROM log6;
+  CALL early(0);
+  SELECT * FROM log6 ORDER BY m;
+} {after before}
+
+# 7.x: RAISE
+#
+do_execsql_test 7.0 {
+  CREATE TABLE t7(a INTEGER);
+  CREATE PROCEDURE guarded(v INTEGER)
+  BEGIN
+    INSERT INTO t7 VALUES(v);
+    IF v < 0 THEN RAISE(ABORT, 'negative value'); END IF;
+  END;
+  CALL guarded(1);
+  SELECT * FROM t7;
+} {1}
+do_catchsql_test 7.1 {
+  CALL guarded(-1);
+} {1 {negative value}}
+do_execsql_test 7.2 {
+  -- the aborted CALL rolled back its INSERT
+  SELECT * FROM t7;
+} {1}
+
+# RAISE(IGNORE) stops the procedure silently
+do_execsql_test 7.3 {
+  CREATE PROCEDURE quiet(v INTEGER)
+  BEGIN
+    INSERT INTO t7 VALUES(v);
+    RAISE(IGNORE);
+    INSERT INTO t7 VALUES(-99);
+  END;
+  CALL quiet(2);
+  SELECT * FROM t7 ORDER BY a;
+} {1 2}
+
+# 8.x: putting it together -- recursive factorial via IF + CALL
+#
+do_execsql_test 8.0 {
+  CREATE TABLE fr(n INTEGER PRIMARY KEY, f INTEGER);
+  CREATE PROCEDURE rfact(m INTEGER)
+  BEGIN
+    IF m <= 1 THEN
+      INSERT OR REPLACE INTO fr VALUES(m, 1);
+    ELSE
+      CALL rfact(m-1);
+      INSERT OR REPLACE INTO fr SELECT m, m * f FROM fr WHERE fr.n = m-1;
+    END IF;
+  END;
+  CALL rfact(12);
+  SELECT f FROM fr WHERE n=12;
+} {479001600}
+
+# Variables persist across reopen (schema round-trip of PSM bodies)
+#
+db close
+sqlite3 db test.db
+do_execsql_test 9.0 {
+  CALL fact(6);
+} {720}
+do_execsql_test 9.1 {
+  CALL grade(88);
+} {B}
+
+finish_test

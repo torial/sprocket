@@ -3968,7 +3968,8 @@ struct Parse {
 #ifndef SQLITE_OMIT_PROCEDURE
   ProcPrg *pProcPrg;   /* Linked list of coded procedure bodies */
   Proc *pProcCoding;   /* Procedure whose body is being coded, if any */
-  int iProcParamBase;  /* First mem cell holding procedure parameters */
+  ProcParamList *pProcVars; /* All body variables: parameters then DECLAREs */
+  int iProcParamBase;  /* First mem cell of the pProcVars cell array */
 #endif
   ParseCleanup *pCleanup;   /* List of cleanup operations to run after parse */
 
@@ -4207,6 +4208,11 @@ struct TriggerStep {
   IdList *pIdList;     /* Column names for INSERT */
   Upsert *pUpsert;     /* Upsert clauses on an INSERT */
   char *zSpan;         /* Original SQL text of this command */
+#ifndef SQLITE_OMIT_PROCEDURE
+  char *zVar;          /* Target variable name for DECLARE/SET steps */
+  TriggerStep *pThen;  /* Body of IF/WHILE/LOOP steps */
+  TriggerStep *pElse;  /* ELSE (or ELSEIF chain) branch of an IF step */
+#endif
   TriggerStep *pNext;  /* Next in the link-list */
   TriggerStep *pLast;  /* Last element in link-list. Valid for 1st elem only */
 };
@@ -5361,6 +5367,14 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
   Proc *sqlite3FindProc(Parse*, const char*, const char*);
   TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
+  TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);
+  TriggerStep *sqlite3ProcSetStep(Parse*, Token*, Expr*);
+  TriggerStep *sqlite3ProcIfStep(Parse*, Expr*, TriggerStep*, TriggerStep*);
+  TriggerStep *sqlite3ProcWhileStep(Parse*, Expr*, TriggerStep*);
+  TriggerStep *sqlite3ProcSimpleStep(Parse*, int);
+  TriggerStep *sqlite3ProcRaiseStep(Parse*, int, Expr*);
+  TriggerStep *sqlite3ProcSelectIntoStep(Parse*, Select*, IdList*,
+                                         const char*, const char*);
   void sqlite3VdbeTransferColumnNames(Vdbe*, Vdbe*, int);
 #else
 # define sqlite3DeleteProc(A,B)

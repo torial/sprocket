@@ -603,12 +603,20 @@ int sqlite3FixTriggerStep(
 ){
   while( pStep ){
     if( sqlite3WalkSelect(&pFix->w, pStep->pSelect)
-     || sqlite3WalkExpr(&pFix->w, pStep->pWhere) 
+     || sqlite3WalkExpr(&pFix->w, pStep->pWhere)
      || sqlite3WalkExprList(&pFix->w, pStep->pExprList)
      || sqlite3FixSrcList(pFix, pStep->pSrc)
     ){
       return 1;
     }
+#ifndef SQLITE_OMIT_PROCEDURE
+    /* Control-flow steps in stored procedure bodies carry child lists */
+    if( sqlite3FixTriggerStep(pFix, pStep->pThen)
+     || sqlite3FixTriggerStep(pFix, pStep->pElse)
+    ){
+      return 1;
+    }
+#endif
 #ifndef SQLITE_OMIT_UPSERT
     {
       Upsert *pUp;

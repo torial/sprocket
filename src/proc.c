@@ -324,6 +324,254 @@ TriggerStep *sqlite3ProcCallStep(Parse *pParse, SrcList *pName,
 }
 
 /*
+** Allocate a zeroed TriggerStep with the given opcode, for the PSM
+** statement constructors below.
+*/
+static TriggerStep *procStepAlloc(Parse *pParse, int op){
+  TriggerStep *p = sqlite3DbMallocZero(pParse->db, sizeof(TriggerStep));
+  if( p ){
+    p->op = (u8)op;
+    p->orconf = OE_Default;
+    p->pLast = p;
+  }
+  return p;
+}
+
+/*
+** Build a DECLARE step.  The declared type is currently documentation
+** only (values keep the dynamic types of whatever is assigned to them);
+** the DEFAULT expression, if any, is evaluated when execution reaches
+** the DECLARE statement.
+*/
+TriggerStep *sqlite3ProcDeclareStep(
+  Parse *pParse,
+  Token *pName,          /* Variable name */
+  Token *pType,          /* Declared type token (may be empty) */
+  Expr *pDflt            /* DEFAULT expression, or NULL */
+){
+  TriggerStep *p = procStepAlloc(pParse, TK_DECLARE);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3ExprDelete(db, pDflt);
+    return 0;
+  }
+  p->zVar = sqlite3NameFromToken(db, pName);
+  p->pWhere = pDflt;
+  UNUSED_PARAMETER(pType);
+  return p;
+}
+
+/*
+** Build a SET step: assign an expression to a variable or parameter.
+*/
+TriggerStep *sqlite3ProcSetStep(Parse *pParse, Token *pName, Expr *pValue){
+  TriggerStep *p = procStepAlloc(pParse, TK_SET);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3ExprDelete(db, pValue);
+    return 0;
+  }
+  p->zVar = sqlite3NameFromToken(db, pName);
+  p->pWhere = pValue;
+  return p;
+}
+
+/*
+** Build an IF step.  ELSEIF chains arrive as an IF step in pElse.
+*/
+TriggerStep *sqlite3ProcIfStep(
+  Parse *pParse,
+  Expr *pCond,           /* The IF condition */
+  TriggerStep *pThen,    /* Statements when the condition is true */
+  TriggerStep *pElse     /* ELSE branch, ELSEIF chain, or NULL */
+){
+  TriggerStep *p = procStepAlloc(pParse, TK_IF);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3ExprDelete(db, pCond);
+    sqlite3DeleteTriggerStep(db, pThen);
+    sqlite3DeleteTriggerStep(db, pElse);
+    return 0;
+  }
+  p->pWhere = pCond;
+  p->pThen = pThen;
+  p->pElse = pElse;
+  return p;
+}
+
+/*
+** Build a WHILE step.  A NULL condition is an unconditional LOOP,
+** exited only by LEAVE, RETURN, or RAISE.
+*/
+TriggerStep *sqlite3ProcWhileStep(Parse *pParse, Expr *pCond,
+                                  TriggerStep *pBody){
+  TriggerStep *p = procStepAlloc(pParse, TK_WHILE);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3ExprDelete(db, pCond);
+    sqlite3DeleteTriggerStep(db, pBody);
+    return 0;
+  }
+  p->pWhere = pCond;
+  p->pThen = pBody;
+  return p;
+}
+
+/*
+** Build a bodiless step: LEAVE or RETURN.
+*/
+TriggerStep *sqlite3ProcSimpleStep(Parse *pParse, int op){
+  return procStepAlloc(pParse, op);
+}
+
+/*
+** Build a RAISE step.  onError is OE_Ignore, OE_Rollback, OE_Abort or
+** OE_Fail; pMsg is the error message expression (NULL for OE_Ignore).
+*/
+TriggerStep *sqlite3ProcRaiseStep(Parse *pParse, int onError, Expr *pMsg){
+  TriggerStep *p = procStepAlloc(pParse, TK_RAISE);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3ExprDelete(db, pMsg);
+    return 0;
+  }
+  p->orconf = (u8)onError;
+  p->pWhere = pMsg;
+  return p;
+}
+
+/*
+** Build a SELECT ... INTO step.  Represented as a TK_SELECT step whose
+** pIdList holds the target variable names.
+*/
+TriggerStep *sqlite3ProcSelectIntoStep(
+  Parse *pParse,
+  Select *pSelect,       /* The SELECT statement */
+  IdList *pInto,         /* Target variable names */
+  const char *zStart,    /* Start of SQL text */
+  const char *zEnd       /* End of SQL text */
+){
+  TriggerStep *p = procStepAlloc(pParse, TK_SELECT);
+  sqlite3 *db = pParse->db;
+  if( p==0 ){
+    sqlite3SelectDelete(db, pSelect);
+    sqlite3IdListDelete(db, pInto);
+    return 0;
+  }
+  p->pSelect = pSelect;
+  p->pIdList = pInto;
+  p->zSpan = sqlite3DbSpanDup(db, zStart, zEnd);
+  return p;
+}
+
+/*
+** Append zName to the variable table being built for a procedure body,
+** reporting an error on duplicates.
+*/
+static void procVarAdd(Parse *pParse, ProcParamList **ppList,
+                       const char *zName){
+  sqlite3 *db = pParse->db;
+  ProcParamList *pList = *ppList;
+  ProcParam *a;
+  int i;
+  if( pParse->nErr || db->mallocFailed || zName==0 ) return;
+  if( pList==0 ){
+    pList = sqlite3DbMallocZero(db, sizeof(ProcParamList));
+    if( pList==0 ) return;
+    *ppList = pList;
+  }
+  for(i=0; i<pList->nParam; i++){
+    if( sqlite3StrICmp(pList->a[i].zName, zName)==0 ){
+      sqlite3ErrorMsg(pParse, "duplicate variable name: %s", zName);
+      return;
+    }
+  }
+  a = sqlite3DbRealloc(db, pList->a, (pList->nParam+1)*sizeof(ProcParam));
+  if( a==0 ) return;
+  pList->a = a;
+  memset(&a[pList->nParam], 0, sizeof(ProcParam));
+  a[pList->nParam].zName = sqlite3DbStrDup(db, zName);
+  pList->nParam++;
+}
+
+/*
+** Recursively collect the names of all DECLAREd variables in a step
+** tree.  Variables are hoisted: one flat scope per procedure body.
+*/
+static void procCollectVars(Parse *pParse, ProcParamList **ppList,
+                            TriggerStep *pStep){
+  for(; pStep; pStep=pStep->pNext){
+    if( pStep->op==TK_DECLARE ){
+      procVarAdd(pParse, ppList, pStep->zVar);
+    }
+    procCollectVars(pParse, ppList, pStep->pThen);
+    procCollectVars(pParse, ppList, pStep->pElse);
+  }
+}
+
+/*
+** Return the memory cell holding variable zName, or 0 if there is no
+** such variable.
+*/
+static int procVarCell(Parse *pParse, const char *zName){
+  ProcParamList *pL = pParse->pProcVars;
+  int i;
+  if( pL ){
+    for(i=0; i<pL->nParam; i++){
+      if( sqlite3StrICmp(pL->a[i].zName, zName)==0 ){
+        return pParse->iProcParamBase + i;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** Mark every subquery in the given expression and/or SELECT as
+** EP_VarSelect (i.e. "not constant").  Uncorrelated subqueries are
+** normally wrapped in OP_Once, which caches their result for the
+** lifetime of one frame invocation -- inside a WHILE/LOOP body that
+** would return stale values on every iteration after the first.
+*/
+static int procMarkVarSelectExpr(Walker *pWalker, Expr *pExpr){
+  UNUSED_PARAMETER(pWalker);
+  if( pExpr->op==TK_SELECT || pExpr->op==TK_EXISTS ){
+    ExprSetProperty(pExpr, EP_VarSelect);
+  }
+  return WRC_Continue;
+}
+static void procMarkVarSelect(Parse *pParse, Expr *pExpr, Select *pSelect){
+  Walker w;
+  memset(&w, 0, sizeof(w));
+  w.pParse = pParse;
+  w.xExprCallback = procMarkVarSelectExpr;
+  w.xSelectCallback = sqlite3SelectWalkNoop;
+  if( pExpr ) sqlite3WalkExpr(&w, pExpr);
+  if( pSelect ) sqlite3WalkSelect(&w, pSelect);
+}
+
+/*
+** Duplicate, mark, and resolve one PSM-managed expression, then code it
+** into the given cell (iTarget>0), or evaluate it for control flow via
+** the returned duplicate.  Returns the resolved duplicate (caller must
+** delete) or NULL on error.
+*/
+static Expr *procDupResolveExpr(Parse *pParse, Expr *pExpr){
+  sqlite3 *db = pParse->db;
+  Expr *pDup = sqlite3ExprDup(db, pExpr, 0);
+  NameContext sNC;
+  if( pDup==0 ) return 0;
+  procMarkVarSelect(pParse, pDup, 0);
+  memset(&sNC, 0, sizeof(sNC));
+  sNC.pParse = pParse;
+  if( sqlite3ResolveExprNames(&sNC, pDup) ){
+    sqlite3ExprDelete(db, pDup);
+    return 0;
+  }
+  return pDup;
+}
+
+/*
 ** Move a parse error from the sub-parse used to compile a procedure body
 ** up into the parent parse.  (Same logic as trigger.c:transferParseError,
 ** which is file-static there.)
@@ -354,7 +602,8 @@ static void procTransferParseError(Parse *pTo, Parse *pFrom){
 static void codeProcProgram(
   Parse *pParse,            /* Sub-parse context for the body */
   TriggerStep *pStepList,   /* List of statements in the body */
-  ProcPrg *pPrg             /* Records the result-column count */
+  ProcPrg *pPrg,            /* Records the result-column count */
+  int lblLeave              /* Jump target for LEAVE; 0 if not in a loop */
 ){
   TriggerStep *pStep;
   Vdbe *v = pParse->pVdbe;
@@ -386,18 +635,28 @@ static void codeProcProgram(
 
     switch( pStep->op ){
       case TK_UPDATE: {
+        ExprList *pSet = sqlite3ExprListDup(db, pStep->pExprList, 0);
+        Expr *pWhere = sqlite3ExprDup(db, pStep->pWhere, 0);
+        if( lblLeave ){
+          /* Inside a loop: subqueries must re-evaluate every iteration */
+          int i;
+          procMarkVarSelect(pParse, pWhere, 0);
+          for(i=0; pSet && i<pSet->nExpr; i++){
+            procMarkVarSelect(pParse, pSet->a[i].pExpr, 0);
+          }
+        }
         sqlite3Update(pParse,
           sqlite3SrcListDup(db, pStep->pSrc, 0),
-          sqlite3ExprListDup(db, pStep->pExprList, 0),
-          sqlite3ExprDup(db, pStep->pWhere, 0),
-          pParse->eOrconf, 0, 0, 0
+          pSet, pWhere, pParse->eOrconf, 0, 0, 0
         );
         break;
       }
       case TK_INSERT: {
+        Select *pSel = sqlite3SelectDup(db, pStep->pSelect, 0);
+        if( lblLeave ) procMarkVarSelect(pParse, 0, pSel);
         sqlite3Insert(pParse,
           sqlite3SrcListDup(db, pStep->pSrc, 0),
-          sqlite3SelectDup(db, pStep->pSelect, 0),
+          pSel,
           sqlite3IdListDup(db, pStep->pIdList),
           pParse->eOrconf,
           sqlite3UpsertDup(db, pStep->pUpsert)
@@ -405,9 +664,11 @@ static void codeProcProgram(
         break;
       }
       case TK_DELETE: {
+        Expr *pWhere = sqlite3ExprDup(db, pStep->pWhere, 0);
+        if( lblLeave ) procMarkVarSelect(pParse, pWhere, 0);
         sqlite3DeleteFrom(pParse,
           sqlite3SrcListDup(db, pStep->pSrc, 0),
-          sqlite3ExprDup(db, pStep->pWhere, 0), 0, 0
+          pWhere, 0, 0
         );
         break;
       }
@@ -418,22 +679,159 @@ static void codeProcProgram(
         );
         break;
       }
-      default: assert( pStep->op==TK_SELECT ); {
-        SelectDest sDest;
-        Select *pSelect = sqlite3SelectDup(db, pStep->pSelect, 0);
-        sqlite3SelectDestInit(&sDest, SRT_Output, 0);
-        sqlite3Select(pParse, pSelect, &sDest);
-        if( pParse->nErr==0 && pSelect ){
-          int nCol = pSelect->pEList->nExpr;
-          if( pPrg->nResCol<0 ){
-            pPrg->nResCol = nCol;
-          }else if( pPrg->nResCol!=nCol ){
-            sqlite3ErrorMsg(pParse, "all row-producing SELECT statements "
-               "in procedure %s must have the same number of result columns",
-               pPrg->pProc->zName);
+      case TK_DECLARE: {
+        /* The variable cell was allocated (and NULL-initialized) by the
+        ** body prologue; all that executes here is the DEFAULT, if any. */
+        if( pStep->pWhere ){
+          int iCell = procVarCell(pParse, pStep->zVar);
+          Expr *pDflt = procDupResolveExpr(pParse, pStep->pWhere);
+          assert( iCell>0 || pParse->nErr );
+          if( pDflt ){
+            sqlite3ExprCode(pParse, pDflt, iCell);
+            sqlite3ExprDelete(db, pDflt);
           }
         }
-        sqlite3SelectDelete(db, pSelect);
+        break;
+      }
+      case TK_SET: {
+        int iCell = procVarCell(pParse, pStep->zVar);
+        if( iCell==0 ){
+          sqlite3ErrorMsg(pParse, "no such variable: %s", pStep->zVar);
+        }else{
+          Expr *pVal = procDupResolveExpr(pParse, pStep->pWhere);
+          if( pVal ){
+            sqlite3ExprCode(pParse, pVal, iCell);
+            sqlite3ExprDelete(db, pVal);
+          }
+        }
+        break;
+      }
+      case TK_IF: {
+        int lblElse = sqlite3VdbeMakeLabel(pParse);
+        int lblEnd = sqlite3VdbeMakeLabel(pParse);
+        Expr *pCond = procDupResolveExpr(pParse, pStep->pWhere);
+        if( pCond ){
+          sqlite3ExprIfFalse(pParse, pCond, lblElse, SQLITE_JUMPIFNULL);
+          sqlite3ExprDelete(db, pCond);
+        }
+        codeProcProgram(pParse, pStep->pThen, pPrg, lblLeave);
+        sqlite3VdbeGoto(v, lblEnd);
+        sqlite3VdbeResolveLabel(v, lblElse);
+        codeProcProgram(pParse, pStep->pElse, pPrg, lblLeave);
+        sqlite3VdbeResolveLabel(v, lblEnd);
+        break;
+      }
+      case TK_WHILE: {
+        /* A NULL condition is an unconditional LOOP */
+        int addrTop = sqlite3VdbeCurrentAddr(v);
+        int lblEnd = sqlite3VdbeMakeLabel(pParse);
+        if( pStep->pWhere ){
+          Expr *pCond = procDupResolveExpr(pParse, pStep->pWhere);
+          if( pCond ){
+            sqlite3ExprIfFalse(pParse, pCond, lblEnd, SQLITE_JUMPIFNULL);
+            sqlite3ExprDelete(db, pCond);
+          }
+        }
+        codeProcProgram(pParse, pStep->pThen, pPrg, lblEnd);
+        sqlite3VdbeGoto(v, addrTop);
+        sqlite3VdbeResolveLabel(v, lblEnd);
+        break;
+      }
+      case TK_LEAVE: {
+        if( lblLeave==0 ){
+          sqlite3ErrorMsg(pParse, "LEAVE used outside of a LOOP or WHILE");
+        }else{
+          sqlite3VdbeGoto(v, lblLeave);
+        }
+        break;
+      }
+      case TK_RETURN: {
+        sqlite3VdbeAddOp0(v, OP_Halt);
+        break;
+      }
+      case TK_RAISE: {
+        if( pStep->orconf==OE_Ignore ){
+          sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_OK, OE_Ignore);
+        }else{
+          Expr *pMsg = procDupResolveExpr(pParse, pStep->pWhere);
+          int r1 = ++pParse->nMem;
+          if( pMsg ){
+            sqlite3ExprCode(pParse, pMsg, r1);
+            sqlite3ExprDelete(db, pMsg);
+          }
+          if( pStep->orconf==OE_Abort ){
+            sqlite3MayAbort(pParse);
+          }
+          sqlite3VdbeAddOp3(v, OP_Halt, SQLITE_ERROR, pStep->orconf, r1);
+        }
+        break;
+      }
+      default: assert( pStep->op==TK_SELECT ); {
+        if( pStep->pIdList ){
+          /* SELECT ... INTO var-list.  Compiled as a row-value subquery
+          ** (first row wins; all-NULL if the query returns no rows),
+          ** then copied into the target variable cells. */
+          Expr *pSub;
+          Select *pSelect = sqlite3SelectDup(db, pStep->pSelect, 0);
+          IdList *pInto = pStep->pIdList;
+          int nInto = pInto->nId;
+          NameContext sNC;
+          int k, nCol, rReg;
+          pSub = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+          if( pSub==0 ){
+            sqlite3SelectDelete(db, pSelect);
+            break;
+          }
+          sqlite3PExprAddSelect(pParse, pSub, pSelect);
+          /* Never cache across loop iterations */
+          procMarkVarSelect(pParse, pSub, 0);
+          memset(&sNC, 0, sizeof(sNC));
+          sNC.pParse = pParse;
+          if( sqlite3ResolveExprNames(&sNC, pSub) ){
+            sqlite3ExprDelete(db, pSub);
+            break;
+          }
+          assert( ExprUseXSelect(pSub) );
+          nCol = pSub->x.pSelect->pEList->nExpr;
+          if( nCol!=nInto ){
+            sqlite3ErrorMsg(pParse, "SELECT INTO has %d result column%s "
+               "but %d target variable%s", nCol, nCol==1?"":"s",
+               nInto, nInto==1?"":"s");
+            sqlite3ExprDelete(db, pSub);
+            break;
+          }
+          rReg = sqlite3CodeSubselect(pParse, pSub);
+          for(k=0; k<nInto && pParse->nErr==0; k++){
+            int iCell = procVarCell(pParse, pInto->a[k].zName);
+            if( iCell==0 ){
+              sqlite3ErrorMsg(pParse, "no such variable: %s",
+                              pInto->a[k].zName);
+            }else{
+              sqlite3VdbeAddOp2(v, OP_Copy, rReg+k, iCell);
+            }
+          }
+          sqlite3ExprDelete(db, pSub);
+        }else{
+          SelectDest sDest;
+          Select *pSelect = sqlite3SelectDup(db, pStep->pSelect, 0);
+          if( lblLeave ){
+            /* Inside a loop: subqueries must re-evaluate every iteration */
+            procMarkVarSelect(pParse, 0, pSelect);
+          }
+          sqlite3SelectDestInit(&sDest, SRT_Output, 0);
+          sqlite3Select(pParse, pSelect, &sDest);
+          if( pParse->nErr==0 && pSelect ){
+            int nCol = pSelect->pEList->nExpr;
+            if( pPrg->nResCol<0 ){
+              pPrg->nResCol = nCol;
+            }else if( pPrg->nResCol!=nCol ){
+              sqlite3ErrorMsg(pParse, "all row-producing SELECT statements "
+                 "in procedure %s must have the same number of result "
+                 "columns", pPrg->pProc->zName);
+            }
+          }
+          sqlite3SelectDelete(db, pSelect);
+        }
         break;
       }
     }
@@ -499,17 +897,35 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
     );
 #endif
 
-    /* Copy the arguments (evaluated by the caller into the register
-    ** block passed as P1 of OP_Program) into fixed local cells.  All
-    ** parameter references inside the body resolve to these cells. */
-    sSubParse.iProcParamBase = sSubParse.nMem+1;
-    sSubParse.nMem += nParam;
-    for(i=0; i<nParam; i++){
-      sqlite3VdbeAddOp2(v, OP_Param, i, sSubParse.iProcParamBase+i);
-      VdbeComment((v, "param %s", pProc->pParams->a[i].zName));
+    /* Build the flat variable table for the body: parameters first,
+    ** then every DECLAREd variable (hoisted; one scope per body). */
+    {
+      int nVar;
+      for(i=0; i<nParam; i++){
+        procVarAdd(&sSubParse, &sSubParse.pProcVars,
+                   pProc->pParams->a[i].zName);
+      }
+      procCollectVars(&sSubParse, &sSubParse.pProcVars, pProc->pBody);
+      nVar = sSubParse.pProcVars ? sSubParse.pProcVars->nParam : 0;
+      sSubParse.iProcParamBase = sSubParse.nMem+1;
+      sSubParse.nMem += nVar;
+
+      /* Prologue: copy the arguments (evaluated by the caller into the
+      ** register block passed as P1 of OP_Program) into their local
+      ** cells, and NULL-initialize the DECLAREd variables (frame cells
+      ** start out MEM_Undefined, not NULL). */
+      for(i=0; i<nParam; i++){
+        sqlite3VdbeAddOp2(v, OP_Param, i, sSubParse.iProcParamBase+i);
+        VdbeComment((v, "param %s", pProc->pParams->a[i].zName));
+      }
+      if( nVar>nParam ){
+        sqlite3VdbeAddOp3(v, OP_Null, 0, sSubParse.iProcParamBase+nParam,
+                          sSubParse.iProcParamBase+nVar-1);
+        VdbeComment((v, "init %d local variable(s)", nVar-nParam));
+      }
     }
 
-    codeProcProgram(&sSubParse, pProc->pBody, pPrg);
+    codeProcProgram(&sSubParse, pProc->pBody, pPrg, 0);
 
     sqlite3VdbeAddOp0(v, OP_Halt);
     VdbeComment((v, "End: proc %s", pProc->zName));
@@ -534,6 +950,8 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
 
   assert( !sSubParse.pTriggerPrg && !sSubParse.nMaxArg );
   assert( !sSubParse.pProcPrg );
+  sqlite3ProcParamListDelete(db, sSubParse.pProcVars);
+  sSubParse.pProcVars = 0;
   sqlite3ParseObjectReset(&sSubParse);
   return pPrg;
 }

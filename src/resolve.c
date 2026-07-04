@@ -756,7 +756,7 @@ static int lookupName(
   ** Columns deliberately shadow parameters: this branch runs only after
   ** every column lookup has failed.  */
   if( cnt==0 && zTab==0 && pParse->pProcCoding ){
-    ProcParamList *pPL = pParse->pProcCoding->pParams;
+    ProcParamList *pPL = pParse->pProcVars;
     if( pPL ){
       int iP;
       for(iP=0; iP<pPL->nParam; iP++){
