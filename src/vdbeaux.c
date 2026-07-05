@@ -2939,6 +2939,25 @@ void sqlite3VdbeTransferColumnNames(Vdbe *pTo, Vdbe *pFrom, int nCol){
     }
   }
 }
+
+/*
+** Return a DbMalloc'ed array of nCol DbStrDup'ed result-column names
+** from Vdbe p, or NULL if p's column info does not match.  Used to
+** stock the compiled-procedure cache.
+*/
+char **sqlite3VdbeCaptureColumnNames(Vdbe *p, int nCol){
+  char **az;
+  int i;
+  sqlite3 *db = p->db;
+  if( p->nResColumn!=nCol || p->aColName==0 || nCol<=0 ) return 0;
+  az = sqlite3DbMallocZero(db, nCol*sizeof(char*));
+  if( az==0 ) return 0;
+  for(i=0; i<nCol; i++){
+    const char *z = (const char*)sqlite3_value_text(&p->aColName[i]);
+    if( z ) az[i] = sqlite3DbStrDup(db, z);
+  }
+  return az;
+}
 #endif /* !defined(SQLITE_OMIT_PROCEDURE) */
 
 /*
@@ -3772,9 +3791,20 @@ static void sqlite3VdbeClearObject(sqlite3 *db, Vdbe *p){
   }
   for(pSub=p->pProgram; pSub; pSub=pNext){
     pNext = pSub->pNext;
-    vdbeFreeOpArray(db, pSub->aOp, pSub->nOp);
-    sqlite3DbFree(db, pSub);
+    sqlite3SubProgramUnref(db, pSub);
   }
+#ifndef SQLITE_OMIT_PROCEDURE
+  if( p->apSharedProg ){
+    int iSh;
+    for(iSh=0; iSh<p->nSharedProg; iSh++){
+      sqlite3SubProgramUnref(db, p->apSharedProg[iSh]);
+    }
+    sqlite3DbFree(db, p->apSharedProg);
+    /* Do not zero the fields: like the rest of this function, this
+    ** path also runs during sqlite3_db_status() memory-measurement
+    ** passes, which must leave the object graph untouched. */
+  }
+#endif
   if( p->eVdbeState!=VDBE_INIT_STATE ){
     releaseMemArray(p->aVar, p->nVar);
     if( p->pVList ) sqlite3DbNNFreeNN(db, p->pVList);
@@ -5365,8 +5395,56 @@ void sqlite3VdbeCountChanges(Vdbe *v){
 ** prepared statements.  The flag is set to 1 for an immediate expiration
 ** and set to 2 for an advisory expiration.
 */
+/*
+** Drop one reference to a SubProgram, freeing it when the last owner
+** lets go.  Owners are: the pProgram list of the Vdbe that compiled it,
+** a Proc body cache, and any Vdbe that attached it via
+** sqlite3VdbeAttachSubProgram().
+*/
+void sqlite3SubProgramUnref(sqlite3 *db, SubProgram *pSub){
+  assert( pSub->nRef>=1 );
+  if( db->pnBytesFreed!=0 ){
+    /* This is a memory-measurement pass (sqlite3_db_status(): DbFree
+    ** and friends only count bytes, nothing is really released).  The
+    ** object graph must come through completely unmodified: mutating
+    ** nRef here would make the later REAL teardown skip the free. */
+    vdbeFreeOpArray(db, pSub->aOp, pSub->nOp);
+    sqlite3DbFree(db, pSub);
+    return;
+  }
+  if( --pSub->nRef==0 ){
+    vdbeFreeOpArray(db, pSub->aOp, pSub->nOp);
+    sqlite3DbFree(db, pSub);
+  }
+}
+
+#ifndef SQLITE_OMIT_PROCEDURE
+/*
+** Record that Vdbe p uses the (cached) sub-program pSub, holding a
+** reference for the lifetime of the statement.  Unlike
+** sqlite3VdbeLinkSubProgram(), this may be used for sub-programs owned
+** elsewhere: the intrusive pProgram list cannot be shared between VMs.
+*/
+int sqlite3VdbeAttachSubProgram(Vdbe *p, SubProgram *pSub){
+  SubProgram **ap;
+  ap = sqlite3DbRealloc(p->db, p->apSharedProg,
+                        (p->nSharedProg+1)*sizeof(SubProgram*));
+  if( ap==0 ) return SQLITE_NOMEM_BKPT;
+  p->apSharedProg = ap;
+  ap[p->nSharedProg++] = pSub;
+  pSub->nRef++;
+  return SQLITE_OK;
+}
+#endif /* !defined(SQLITE_OMIT_PROCEDURE) */
+
 void sqlite3ExpirePreparedStatements(sqlite3 *db, int iCode){
   Vdbe *p;
+#ifndef SQLITE_OMIT_PROCEDURE
+  /* Anything invalidating every prepared statement (new function or
+  ** collation definitions, schema resets, ...) also invalidates cached
+  ** compiled procedure bodies. */
+  sqlite3ProcCacheFlush(db);
+#endif
   for(p = db->pVdbe; p; p=p->pVNext){
     p->expired = iCode+1;
   }

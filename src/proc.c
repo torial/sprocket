@@ -875,6 +875,7 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
   pTop->pProcPrg = pPrg;
   pPrg->pProgram = pProgram = sqlite3DbMallocZero(db, sizeof(SubProgram));
   if( !pProgram ) return 0;
+  pProgram->nRef = 1;   /* owned by pTop->pVdbe's pProgram list */
   sqlite3VdbeLinkSubProgram(pTop->pVdbe, pProgram);
   pPrg->pProc = pProc;
   pPrg->nResCol = -1;
@@ -957,6 +958,126 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
 }
 
 /*
+** Free one entry of the per-connection compiled-body cache.
+*/
+static void procCacheEntryFree(sqlite3 *db, ProcCacheEntry *pE){
+  sqlite3SubProgramUnref(db, pE->pProg);
+  if( pE->azColName ){
+    int i;
+    for(i=0; i<pE->nResCol; i++) sqlite3DbFree(db, pE->azColName[i]);
+    sqlite3DbFree(db, pE->azColName);
+  }
+  sqlite3DbFree(db, pE->zProc);
+  sqlite3DbFree(db, pE);
+}
+
+/*
+** Discard every cached compiled procedure body on the connection.
+** Called whenever prepared statements are mass-expired (new function
+** or collation registrations, schema resets), on DETACH, and at
+** connection close.
+*/
+void sqlite3ProcCacheFlush(sqlite3 *db){
+  ProcCacheEntry *pE, *pNext;
+  for(pE=db->pProcCache; pE; pE=pNext){
+    pNext = pE->pNext;
+    procCacheEntryFree(db, pE);
+  }
+  db->pProcCache = 0;
+}
+
+/*
+** Look for a valid cached compiled body for pProc.  A hit requires the
+** same database slot, the same Schema (pointer identity), an unchanged
+** schema cookie, and a name match.
+*/
+static ProcCacheEntry *procCacheFind(Parse *pParse, Proc *pProc){
+  sqlite3 *db = pParse->db;
+  int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
+  ProcCacheEntry *pE;
+  if( iDb==1 ) return 0;   /* TEMP procedures are never cached */
+  for(pE=db->pProcCache; pE; pE=pE->pNext){
+    if( pE->iDb==iDb
+     && pE->pSchema==pProc->pSchema
+     && pE->cookie==(u32)pProc->pSchema->schema_cookie
+     && sqlite3StrICmp(pE->zProc, pProc->zName)==0
+    ){
+      return pE;
+    }
+  }
+  return 0;
+}
+
+/*
+** After successfully compiling pPrg for a top-level CALL of pProc,
+** stash the compiled body in the connection cache if it is
+** self-contained enough to be safely reused by other statements:
+**
+**  - not a TEMP procedure (TEMP bodies may reference any database, so
+**    a single schema cookie cannot guard them);
+**  - not in shared-cache mode (the Schema, and hence the Proc, may be
+**    shared across connections; this cache is strictly per-connection);
+**  - the body did not touch AUTOINCREMENT tables (autoinc opcodes
+**    address counters in the toplevel frame by register number, which
+**    differs between statements);
+**  - the body embeds no other sub-programs (trigger programs and
+**    nested CALLs are owned by the compiling statement; sharing them
+**    would require cycle-aware reference counting).
+*/
+static void procCachePopulate(
+  Parse *pParse,        /* The (toplevel) parse of the CALL statement */
+  Proc *pProc,          /* The procedure that was compiled */
+  ProcPrg *pPrg,        /* Its compiled body */
+  void *pAincBefore     /* Value of pParse->pAinc before compilation */
+){
+  sqlite3 *db = pParse->db;
+  int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
+  ProcCacheEntry *pE, **pp;
+  SubProgram *pProg = pPrg->pProgram;
+  int i;
+
+  assert( pParse->pToplevel==0 );
+  if( iDb<0 || iDb==1 ) return;
+  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSharable(db->aDb[iDb].pBt) ) return;
+  if( (void*)pParse->pAinc!=pAincBefore ) return;
+  if( pProg==0 || pProg->aOp==0 ) return;
+  for(i=0; i<pProg->nOp; i++){
+    if( pProg->aOp[i].p4type==P4_SUBPROGRAM ) return;
+  }
+
+  /* Replace any existing (now stale) entry for this procedure */
+  for(pp=&db->pProcCache; (pE=*pp)!=0; pp=&pE->pNext){
+    if( pE->iDb==iDb && sqlite3StrICmp(pE->zProc, pProc->zName)==0 ){
+      *pp = pE->pNext;
+      procCacheEntryFree(db, pE);
+      break;
+    }
+  }
+
+  pE = sqlite3DbMallocZero(db, sizeof(*pE));
+  if( pE==0 ) return;
+  pE->zProc = sqlite3DbStrDup(db, pProc->zName);
+  if( pE->zProc==0 ){
+    sqlite3DbFree(db, pE);
+    return;
+  }
+  pE->iDb = iDb;
+  pE->pSchema = pProc->pSchema;
+  pE->cookie = (u32)pProc->pSchema->schema_cookie;
+  pE->pProg = pProg;
+  pProg->nRef++;
+  pE->nResCol = pPrg->nResCol;
+  pE->nMaxArg = pParse->nMaxArg;
+  if( DbMaskTest(pParse->writeMask, iDb) ) pE->flags |= PROCCACHE_WRITES;
+  if( pParse->mayAbort ) pE->flags |= PROCCACHE_MAYABORT;
+  if( pE->nResCol>0 && pParse->pVdbe ){
+    pE->azColName = sqlite3VdbeCaptureColumnNames(pParse->pVdbe, pE->nResCol);
+  }
+  pE->pNext = db->pProcCache;
+  db->pProcCache = pE;
+}
+
+/*
 ** This is called by the parser for a CALL statement.
 **
 ** The procedure body is compiled (once per statement; recursive CALLs
@@ -1023,12 +1144,54 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
   iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
   sqlite3CodeVerifySchema(pParse, iDb);
 
-  /* Find or create the compiled body */
+  /* Find the compiled body: already coded in this statement, cached on
+  ** the connection from an earlier statement, or compiled fresh. */
   pTop = sqlite3ParseToplevel(pParse);
   for(pPrg=pTop->pProcPrg; pPrg && pPrg->pProc!=pProc; pPrg=pPrg->pNext){}
   if( pPrg==0 ){
-    pPrg = codeProcBody(pParse, pProc);
-    if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
+    ProcCacheEntry *pE = procCacheFind(pParse, pProc);
+    if( pE ){
+      /* Cache hit: reuse the compiled body, replaying the toplevel
+      ** bookkeeping that compiling it would have performed. */
+      pPrg = sqlite3DbMallocZero(db, sizeof(ProcPrg));
+      if( pPrg==0 ) goto call_cleanup;
+      pPrg->pNext = pTop->pProcPrg;
+      pTop->pProcPrg = pPrg;
+      pPrg->pProc = pProc;
+      pPrg->pProgram = pE->pProg;
+      pPrg->nResCol = pE->nResCol;
+      if( sqlite3VdbeAttachSubProgram(pTop->pVdbe, pE->pProg) ){
+        goto call_cleanup;
+      }
+      if( pTop->nMaxArg<pE->nMaxArg ) pTop->nMaxArg = pE->nMaxArg;
+      if( pE->flags & PROCCACHE_WRITES ){
+        sqlite3BeginWriteOperation(pParse, 1, pE->iDb);
+        sqlite3MultiWrite(pParse);
+      }
+      if( pE->flags & PROCCACHE_MAYABORT ){
+        sqlite3MayAbort(pParse);
+      }
+      if( pParse->pToplevel==0 && pE->nResCol>0 ){
+        int k;
+        sqlite3VdbeSetNumCols(v, pE->nResCol);
+        for(k=0; k<pE->nResCol; k++){
+          const char *z = pE->azColName ? pE->azColName[k] : 0;
+          if( z ){
+            sqlite3VdbeSetColName(v, k, COLNAME_NAME, z, SQLITE_TRANSIENT);
+          }else{
+            char *zGen = sqlite3MPrintf(db, "column%d", k+1);
+            sqlite3VdbeSetColName(v, k, COLNAME_NAME, zGen, SQLITE_DYNAMIC);
+          }
+        }
+      }
+    }else{
+      void *pAincBefore = (void*)pTop->pAinc;
+      pPrg = codeProcBody(pParse, pProc);
+      if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
+      if( pParse->pToplevel==0 ){
+        procCachePopulate(pParse, pProc, pPrg, pAincBefore);
+      }
+    }
   }
 
   /* If this CALL occurs inside another procedure's body, rows produced by

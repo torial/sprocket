@@ -303,6 +303,11 @@ static void detachFunc(
   char zErr[128];
 
   UNUSED_PARAMETER(NotUsed);
+#ifndef SQLITE_OMIT_PROCEDURE
+  /* Database indexes shift meaning after DETACH; drop all cached
+  ** compiled procedure bodies rather than track the renumbering. */
+  sqlite3ProcCacheFlush(db);
+#endif
 
   if( zName==0 ) zName = "";
   for(i=0; i<db->nDb; i++){

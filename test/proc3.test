@@ -1,0 +1,226 @@
+# 2026-07-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Tests for the per-connection compiled-procedure-body cache (phase 5).
+# Caching must be observably invisible: these tests disable the TCL
+# interface's own statement cache so that every "db eval" is a fresh
+# sqlite3_prepare(), exercising cache hits and invalidations.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc3
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+db cache size 0
+
+# 1.x: repeated fresh prepares of the same CALL (cache hit path)
+#
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER, b TEXT);
+  CREATE PROCEDURE ins1(x INTEGER, y TEXT)
+  BEGIN
+    INSERT INTO t1 VALUES(x, y);
+  END;
+  CREATE PROCEDURE getall()
+  BEGIN
+    SELECT a, b FROM t1 ORDER BY a;
+  END;
+} {}
+
+do_test 1.1 {
+  for {set i 1} {$i <= 5} {incr i} {
+    db eval {CALL ins1($i, 'row')}
+  }
+  db eval {SELECT count(*) FROM t1}
+} {5}
+
+do_execsql_test 1.2 { CALL getall(); } {1 row 2 row 3 row 4 row 5 row}
+do_execsql_test 1.3 { CALL getall(); } {1 row 2 row 3 row 4 row 5 row}
+
+# Column names survive the cache-hit path
+do_test 1.4 {
+  db eval {CALL getall()} val break
+  set val(*)
+} {a b}
+do_test 1.5 {
+  db eval {CALL getall()} val break
+  set val(*)
+} {a b}
+
+# 2.x: invalidation by DDL (schema cookie bump)
+#
+do_test 2.0 {
+  db eval {CALL getall()}
+  db eval {CREATE TABLE poke1(x)}
+  db eval {CALL getall()}
+  db eval {SELECT count(*) FROM t1}
+} {5}
+
+# DROP + recreate procedure with a different body between fresh prepares
+do_test 2.1 {
+  db eval {CALL getall()}
+  db eval {
+    DROP PROCEDURE getall;
+    CREATE PROCEDURE getall() BEGIN SELECT 'new version'; END;
+  }
+  db eval {CALL getall()}
+} {{new version}}
+
+# 3.x: invalidation when functions are (re)registered
+#
+do_test 3.0 {
+  db function myfn {return 111}
+  db eval {
+    CREATE PROCEDURE usesfn() BEGIN SELECT myfn(); END;
+  }
+  db eval {CALL usesfn()}
+} {111}
+do_test 3.1 {
+  db eval {CALL usesfn()}       ;# cached
+  db function myfn {return 222} ;# expires statements + flushes cache
+  db eval {CALL usesfn()}
+} {222}
+
+# 4.x: writes through a cached body keep transactional behavior
+#
+do_execsql_test 4.0 {
+  CREATE TABLE t4(a INTEGER PRIMARY KEY);
+  CREATE PROCEDURE add4(v INTEGER)
+  BEGIN
+    INSERT INTO t4 VALUES(v);
+    INSERT INTO t4 VALUES(v+1);
+  END;
+} {}
+do_test 4.1 {
+  db eval {CALL add4(10)}   ;# populate
+  db eval {CALL add4(20)}   ;# hit
+  db eval {SELECT * FROM t4 ORDER BY a}
+} {10 11 20 21}
+do_test 4.2 {
+  # constraint failure through the CACHED body: whole CALL unwinds
+  catch {db eval {CALL add4(30)}}   ;# populate is warm already
+  list [catch {db eval {CALL add4(21)}} msg] $msg \
+       [db eval {SELECT count(*) FROM t4}]
+} {1 {UNIQUE constraint failed: t4.a} 6}
+do_test 4.3 {
+  db eval {BEGIN}
+  db eval {CALL add4(40)}
+  db eval {ROLLBACK}
+  db eval {SELECT count(*) FROM t4 WHERE a>=40}
+} {0}
+
+# RAISE through a cached body
+do_execsql_test 4.4 {
+  CREATE PROCEDURE angry(v INTEGER)
+  BEGIN
+    INSERT INTO t4 VALUES(v);
+    RAISE(ABORT, 'angry');
+  END;
+} {}
+do_test 4.5 {
+  catch {db eval {CALL angry(100)}}
+  list [catch {db eval {CALL angry(101)}} msg] $msg \
+       [db eval {SELECT count(*) FROM t4 WHERE a>=100}]
+} {1 angry 0}
+
+# 5.x: bodies excluded from the cache still behave correctly on
+# repeated fresh prepares
+#
+do_execsql_test 5.0 {
+  -- trigger on target table => body embeds a trigger sub-program
+  CREATE TABLE t5(a INTEGER);
+  CREATE TABLE t5log(m TEXT);
+  CREATE TRIGGER tr5 AFTER INSERT ON t5 BEGIN
+    INSERT INTO t5log VALUES('fired');
+  END;
+  CREATE PROCEDURE add5(v INTEGER) BEGIN INSERT INTO t5 VALUES(v); END;
+} {}
+do_test 5.1 {
+  db eval {CALL add5(1)}
+  db eval {CALL add5(2)}
+  db eval {SELECT count(*) FROM t5log}
+} {2}
+
+do_execsql_test 5.2 {
+  -- AUTOINCREMENT table => excluded (toplevel register coupling)
+  CREATE TABLE t5b(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+  CREATE PROCEDURE add5b(x TEXT) BEGIN INSERT INTO t5b(v) VALUES(x); END;
+} {}
+do_test 5.3 {
+  db eval {CALL add5b('p')}
+  db eval {CALL add5b('q')}
+  db eval {SELECT id, v FROM t5b ORDER BY id}
+} {1 p 2 q}
+
+do_execsql_test 5.4 {
+  -- nested CALL => excluded
+  CREATE PROCEDURE outer5(v INTEGER) BEGIN CALL add4(v); END;
+} {}
+do_test 5.5 {
+  db eval {CALL outer5(200)}
+  db eval {CALL outer5(300)}
+  db eval {SELECT count(*) FROM t4 WHERE a>=200}
+} {4}
+
+do_test 5.6 {
+  # TEMP procedure => excluded
+  db eval {
+    CREATE TEMP PROCEDURE tp(v INTEGER) BEGIN SELECT v*2; END;
+  }
+  concat [db eval {CALL tp(4)}] [db eval {CALL tp(5)}]
+} {8 10}
+
+# Recursion still works with the cache warm for the callee
+do_execsql_test 5.7 {
+  CREATE PROCEDURE cnt(n INTEGER)
+  BEGIN
+    IF n > 0 THEN CALL cnt(n-1); END IF;
+  END;
+} {}
+do_test 5.8 {
+  db eval {CALL cnt(5)}
+  db eval {CALL cnt(5)}
+  set {} ok
+} {ok}
+
+# 6.x: ATTACH / DETACH interplay
+#
+do_test 6.0 {
+  forcedelete test3.db
+  db eval {ATTACH 'test3.db' AS aux3}
+  db eval {CREATE PROCEDURE aux3.ap(v INTEGER) BEGIN SELECT v+1000; END}
+  db eval {CALL aux3.ap(1)}
+} {1001}
+do_test 6.1 {
+  db eval {CALL aux3.ap(2)}    ;# hit
+  db eval {DETACH aux3}        ;# flushes the cache
+  db eval {CALL getall()}
+} {{new version}}
+
+# 7.x: cache correctness across two procedures at once
+#
+do_test 7.0 {
+  db eval {
+    CREATE PROCEDURE pa() BEGIN SELECT 'A'; END;
+    CREATE PROCEDURE pb() BEGIN SELECT 'B'; END;
+  }
+  set r {}
+  foreach n {1 2 3} {
+    lappend r {*}[db eval {CALL pa()}] {*}[db eval {CALL pb()}]
+  }
+  set r
+} {A B A B A B}
+
+finish_test

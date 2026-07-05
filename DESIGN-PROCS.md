@@ -174,11 +174,38 @@ Three tiers, landed in this order:
    at `sqlite3_prepare()` of the `CALL` and owned by that Vdbe (`sqlite3VdbeLinkSubProgram`).
    `step`/`reset`/`step` loops never recompile. This alone equals the efficiency of a
    hand-managed prepared statement, with the logic living in the database.
-2. **Per-connection shared cache (phase 5):** `Proc.pCompiled` — a refcounted `SubProgram`
-   shared by every `CALL` statement on the connection. Refcount held by the `Proc` and by
-   each linking Vdbe; schema-cookie bump swaps the `Proc` pointer while in-flight Vdbes
-   keep their (now-orphaned) copy alive until finalized. Invalidation is *already correct*
-   via the existing cookie/expire machinery — the cache only adds lifetime management.
+2. **Per-connection shared cache (phase 5 — implemented, revised):** a
+   `ProcCacheEntry` list on the **connection** (`sqlite3.pProcCache`), *not* on the
+   `Proc` as originally sketched — schema teardown frees Proc objects through a zeroed
+   stand-in db handle (`xdb` pattern), which must never free lookaside memory, and
+   compiled bodies are lookaside-eligible. Keeping every cache byte owned by the real
+   handle makes all frees safe. `SubProgram` is now refcounted (`nRef`); owners are the
+   compiling Vdbe's intrusive list, cache entries, and consuming Vdbes (via a
+   non-intrusive `apSharedProg` array — the intrusive list cannot be shared). Hits
+   require iDb + Schema pointer identity + schema-cookie match + name; flushes happen
+   in `sqlite3ExpirePreparedStatements` (function/collation registration, schema
+   resets), on DETACH, and at close. A hit replays the toplevel bookkeeping the
+   compile would have done: `nMaxArg`, write-transaction/journal flags, column names.
+
+   **Cacheability is conservative** — only self-contained bodies: not TEMP (multi-db
+   references defeat single-cookie guarding), not shared-cache mode, no AUTOINCREMENT
+   (autoinc opcodes address toplevel-frame registers by number, which differ across
+   statements), and no embedded sub-programs (trigger programs and nested CALLs are
+   statement-owned; sharing them needs cycle-aware refcounting — mutually recursive
+   cached procs would form uncollectable reference cycles). Excluded bodies silently
+   use tier 1.
+
+   Measured (bench-proccache.tcl, 8-statement body, 3000 fresh prepares): cached
+   21-32 µs/prepare vs 26-43 µs uncached across runs — the body-compile cost is
+   eliminated (the win scales with body size), and a cached CALL prepares faster
+   than the equivalent inline SQL, which pays codegen every time.
+
+   **Hard-won invariant:** `sqlite3_db_status()` measures statement memory by
+   running the real teardown path with `db->pnBytesFreed` set and all frees
+   faked. Teardown must not mutate state that survives the call;
+   `sqlite3SubProgramUnref` therefore counts-without-decrementing during
+   measurement passes. (Violating this leaked one op array per trigger per
+   measured statement — dbstatus/memsubsys2 caught it.)
 3. **Cross-connection (explicitly deferred, maybe never):** shared-schema builds only;
    not worth the mutex surface for v1.
 

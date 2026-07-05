@@ -521,6 +521,10 @@ struct Vdbe {
   int nFrame;             /* Number of frames in pFrame list */
   u32 expmask;            /* Binding to these vars invalidates VM */
   SubProgram *pProgram;   /* Linked list of all sub-programs used by VM */
+#ifndef SQLITE_OMIT_PROCEDURE
+  SubProgram **apSharedProg; /* Cached procedure bodies used by this VM */
+  int nSharedProg;        /* Number of entries in apSharedProg */
+#endif
   AuxData *pAuxData;      /* Linked list of auxdata allocations */
 #ifdef SQLITE_ENABLE_STMT_SCANSTATUS
   int nScan;              /* Entries in aScan[] */

@@ -48,8 +48,14 @@ CALL pay_down(42, 19.99);
   (statement-journal semantics), inside or outside explicit transactions.
 - **Pre-compilation**: the body compiles once per prepared CALL into a VDBE
   SubProgram (the machinery triggers use); `step`/`reset` cycles never
-  re-parse. A per-connection cache shared across statements is the planned
-  phase 5.
+  re-parse. On top of that, a per-connection cache shares the compiled body
+  across statements: re-preparing a CALL skips body compilation entirely
+  (measured ~1.35x faster prepares on an 8-statement body; the win scales
+  with body size). Cached bodies must be self-contained -- non-TEMP, no
+  AUTOINCREMENT tables, no triggers fired by body DML, no nested CALL;
+  anything else transparently uses the per-statement tier. The cache
+  invalidates on schema change (cookie), function/collation registration,
+  DETACH, and close.
 
 ## Semantics worth knowing
 
@@ -99,6 +105,8 @@ elsewhere are small and greppable by `SQLITE_OMIT_PROCEDURE`:
 | `src/vdbe.c` | `OP_DropProc` |
 | `src/vdbeaux.c` | `sqlite3VdbeTransferColumnNames` (CALL column names) |
 | `src/complete.c` | `CREATE PROCEDURE` uses the trigger ";END;" states |
+| `src/vdbe.h`, `src/vdbeInt.h` | `SubProgram.nRef`; `Vdbe.apSharedProg` (non-intrusive refs to cached bodies) |
+| `src/main.c`, `src/attach.c` | body-cache flush at close and on DETACH |
 | `src/shell.c.in` | `.dump` includes `'proc'` |
 
 Bodies are `TriggerStep` trees, so the trigger DbFixer and codegen
@@ -119,6 +127,22 @@ and lemon.
    requested explicitly (`sqlite3MultiWrite`/`sqlite3MayAbort`) for write steps.
 5. `SrcList` names inside stored bodies arrive with `fg.fixedSchema` set by the
    DbFixer; read the schema from `u4.pSchema`, not `u4.zDatabase`.
+6. Every byte of the connection-level body cache is allocated and freed
+   against the real `sqlite3*`. Schema teardown uses a zeroed stand-in handle
+   whose frees bypass lookaside -- caching anything on schema-owned objects
+   (e.g. on the Proc itself) would corrupt the heap.
+7. A cache hit must replay the toplevel bookkeeping its compile would have
+   done: `nMaxArg`, write-transaction and statement-journal flags, result
+   column names. Missing the write flags means body writes run without a
+   write transaction.
+8. Statement teardown (`sqlite3VdbeClearObject` and everything it calls)
+   doubles as the `sqlite3_db_status()` **memory-measurement pass**: with
+   `db->pnBytesFreed` set, all "frees" merely count bytes and nothing is
+   released. Teardown code must therefore never mutate state that outlives
+   the call — *reference counts included*. `sqlite3SubProgramUnref`
+   counts-without-decrementing in that mode; violating this leaked one op
+   array per trigger per measured statement (found via dbstatus/memsubsys2,
+   cost several hours — see git history).
 
 ## Build (Windows/MSVC)
 
@@ -135,5 +159,6 @@ the makefiles invoke freshly built tools by bare name.
 
 ## Test status at last commit
 
-- `proc1.test` 33/33, `proc2.test` 31/31, `psm1.test` 35/35, no memory leaks
+- `proc1.test` 33/33, `proc2.test` 31/31, `proc3.test` (cache) 29/29,
+  `psm1.test` 35/35, no memory leaks
 - Full `veryquick`: **0 errors out of 392,870** (vanilla baseline: 0/392,771)

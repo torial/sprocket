@@ -1376,6 +1376,7 @@ typedef struct SrcItem SrcItem;
 typedef struct SrcList SrcList;
 typedef struct sqlite3_str StrAccum; /* Internal alias for sqlite3_str */
 typedef struct Proc Proc;
+typedef struct ProcCacheEntry ProcCacheEntry;
 typedef struct ProcParam ProcParam;
 typedef struct ProcParamList ProcParamList;
 typedef struct Table Table;
@@ -1673,6 +1674,9 @@ typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
 struct sqlite3 {
   sqlite3_vfs *pVfs;            /* OS Interface */
   struct Vdbe *pVdbe;           /* List of active virtual machines */
+#ifndef SQLITE_OMIT_PROCEDURE
+  ProcCacheEntry *pProcCache;   /* Cached compiled procedure bodies */
+#endif
   CollSeq *pDfltColl;           /* BINARY collseq for the database encoding */
   sqlite3_mutex *mutex;         /* Connection mutex */
   Db *aDb;                      /* All backends */
@@ -4253,6 +4257,31 @@ struct Proc {
 };
 
 /*
+** One entry in the per-connection cache of compiled procedure bodies
+** (sqlite3.pProcCache).  The cache lives on the connection, not on the
+** Proc, so that every byte of it is allocated and freed against the
+** real database handle (schema teardown uses a zeroed stand-in handle
+** that must never free lookaside memory).
+**
+** pSchema is compared by pointer identity only and never dereferenced;
+** validity of a hit is established by iDb + name + schema cookie.
+*/
+struct ProcCacheEntry {
+  ProcCacheEntry *pNext;    /* Next entry in sqlite3.pProcCache */
+  Schema *pSchema;          /* Identity check only -- never dereferenced */
+  char *zProc;              /* Procedure name */
+  int iDb;                  /* Database holding the procedure */
+  u32 cookie;               /* Schema cookie when the body was compiled */
+  SubProgram *pProg;        /* The compiled body (holds one nRef) */
+  char **azColName;         /* nResCol cached column names, or NULL */
+  int nResCol;              /* Result columns; -1 if the body emits none */
+  int nMaxArg;              /* Toplevel nMaxArg needed by the body */
+  u8 flags;                 /* PROCCACHE_* flags */
+};
+#define PROCCACHE_WRITES    0x01  /* Body writes its database */
+#define PROCCACHE_MAYABORT  0x02  /* Body may throw an ABORT */
+
+/*
 ** Information about a RETURNING clause
 */
 struct Returning {
@@ -5367,6 +5396,9 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
   Proc *sqlite3FindProc(Parse*, const char*, const char*);
   TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
+  void sqlite3ProcCacheFlush(sqlite3*);
+  int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
+  char **sqlite3VdbeCaptureColumnNames(Vdbe*, int);
   TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);
   TriggerStep *sqlite3ProcSetStep(Parse*, Token*, Expr*);
   TriggerStep *sqlite3ProcIfStep(Parse*, Expr*, TriggerStep*, TriggerStep*);
@@ -5379,8 +5411,10 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
 #else
 # define sqlite3DeleteProc(A,B)
 # define sqlite3UnlinkAndDeleteProc(A,B,C)
+# define sqlite3ProcCacheFlush(A)
 #endif
 
+void sqlite3SubProgramUnref(sqlite3*, SubProgram*);
 int sqlite3JoinType(Parse*, Token*, Token*, Token*);
 int sqlite3ColumnIndex(Table *pTab, const char *zCol);
 void sqlite3SrcItemColumnUsed(SrcItem*,int);

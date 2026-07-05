@@ -1391,6 +1391,10 @@ void sqlite3LeaveMutexAndCloseZombie(sqlite3 *db){
   ** go ahead and free all resources.
   */
 
+  /* Release cached compiled procedure bodies while the handle is still
+  ** fully valid (their memory may live in this connection's lookaside). */
+  sqlite3ProcCacheFlush(db);
+
   /* If a transaction is open, roll it back. This also ensures that if
   ** any database schemas have been modified by an uncommitted transaction
   ** they are reset. And that the required b-tree mutex is held to make

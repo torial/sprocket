@@ -1275,6 +1275,7 @@ static TriggerPrg *codeRowTrigger(
   pTop->pTriggerPrg = pPrg;
   pPrg->pProgram = pProgram = sqlite3DbMallocZero(db, sizeof(SubProgram));
   if( !pProgram ) return 0;
+  pProgram->nRef = 1;   /* owned by pTop->pVdbe's pProgram list */
   sqlite3VdbeLinkSubProgram(pTop->pVdbe, pProgram);
   pPrg->pTrigger = pTrigger;
   pPrg->orconf = orconf;

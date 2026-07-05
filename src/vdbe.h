@@ -103,6 +103,9 @@ struct SubProgram {
   int nOp;                      /* Elements in aOp[] */
   int nMem;                     /* Number of memory cells required */
   int nCsr;                     /* Number of cursors required */
+  int nRef;                     /* Owners: the creating Vdbe's pProgram list,
+                                ** Proc body caches, and Vdbes attached via
+                                ** the apSharedProg array */
   u8 *aOnce;                    /* Array of OP_Once flags */
   void *token;                  /* id that may be used to recursive triggers */
   SubProgram *pNext;            /* Next sub-program already visited */
