@@ -1,0 +1,46 @@
+# MSVC in-tree build artifacts (nmake /f Makefile.msc)
+*.obj
+*.lo
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.asm
+
+# Generated sources and build state
+sqlite3.c
+sqlite3.h
+sqlite3ext.h
+sqlite3session.h
+sqlite3rc.h
+sqlite3.def
+shell.c
+ctime.c
+parse.c
+parse.h
+parse.out
+parse.sql
+opcodes.c
+opcodes.h
+keywordhash.h
+pragma.h
+fts5.c
+fts5.h
+fts5parse.c
+fts5parse.h
+fts5parse.out
+fts5parse.sql
+lempar.c
+tclsqlite-ex.c
+tsrc/
+testdir/
+.target_source
+tmp-*.txt
+
+# Test litter
+test.db
+test.db-journal
+test2.db
+test3.db
+testdb*

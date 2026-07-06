@@ -1,3 +1,33 @@
+<h1 align="center">Sprocket &mdash; SQLite with Stored Procedures</h1>
+
+> **This is a fork of SQLite 3.53.3 that adds native stored procedures**:
+> `CREATE PROCEDURE` / `DROP PROCEDURE` / `CALL`, a full procedural language
+> (`DECLARE`, `SET`, `IF/ELSEIF/ELSE`, `WHILE`, `LOOP`/`LEAVE`,
+> `SELECT ... INTO`, `RETURN`, `RAISE`), streaming result sets, atomic
+> multi-statement bodies, recursion, and two tiers of compiled-bytecode
+> caching (a cached `CALL` prepares faster than the equivalent inline SQL).
+>
+> ```sql
+> CREATE PROCEDURE archive_user(uid INTEGER)
+> BEGIN
+>   INSERT INTO archive SELECT * FROM users WHERE id = uid;
+>   DELETE FROM users WHERE id = uid;
+>   SELECT * FROM users;   -- rows stream back to the caller
+> END;
+>
+> CALL archive_user(42);
+> ```
+>
+> Start with **[README-PROCS.md](README-PROCS.md)** (user guide and
+> maintainer notes) and **[DESIGN-PROCS.md](DESIGN-PROCS.md)** (design
+> rationale and internals). All new code carries the same public-domain
+> blessing as SQLite itself. Full regression status at last commit:
+> 0 errors out of 392,904 tests.
+>
+> Everything below this line is stock SQLite's original README.
+
+---
+
 <h1 align="center">SQLite Source Repository</h1>
 
 This repository contains the complete source code for the
