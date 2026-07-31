@@ -114,6 +114,298 @@ void sqlite3ProcShapeListDelete(sqlite3 *db, ProcShape *pList){
 }
 
 /*
+** Conformance checking of a procedure body against its declared result
+** shapes (SPROCKET_RETURNS_TABLE_SPEC.md section 4).  Runs once, at
+** CREATE PROCEDURE time, on the TriggerStep tree -- never at CALL time.
+**
+** The walk carries a "shape cursor": the number of result sets streamed
+** so far on the path being examined.  Streaming SELECTs advance it;
+** every complete path must end with the cursor at nShape.
+**
+** Enforced: R1 (set count per path; RAISE exempt), R2 arity, R3 (branch
+** symmetry), R3L (no row-returning SELECT inside a loop), R4 (a declared
+** procedure may only CALL a RETURNS NOTHING procedure) and R5 (static
+** and conservative: "SELECT *" is rejected inside a declared procedure
+** because its arity is not knowable without name resolution).
+**
+** NOT enforced here: per-column type conformance.  Declared types are
+** authoritative for CALL metadata; as with an ordinary SQLite column
+** declaration they express affinity and intent rather than a checked
+** constraint.  Arity, ordering and set count -- the properties a static
+** consumer cannot recover at runtime -- are checked strictly.
+*/
+typedef struct ProcConf ProcConf;
+struct ProcConf {
+  Parse *pParse;          /* Parse context for error reporting */
+  Proc *pProc;            /* Procedure being defined (not yet in the hash) */
+  const char *zName;      /* Its name, for error messages */
+  int nShape;             /* Number of declared shapes (0 = RETURNS NOTHING) */
+  ProcShape **apShape;    /* Declared shapes, indexed */
+  const char *zWhere;     /* " in the THEN branch" etc, or "" at top level */
+  int nErr;               /* Nonzero once an error has been reported */
+};
+
+/* How a walked statement list ended */
+#define PROC_PATH_FALLS   0   /* Control falls out of the list normally */
+#define PROC_PATH_ENDS    1   /* Path ended (RETURN/LEAVE) */
+#define PROC_PATH_ABORTS  2   /* Path aborted (RAISE) -- exempt from R1 */
+
+/*
+** Return the number of result columns of pSelect, or -1 if that cannot
+** be determined statically (a "*" appears in some arm of a compound).
+*/
+static int procSelectArity(Select *pSelect){
+  Select *p;
+  int nCol = -1;
+  for(p=pSelect; p; p=p->pPrior){
+    ExprList *pEList = p->pEList;
+    int k;
+    if( pEList==0 ) return -1;
+    for(k=0; k<pEList->nExpr; k++){
+      Expr *pE = pEList->a[k].pExpr;
+      if( pE==0 ) return -1;
+      if( pE->op==TK_ASTERISK ) return -1;
+      if( pE->op==TK_DOT && pE->pRight && pE->pRight->op==TK_ASTERISK ){
+        return -1;
+      }
+    }
+    if( nCol<0 ) nCol = pEList->nExpr;
+  }
+  return nCol;
+}
+
+static int procCheckList(ProcConf*, TriggerStep*, int, int*, int);
+
+/*
+** Apply the CALL rule (R4) to one CALL step.
+*/
+static void procCheckCall(ProcConf *p, TriggerStep *pStep){
+  Proc *pCallee = 0;
+  const char *zCallee = "?";
+  if( pStep->pSrc && pStep->pSrc->nSrc>0 ){
+    SrcItem *pItem = &pStep->pSrc->a[0];
+    zCallee = pItem->zName;
+    if( zCallee && sqlite3StrICmp(zCallee, p->zName)==0 ){
+      pCallee = p->pProc;      /* Recursive self-call */
+    }else{
+      const char *zDb = pItem->fg.fixedSchema ? 0 : pItem->u4.zDatabase;
+      pCallee = sqlite3FindProc(p->pParse, zCallee, zDb);
+    }
+  }
+  if( pCallee==0 || pCallee->eRet!=PROC_RET_NOTHING ){
+    sqlite3ErrorMsg(p->pParse,
+      "procedure %s declares result shapes, so it may only CALL a "
+      "procedure declared RETURNS NOTHING (%s is not)",
+      p->zName, zCallee ? zCallee : "?");
+    p->nErr = 1;
+  }
+}
+
+/*
+** Walk a loop body: no row-returning SELECT is permitted there (R3L),
+** and nested constructs are searched too.
+*/
+static void procCheckLoopBody(ProcConf *p, TriggerStep *pList){
+  TriggerStep *pStep;
+  for(pStep=pList; pStep && p->nErr==0; pStep=pStep->pNext){
+    switch( pStep->op ){
+      case TK_SELECT: {
+        if( pStep->pIdList==0 ){
+          sqlite3ErrorMsg(p->pParse,
+            "procedure %s declares result shapes, so a loop body may not "
+            "contain a row-returning SELECT (SELECT ... INTO is allowed)",
+            p->zName);
+          p->nErr = 1;
+        }
+        break;
+      }
+      case TK_IF: {
+        procCheckLoopBody(p, pStep->pThen);
+        procCheckLoopBody(p, pStep->pElse);
+        break;
+      }
+      case TK_WHILE: {
+        procCheckLoopBody(p, pStep->pThen);
+        break;
+      }
+      case TK_CALL: {
+        procCheckCall(p, pStep);
+        break;
+      }
+      default: break;
+    }
+  }
+}
+
+/*
+** Walk one statement list with the shape cursor at iStart.  Returns the
+** cursor after the list; *peEnd receives a PROC_PATH_* code.
+*/
+static int procCheckList(
+  ProcConf *p,            /* Checker context */
+  TriggerStep *pList,     /* Statements to walk */
+  int iStart,             /* Shape cursor on entry */
+  int *peEnd,             /* OUT: PROC_PATH_* */
+  int bInLoop             /* True when walking inside a loop body */
+){
+  TriggerStep *pStep;
+  int i = iStart;
+  *peEnd = PROC_PATH_FALLS;
+  for(pStep=pList; pStep && p->nErr==0; pStep=pStep->pNext){
+    switch( pStep->op ){
+      case TK_SELECT: {
+        int nCol;
+        if( pStep->pIdList!=0 ) break;   /* SELECT ... INTO streams nothing */
+        if( bInLoop ) break;             /* Already reported by R3L */
+        if( p->nShape==0 ){
+          sqlite3ErrorMsg(p->pParse,
+            "procedure %s declares RETURNS NOTHING but contains a "
+            "row-returning SELECT", p->zName);
+          p->nErr = 1;
+          break;
+        }
+        if( i>=p->nShape ){
+          sqlite3ErrorMsg(p->pParse,
+            "procedure %s streams more result sets than the %d declared "
+            "by its RETURNS clauses", p->zName, p->nShape);
+          p->nErr = 1;
+          break;
+        }
+        nCol = procSelectArity(pStep->pSelect);
+        if( nCol<0 ){
+          sqlite3ErrorMsg(p->pParse,
+            "procedure %s declares result shapes, so result set %d may "
+            "not use \"*\" -- list the columns explicitly", p->zName, i+1);
+          p->nErr = 1;
+          break;
+        }
+        if( nCol!=p->apShape[i]->pCols->nParam ){
+          sqlite3ErrorMsg(p->pParse,
+            "result set %d of procedure %s%s has %d column%s but its "
+            "RETURNS TABLE declares %d", i+1, p->zName, p->zWhere, nCol,
+            nCol==1 ? "" : "s", p->apShape[i]->pCols->nParam);
+          p->nErr = 1;
+          break;
+        }
+        i++;
+        break;
+      }
+      case TK_IF: {
+        int eThen, eElse, iThen, iElse;
+        const char *zSave = p->zWhere;
+        p->zWhere = " in the THEN branch";
+        iThen = procCheckList(p, pStep->pThen, i, &eThen, bInLoop);
+        p->zWhere = pStep->pElse ? " in the ELSE branch" : zSave;
+        if( p->nErr ){ p->zWhere = zSave; break; }
+        iElse = procCheckList(p, pStep->pElse, i, &eElse, bInLoop);
+        p->zWhere = zSave;
+        if( p->nErr ) break;
+        if( eThen!=PROC_PATH_FALLS && eElse!=PROC_PATH_FALLS ){
+          *peEnd = (eThen==PROC_PATH_ABORTS && eElse==PROC_PATH_ABORTS)
+                     ? PROC_PATH_ABORTS : PROC_PATH_ENDS;
+          return i;
+        }else if( eThen!=PROC_PATH_FALLS ){
+          i = iElse;
+        }else if( eElse!=PROC_PATH_FALLS ){
+          i = iThen;
+        }else if( iThen!=iElse ){
+          sqlite3ErrorMsg(p->pParse,
+            "branches of IF in procedure %s stream different numbers of "
+            "result sets (%d and %d); every path must stream the declared "
+            "sequence in order", p->zName, iThen, iElse);
+          p->nErr = 1;
+        }else{
+          i = iThen;
+        }
+        break;
+      }
+      case TK_WHILE: {
+        procCheckLoopBody(p, pStep->pThen);
+        break;
+      }
+      case TK_CALL: {
+        procCheckCall(p, pStep);
+        break;
+      }
+      case TK_RETURN: {
+        if( !bInLoop && i!=p->nShape ){
+          sqlite3ErrorMsg(p->pParse,
+            "procedure %s returns after streaming %d of %d declared "
+            "result sets", p->zName, i, p->nShape);
+          p->nErr = 1;
+        }
+        *peEnd = PROC_PATH_ENDS;
+        return i;
+      }
+      case TK_RAISE: {
+        *peEnd = PROC_PATH_ABORTS;   /* R1 exempt */
+        return i;
+      }
+      case TK_LEAVE: {
+        *peEnd = PROC_PATH_ENDS;
+        return i;
+      }
+      default: break;
+    }
+  }
+  return i;
+}
+
+/*
+** Check a procedure body against its declared result shapes, reporting
+** errors through pParse.  Procedures with no RETURNS clause are not
+** checked (legacy dynamic behavior).
+*/
+static void procCheckConformance(Parse *pParse, Proc *pProc){
+  sqlite3 *db = pParse->db;
+  ProcConf conf;
+  ProcShape *pS;
+  int i, iEnd, eEnd;
+
+  if( pProc->eRet==PROC_RET_UNDECLARED ) return;
+  memset(&conf, 0, sizeof(conf));
+  conf.pParse = pParse;
+  conf.pProc = pProc;
+  conf.zName = pProc->zName;
+  conf.zWhere = "";
+  for(pS=pProc->pShapes; pS; pS=pS->pNext) conf.nShape++;
+  if( conf.nShape>0 ){
+    conf.apShape = sqlite3DbMallocRaw(db, conf.nShape*sizeof(ProcShape*));
+    if( conf.apShape==0 ) return;
+    for(i=0, pS=pProc->pShapes; pS; pS=pS->pNext, i++){
+      conf.apShape[i] = pS;
+    }
+  }
+  /* The engine currently delivers every streamed set through one prepared
+  ** statement, which has a single column count, and rejects a body whose
+  ** row-producing SELECTs disagree in width.  Until the result-set
+  ** boundary API of the spec lands, declared shapes must therefore agree
+  ** in arity.  Catching it here converts a confusing CALL-time failure
+  ** into a precise CREATE-time one. */
+  for(i=1; i<conf.nShape; i++){
+    int n0 = conf.apShape[0]->pCols->nParam;
+    int nk = conf.apShape[i]->pCols->nParam;
+    if( n0!=nk ){
+      sqlite3ErrorMsg(pParse,
+        "procedure %s declares result sets of differing widths (%d and %d); "
+        "this build streams all sets through one statement, so every "
+        "RETURNS TABLE must declare the same number of columns",
+        pProc->zName, n0, nk);
+      sqlite3DbFree(db, conf.apShape);
+      return;
+    }
+  }
+
+  iEnd = procCheckList(&conf, pProc->pBody, 0, &eEnd, 0);
+  if( conf.nErr==0 && eEnd==PROC_PATH_FALLS && iEnd!=conf.nShape ){
+    sqlite3ErrorMsg(pParse,
+      "procedure %s streams %d result set%s but declares %d",
+      pProc->zName, iEnd, iEnd==1 ? "" : "s", conf.nShape);
+  }
+  sqlite3DbFree(db, conf.apShape);
+}
+
+/*
 ** Delete a procedure parameter list and all of its content.
 */
 void sqlite3ProcParamListDelete(sqlite3 *db, ProcParamList *pList){
@@ -302,6 +594,14 @@ void sqlite3FinishProc(
     pProc->pShapes = pShapes;
   }
   pShapes = 0;
+
+  /* Enforce the declared shapes against the body.  Only on real DDL
+  ** execution: a procedure reaching the schema-reparse path already
+  ** passed this check when it was created. */
+  if( !db->init.busy && pProc->eRet!=PROC_RET_UNDECLARED ){
+    procCheckConformance(pParse, pProc);
+    if( pParse->nErr ) goto proc_cleanup;
+  }
 
   if( !db->init.busy ){
     /* Normal DDL execution: write the entry into sqlite_schema, then
