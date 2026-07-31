@@ -1379,6 +1379,7 @@ typedef struct Proc Proc;
 typedef struct ProcCacheEntry ProcCacheEntry;
 typedef struct ProcParam ProcParam;
 typedef struct ProcParamList ProcParamList;
+typedef struct ProcShape ProcShape;
 typedef struct Table Table;
 typedef struct TableLock TableLock;
 typedef struct Token Token;
@@ -4244,6 +4245,23 @@ struct ProcParamList {
 };
 
 /*
+** One declared result-set shape of a stored procedure ("RETURNS TABLE(...)").
+** Shapes form an ordered linked list on Proc.pShapes.  The columns of a
+** shape reuse ProcParamList (name + declared type).  A shape with pCols==0
+** is the parser's representation of "RETURNS NOTHING"; FinishProc folds
+** that into Proc.eRet and never stores such a node on the Proc.
+*/
+struct ProcShape {
+  ProcShape *pNext;         /* Next declared shape, in declaration order */
+  ProcParamList *pCols;     /* Declared columns, or NULL for RETURNS NOTHING */
+};
+
+/* Values for Proc.eRet */
+#define PROC_RET_UNDECLARED  0    /* No returns-clause: legacy dynamic proc */
+#define PROC_RET_NOTHING     1    /* RETURNS NOTHING: streams no result sets */
+#define PROC_RET_TABLES      2    /* One or more RETURNS TABLE(...) shapes */
+
+/*
 ** Each stored procedure is an instance of the following structure, stored
 ** in the Schema.procHash hash table and persisted as a 'proc' row in the
 ** sqlite_schema table.  The compiled-SubProgram cache (Proc.pCompiled) is
@@ -4254,6 +4272,8 @@ struct Proc {
   ProcParamList *pParams;   /* Declared parameters, or NULL if none */
   TriggerStep *pBody;       /* Linked list of body statements */
   Schema *pSchema;          /* Schema containing the procedure */
+  ProcShape *pShapes;       /* Declared result shapes (PROC_RET_TABLES) */
+  u8 eRet;                  /* One of the PROC_RET_* values */
 };
 
 /*
@@ -5386,14 +5406,17 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
 #endif
 
 #ifndef SQLITE_OMIT_PROCEDURE
-  void sqlite3FinishProc(Parse*,Token*,Token*,ProcParamList*,TriggerStep*,
-                         int,int,Token*);
+  void sqlite3FinishProc(Parse*,Token*,Token*,ProcParamList*,ProcShape*,
+                         TriggerStep*,int,int,Token*);
   void sqlite3DropProc(Parse*, SrcList*, int);
   void sqlite3CallProc(Parse*, SrcList*, ExprList*);
   void sqlite3DeleteProc(sqlite3*, Proc*);
   void sqlite3UnlinkAndDeleteProc(sqlite3*, int, const char*);
   ProcParamList *sqlite3ProcParamAppend(Parse*,ProcParamList*,Token*,Token*);
   void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
+  ProcShape *sqlite3ProcShapeAppend(Parse*,ProcShape*,ProcParamList*);
+  ProcShape *sqlite3ProcShapeNothing(Parse*,ProcShape*,Token*);
+  void sqlite3ProcShapeListDelete(sqlite3*, ProcShape*);
   Proc *sqlite3FindProc(Parse*, const char*, const char*);
   TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
   void sqlite3ProcCacheFlush(sqlite3*);

@@ -56,6 +56,64 @@ ProcParamList *sqlite3ProcParamAppend(
 }
 
 /*
+** Append a declared result shape ("RETURNS TABLE(...)") to a procedure's
+** shape list.  pCols carries the declared columns.  Creates the list head
+** if pList is NULL; returns the (possibly new) list, or NULL on OOM after
+** freeing both inputs.
+*/
+ProcShape *sqlite3ProcShapeAppend(
+  Parse *pParse,          /* Parsing context */
+  ProcShape *pList,       /* Existing shape list, or NULL */
+  ProcParamList *pCols    /* Declared columns of the new shape */
+){
+  sqlite3 *db = pParse->db;
+  ProcShape *pNew, *p;
+  pNew = sqlite3DbMallocZero(db, sizeof(ProcShape));
+  if( pNew==0 ){
+    sqlite3ProcParamListDelete(db, pCols);
+    sqlite3ProcShapeListDelete(db, pList);
+    return 0;
+  }
+  pNew->pCols = pCols;
+  if( pList==0 ) return pNew;
+  for(p=pList; p->pNext; p=p->pNext){}
+  p->pNext = pNew;
+  return pList;
+}
+
+/*
+** Parse-time handler for "RETURNS <name>" where <name> is not TABLE.
+** The only legal spelling is NOTHING (kept out of the keyword table on
+** purpose).  Represented as a shape node with pCols==0; FinishProc folds
+** it into Proc.eRet and enforces that it stands alone.
+*/
+ProcShape *sqlite3ProcShapeNothing(
+  Parse *pParse,          /* Parsing context */
+  ProcShape *pList,       /* Existing shape list, or NULL */
+  Token *pName            /* The word following RETURNS */
+){
+  sqlite3 *db = pParse->db;
+  if( pName->n!=7 || sqlite3StrNICmp((const char*)pName->z, "NOTHING", 7)!=0 ){
+    sqlite3ErrorMsg(pParse, "expected TABLE or NOTHING after RETURNS");
+    sqlite3ProcShapeListDelete(db, pList);
+    return 0;
+  }
+  return sqlite3ProcShapeAppend(pParse, pList, 0);
+}
+
+/*
+** Delete a list of declared result shapes.
+*/
+void sqlite3ProcShapeListDelete(sqlite3 *db, ProcShape *pList){
+  while( pList ){
+    ProcShape *pNext = pList->pNext;
+    sqlite3ProcParamListDelete(db, pList->pCols);
+    sqlite3DbFree(db, pList);
+    pList = pNext;
+  }
+}
+
+/*
 ** Delete a procedure parameter list and all of its content.
 */
 void sqlite3ProcParamListDelete(sqlite3 *db, ProcParamList *pList){
@@ -76,6 +134,7 @@ void sqlite3DeleteProc(sqlite3 *db, Proc *pProc){
   if( pProc==0 ) return;
   sqlite3DeleteTriggerStep(db, pProc->pBody);
   sqlite3ProcParamListDelete(db, pProc->pParams);
+  sqlite3ProcShapeListDelete(db, pProc->pShapes);
   sqlite3DbFree(db, pProc->zName);
   sqlite3DbFree(db, pProc);
 }
@@ -115,6 +174,7 @@ void sqlite3FinishProc(
   Token *pName1,          /* First part of the procedure name */
   Token *pName2,          /* Second part of the name, if db-qualified */
   ProcParamList *pParams, /* Declared parameters, or NULL */
+  ProcShape *pShapes,     /* Declared result shapes, or NULL if undeclared */
   TriggerStep *pStepList, /* Body of the procedure */
   int isTemp,             /* True if the TEMP keyword is present */
   int noErr,              /* True if IF NOT EXISTS is present */
@@ -177,6 +237,45 @@ void sqlite3FinishProc(
     }
   }
 
+  /* Validate the declared result shapes, if any.  RETURNS NOTHING (a
+  ** shape node with pCols==0) must stand alone; every RETURNS TABLE
+  ** column must carry a type name; column names within one shape must
+  ** be distinct. */
+  if( pShapes ){
+    ProcShape *pS;
+    int haveNothing = 0, haveTable = 0, iShape = 0;
+    for(pS=pShapes; pS; pS=pS->pNext, iShape++){
+      if( pS->pCols==0 ){
+        haveNothing = 1;
+      }else{
+        int j, k;
+        ProcParamList *pC = pS->pCols;
+        haveTable = 1;
+        for(j=0; j<pC->nParam; j++){
+          if( pC->a[j].zType==0 ){
+            sqlite3ErrorMsg(pParse,
+               "RETURNS TABLE column %s of %s needs a type name",
+               pC->a[j].zName, zName);
+            goto proc_cleanup;
+          }
+          for(k=0; k<j; k++){
+            if( sqlite3StrICmp(pC->a[j].zName, pC->a[k].zName)==0 ){
+              sqlite3ErrorMsg(pParse,
+                 "duplicate column name in RETURNS TABLE %d of %s: %s",
+                 iShape+1, zName, pC->a[j].zName);
+              goto proc_cleanup;
+            }
+          }
+        }
+      }
+    }
+    if( haveNothing && (haveTable || pShapes->pNext!=0) ){
+      sqlite3ErrorMsg(pParse,
+         "RETURNS NOTHING may not be combined with other RETURNS clauses");
+      goto proc_cleanup;
+    }
+  }
+
   /* Resolve or reject database qualifiers inside the body */
   sqlite3FixInit(&sFix, pParse, iDb, "procedure", pName);
   if( sqlite3FixTriggerStep(&sFix, pStepList) ){
@@ -193,6 +292,16 @@ void sqlite3FinishProc(
   pProc->pBody = pStepList;
   pStepList = 0;
   pProc->pSchema = db->aDb[iDb].pSchema;
+  if( pShapes==0 ){
+    pProc->eRet = PROC_RET_UNDECLARED;
+  }else if( pShapes->pCols==0 ){
+    pProc->eRet = PROC_RET_NOTHING;
+    sqlite3ProcShapeListDelete(db, pShapes);   /* Nothing worth keeping */
+  }else{
+    pProc->eRet = PROC_RET_TABLES;
+    pProc->pShapes = pShapes;
+  }
+  pShapes = 0;
 
   if( !db->init.busy ){
     /* Normal DDL execution: write the entry into sqlite_schema, then
@@ -227,6 +336,7 @@ void sqlite3FinishProc(
 proc_cleanup:
   sqlite3DbFree(db, zName);
   sqlite3ProcParamListDelete(db, pParams);
+  sqlite3ProcShapeListDelete(db, pShapes);
   sqlite3DeleteTriggerStep(db, pStepList);
   sqlite3DeleteProc(db, pProc);
 }
@@ -1190,6 +1300,34 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
       if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
       if( pParse->pToplevel==0 ){
         procCachePopulate(pParse, pProc, pPrg, pAincBefore);
+      }
+    }
+  }
+
+  /* Declared result shapes (RETURNS TABLE / RETURNS NOTHING): a toplevel
+  ** prepared CALL reports the FIRST declared shape through the standard
+  ** column-metadata interfaces, exactly as if it were a SELECT with those
+  ** columns -- declared names and types win over whatever the body's
+  ** first SELECT happened to be spelled as.  This intentionally runs
+  ** after all three body-acquisition paths above so it supersedes both
+  ** the fresh-compile column-name transfer and the cache-hit replay.
+  ** Undeclared procedures keep the legacy behavior untouched. */
+  if( pParse->pToplevel==0 && pProc->eRet!=PROC_RET_UNDECLARED ){
+    Vdbe *vTop = pParse->pVdbe;
+    if( pProc->eRet==PROC_RET_NOTHING ){
+      sqlite3VdbeSetNumCols(vTop, 0);
+    }else{
+      ProcParamList *pC = pProc->pShapes->pCols;
+      int k;
+      assert( pProc->eRet==PROC_RET_TABLES && pC!=0 );
+      sqlite3VdbeSetNumCols(vTop, pC->nParam);
+      for(k=0; k<pC->nParam; k++){
+        sqlite3VdbeSetColName(vTop, k, COLNAME_NAME,
+                              pC->a[k].zName, SQLITE_TRANSIENT);
+#ifndef SQLITE_OMIT_DECLTYPE
+        sqlite3VdbeSetColName(vTop, k, COLNAME_DECLTYPE,
+                              pC->a[k].zType, SQLITE_TRANSIENT);
+#endif
       }
     }
   }

@@ -304,6 +304,7 @@ static Keyword aKeywordTable[] = {
   { "REPLACE",          "TK_REPLACE",      CONFLICT,         10     },
   { "RESTRICT",         "TK_RESTRICT",     FKEY,             1      },
   { "RETURN",           "TK_RETURN",       PROCEDURE,        1      },
+  { "RETURNS",          "TK_RETURNS",      PROCEDURE,        1      },
   { "RETURNING",        "TK_RETURNING",    RETURNING,        10     },
   { "RIGHT",            "TK_JOIN_KW",      ALWAYS,           0      },
   { "ROLLBACK",         "TK_ROLLBACK",     ALWAYS,           1      },

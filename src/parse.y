@@ -277,7 +277,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
   QUERY KEY OF OFFSET PRAGMA RAISE RECURSIVE RELEASE REPLACE RESTRICT ROW ROWS
   ROLLBACK SAVEPOINT TEMP TRIGGER VACUUM VIEW VIRTUAL WITH WITHOUT
   NULLS FIRST LAST
-  CALL PROCEDURE DECLARE ELSEIF LEAVE LOOP RETURN WHILE
+  CALL PROCEDURE DECLARE ELSEIF LEAVE LOOP RETURN WHILE RETURNS
 %ifdef SQLITE_OMIT_COMPOUND_SELECT
   EXCEPT INTERSECT UNION
 %endif SQLITE_OMIT_COMPOUND_SELECT
@@ -1856,11 +1856,11 @@ cmd ::= DROP TRIGGER ifexists(NOERR) fullname(X). {
 %ifndef SQLITE_OMIT_PROCEDURE
 
 cmd ::= createkw temp(T) PROCEDURE ifnotexists(NOERR) nm(B) dbnm(Z)
-        LP procparams(P) RP BEGIN proc_cmd_list(S) END(E). {
+        LP procparams(P) RP procreturns(R) BEGIN proc_cmd_list(S) END(E). {
   Token all;
   all.z = (Z.n==0 ? B.z : Z.z);
   all.n = (int)(E.z - all.z) + E.n;
-  sqlite3FinishProc(pParse, &B, &Z, P, S, T, NOERR, &all);
+  sqlite3FinishProc(pParse, &B, &Z, P, R, S, T, NOERR, &all);
 #ifdef SQLITE_DEBUG
   assert( pParse->isCreate ); /* Set by createkw reduce action */
   pParse->isCreate = 0;       /* But, should not be set for CREATE PROCEDURE */
@@ -1940,6 +1940,38 @@ procparams(A) ::= nm(X) typetoken(Y). {
   A = sqlite3ProcParamAppend(pParse, 0, &X, &Y);
 }
 procparams(A) ::= procparams(A) COMMA nm(X) typetoken(Y). {
+  A = sqlite3ProcParamAppend(pParse, A, &X, &Y);
+}
+
+// Optional declared result shapes: zero or more RETURNS clauses between the
+// parameter list and BEGIN.  "RETURNS TABLE(col type, ...)" appends a shape;
+// "RETURNS NOTHING" is parsed as RETURNS nm and validated by name (NOTHING is
+// deliberately not a keyword).  Validation of the clause combinations
+// happens in sqlite3FinishProc.
+//
+%type procreturns {ProcShape*}
+%destructor procreturns {sqlite3ProcShapeListDelete(pParse->db, $$);}
+procreturns(A) ::= . {A = 0;}
+procreturns(A) ::= procreturns(B) RETURNS TABLE LP procretcols(C) RP. {
+  A = sqlite3ProcShapeAppend(pParse, B, C);
+}
+procreturns(A) ::= procreturns(B) RETURNS NOTHING. {
+  A = sqlite3ProcShapeAppend(pParse, B, 0);
+}
+// Any other word after RETURNS: accepted by the grammar so that the error
+// message can name the problem instead of a bare "syntax error".  (NOTHING
+// is a keyword of the UPSERT family and is matched by the rule above; it is
+// deliberately NOT added to the ID fallback list, which would change stock
+// SQLite parsing.)
+procreturns(A) ::= procreturns(B) RETURNS nm(N). {
+  A = sqlite3ProcShapeNothing(pParse, B, &N);
+}
+%type procretcols {ProcParamList*}
+%destructor procretcols {sqlite3ProcParamListDelete(pParse->db, $$);}
+procretcols(A) ::= nm(X) typetoken(Y). {
+  A = sqlite3ProcParamAppend(pParse, 0, &X, &Y);
+}
+procretcols(A) ::= procretcols(A) COMMA nm(X) typetoken(Y). {
   A = sqlite3ProcParamAppend(pParse, A, &X, &Y);
 }
 
