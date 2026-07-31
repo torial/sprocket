@@ -280,6 +280,18 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_INTROSPECTION_PRAGMAS)
 
+  NAME: proc_list
+  FLAG: NeedSchema Result0
+  COLS: name nparams nresultsets declared
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_PROCEDURE)
+
+  NAME: proc_info
+  FLAG: NeedSchema Result1 SchemaOpt
+  COLS: resultset_index position name decltype
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_PROCEDURE)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

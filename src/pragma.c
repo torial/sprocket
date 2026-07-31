@@ -1458,6 +1458,92 @@ void sqlite3Pragma(
   }
   break;
 
+#ifndef SQLITE_OMIT_PROCEDURE
+  /*
+  **   PRAGMA [schema.]proc_list
+  **
+  ** Return one row per stored procedure: name, parameter count, number of
+  ** declared result sets, and whether the procedure declares its shapes.
+  ** Procedures of every attached schema are listed (schema-qualified form
+  ** restricts to one).
+  */
+  case PragTyp_PROC_LIST: {
+    int ii;
+    pParse->nMem = 4;
+    for(ii=0; ii<db->nDb; ii++){
+      HashElem *k;
+      Schema *pSchema;
+      if( !OMIT_TEMPDB && ii==1 ) continue;   /* Covered by iDb below */
+      pSchema = db->aDb[ii].pSchema;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+      for(k=sqliteHashFirst(&pSchema->procHash); k; k=sqliteHashNext(k)){
+        Proc *pProc = (Proc*)sqliteHashData(k);
+        int nShape = 0;
+        ProcShape *pS;
+        for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
+        sqlite3VdbeMultiLoad(v, 1, "siii", pProc->zName,
+            pProc->pParams ? pProc->pParams->nParam : 0,
+            pProc->eRet==PROC_RET_TABLES ? nShape : 0,
+            pProc->eRet!=PROC_RET_UNDECLARED);
+      }
+    }
+    if( !OMIT_TEMPDB && (zDb==0
+     || sqlite3StrICmp(zDb, db->aDb[1].zDbSName)==0) && db->aDb[1].pSchema ){
+      HashElem *k;
+      for(k=sqliteHashFirst(&db->aDb[1].pSchema->procHash); k;
+          k=sqliteHashNext(k)){
+        Proc *pProc = (Proc*)sqliteHashData(k);
+        int nShape = 0;
+        ProcShape *pS;
+        for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
+        sqlite3VdbeMultiLoad(v, 1, "siii", pProc->zName,
+            pProc->pParams ? pProc->pParams->nParam : 0,
+            pProc->eRet==PROC_RET_TABLES ? nShape : 0,
+            pProc->eRet!=PROC_RET_UNDECLARED);
+      }
+    }
+  }
+  break;
+
+  /*
+  **   PRAGMA [schema.]proc_info(procedure-name)
+  **
+  ** Describe one stored procedure.  Result set 0 describes the declared
+  ** parameters; sets 1..n describe the declared RETURNS TABLE shapes, in
+  ** declaration order.  An undeclared procedure reports its parameters
+  ** only; a RETURNS NOTHING procedure likewise (it has no shapes).
+  */
+  case PragTyp_PROC_INFO: if( zRight ){
+    Proc *pProc = 0;
+    int ii;
+    pParse->nMem = 4;
+    for(ii=0; ii<db->nDb && pProc==0; ii++){
+      Schema *pSchema = db->aDb[ii].pSchema;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+      pProc = (Proc*)sqlite3HashFind(&pSchema->procHash, zRight);
+    }
+    if( pProc ){
+      ProcParamList *pP = pProc->pParams;
+      ProcShape *pS;
+      int iSet = 1, j;
+      for(j=0; pP && j<pP->nParam; j++){
+        sqlite3VdbeMultiLoad(v, 1, "iiss", 0, j, pP->a[j].zName,
+                             pP->a[j].zType);
+      }
+      for(pS=pProc->pShapes; pS; pS=pS->pNext, iSet++){
+        ProcParamList *pC = pS->pCols;
+        for(j=0; pC && j<pC->nParam; j++){
+          sqlite3VdbeMultiLoad(v, 1, "iiss", iSet, j, pC->a[j].zName,
+                               pC->a[j].zType);
+        }
+      }
+    }
+  }
+  break;
+#endif /* SQLITE_OMIT_PROCEDURE */
+
 #ifndef SQLITE_OMIT_INTROSPECTION_PRAGMAS
   case PragTyp_FUNCTION_LIST: {
     int i;
