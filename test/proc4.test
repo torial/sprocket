@@ -1,0 +1,313 @@
+# 2026-07-31
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Test cases for declared result shapes on stored procedures:
+# RETURNS TABLE(...) / RETURNS NOTHING, the conformance rules enforced
+# at CREATE PROCEDURE time, prepare-time column metadata for the first
+# declared shape, and the proc_list / proc_info introspection pragmas.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc4
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER, title TEXT, created_at TEXT);
+  CREATE TABLE comments(id INTEGER, post_id INTEGER, body TEXT);
+  CREATE TABLE users(name TEXT);
+  INSERT INTO posts VALUES(1,'Hello','2026-07-31');
+  INSERT INTO comments VALUES(7,1,'nice');
+} {}
+
+#--------------------------------------------------------------------
+# 1.x: syntax and storage
+#
+do_execsql_test 1.0 {
+  CREATE PROCEDURE post_with_comments(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT, created_at TEXT)
+    RETURNS TABLE(cid INTEGER, post_id INTEGER, body TEXT)
+  BEGIN
+    SELECT id, title, created_at FROM posts WHERE id = pid;
+    SELECT id, post_id, body FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+# The declaration round-trips through sqlite_schema
+do_execsql_test 1.1 {
+  SELECT sql LIKE '%RETURNS TABLE%RETURNS TABLE%' FROM sqlite_schema
+   WHERE type='proc' AND name='post_with_comments';
+} {1}
+
+do_execsql_test 1.2 {
+  CREATE PROCEDURE mutate_only(x INTEGER) RETURNS NOTHING
+  BEGIN
+    INSERT INTO posts VALUES(x, 'made', 'now');
+  END;
+  CALL mutate_only(42);
+  SELECT count(*) FROM posts WHERE id=42;
+} {1}
+
+# RETURNS is still usable as an ordinary identifier
+do_execsql_test 1.3 {
+  CREATE TABLE returns(returns INTEGER);
+  INSERT INTO returns VALUES(3);
+  SELECT returns FROM returns;
+} {3}
+
+do_catchsql_test 1.4 {
+  CREATE PROCEDURE e1(x INTEGER) RETURNS SOMETHING BEGIN SELECT 1; END;
+} {1 {expected TABLE or NOTHING after RETURNS}}
+
+do_catchsql_test 1.5 {
+  CREATE PROCEDURE e2(x INTEGER) RETURNS NOTHING RETURNS TABLE(a INTEGER)
+  BEGIN SELECT 1; END;
+} {1 {RETURNS NOTHING may not be combined with other RETURNS clauses}}
+
+do_catchsql_test 1.6 {
+  CREATE PROCEDURE e3(x INTEGER) RETURNS TABLE(a INTEGER, a TEXT)
+  BEGIN SELECT 1,2; END;
+} {1 {duplicate column name in RETURNS TABLE 1 of e3: a}}
+
+do_catchsql_test 1.7 {
+  CREATE PROCEDURE e4(x INTEGER) RETURNS TABLE(a) BEGIN SELECT 1; END;
+} {1 {RETURNS TABLE column a of e4 needs a type name}}
+
+#--------------------------------------------------------------------
+# 2.x: prepare-time metadata (the declaration wins)
+#
+do_test 2.0 {
+  set S [sqlite3_prepare_v2 db "CALL post_with_comments(?)" -1 dummy]
+  set res [list [sqlite3_column_count $S]]
+  for {set i 0} {$i<[sqlite3_column_count $S]} {incr i} {
+    lappend res [sqlite3_column_name $S $i] [sqlite3_column_decltype $S $i]
+  }
+  sqlite3_finalize $S
+  set res
+} {3 id INTEGER title TEXT created_at TEXT}
+
+# Body column names do not have to match the declaration
+do_execsql_test 2.1 {
+  CREATE PROCEDURE renamed(pid INTEGER) RETURNS TABLE(pk INTEGER, headline TEXT)
+  BEGIN
+    SELECT p.id, p.title FROM posts p WHERE p.id = pid;
+  END;
+} {}
+
+do_test 2.2 {
+  set S [sqlite3_prepare_v2 db "CALL renamed(?)" -1 dummy]
+  set res [list [sqlite3_column_name $S 0] [sqlite3_column_name $S 1]]
+  sqlite3_finalize $S
+  set res
+} {pk headline}
+
+# RETURNS NOTHING reports no columns at all
+do_test 2.3 {
+  set S [sqlite3_prepare_v2 db "CALL mutate_only(?)" -1 dummy]
+  set res [sqlite3_column_count $S]
+  sqlite3_finalize $S
+  set res
+} {0}
+
+#--------------------------------------------------------------------
+# 3.x: conformance rules, enforced at CREATE PROCEDURE time
+#
+# R1: the declared number of sets, on every path
+do_catchsql_test 3.0 {
+  CREATE PROCEDURE n1(x INTEGER) RETURNS TABLE(a INTEGER) RETURNS TABLE(b INTEGER)
+  BEGIN SELECT 1; END;
+} {1 {procedure n1 streams 1 result set but declares 2}}
+
+do_catchsql_test 3.1 {
+  CREATE PROCEDURE n2(x INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN SELECT 1; SELECT 2; END;
+} {1 {procedure n2 streams more result sets than the 1 declared by its RETURNS clauses}}
+
+do_catchsql_test 3.2 {
+  CREATE PROCEDURE n3(x INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN IF x > 0 THEN RETURN; END IF; SELECT 1; END;
+} {1 {procedure n3 returns after streaming 0 of 1 declared result sets}}
+
+# R1 exemption: RAISE may abort mid-sequence
+do_execsql_test 3.3 {
+  CREATE PROCEDURE raiser(flag INTEGER) RETURNS TABLE(v INTEGER)
+  BEGIN
+    IF flag > 0 THEN RAISE(ABORT, 'nope'); END IF;
+    SELECT 9;
+  END;
+  CALL raiser(0);
+} {9}
+
+# R2: arity
+do_catchsql_test 3.4 {
+  CREATE PROCEDURE n4(x INTEGER) RETURNS TABLE(a INTEGER, b TEXT)
+  BEGIN SELECT 1; END;
+} {1 {result set 1 of procedure n4 has 1 column but its RETURNS TABLE declares 2}}
+
+# R3: branch symmetry, and the message names the branch
+do_catchsql_test 3.5 {
+  CREATE PROCEDURE n5(x INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN IF x > 0 THEN SELECT 1; END IF; END;
+} {1 {branches of IF in procedure n5 stream different numbers of result sets (1 and 0); every path must stream the declared sequence in order}}
+
+do_catchsql_test 3.6 {
+  CREATE PROCEDURE bad(flag INTEGER) RETURNS TABLE(id INTEGER, title TEXT)
+  BEGIN
+    IF flag > 0 THEN
+      SELECT id, title FROM posts;
+    ELSE
+      SELECT name FROM users;
+    END IF;
+  END;
+} {1 {result set 1 of procedure bad in the ELSE branch has 1 column but its RETURNS TABLE declares 2}}
+
+# Symmetric branches are fine
+do_execsql_test 3.7 {
+  CREATE PROCEDURE sym(flag INTEGER) RETURNS TABLE(v INTEGER)
+  BEGIN
+    IF flag > 0 THEN SELECT 1; ELSE SELECT 2; END IF;
+  END;
+  CALL sym(0);
+} {2}
+
+# R3L: no row-returning SELECT inside a loop; SELECT ... INTO is fine
+do_catchsql_test 3.8 {
+  CREATE PROCEDURE n6(n INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN
+    DECLARE i INTEGER DEFAULT 0;
+    WHILE i < n DO SET i = i + 1; SELECT i; END WHILE;
+  END;
+} {1 {procedure n6 declares result shapes, so a loop body may not contain a row-returning SELECT (SELECT ... INTO is allowed)}}
+
+do_execsql_test 3.9 {
+  CREATE PROCEDURE loopok(n INTEGER) RETURNS TABLE(total INTEGER)
+  BEGIN
+    DECLARE s INTEGER DEFAULT 0;
+    DECLARE i INTEGER DEFAULT 0;
+    DECLARE t INTEGER DEFAULT 0;
+    WHILE i < n DO
+      SET i = i + 1;
+      SELECT count(*) FROM users INTO t;
+      SET s = s + i + t;
+    END WHILE;
+    SELECT s;
+    RETURN;
+  END;
+  CALL loopok(3);
+} {6}
+
+# R4: a declared procedure may only CALL a RETURNS NOTHING procedure
+do_execsql_test 3.10 {
+  CREATE PROCEDURE caller_ok(x INTEGER) RETURNS TABLE(n INTEGER)
+  BEGIN
+    CALL mutate_only(x);
+    SELECT count(*) FROM posts;
+  END;
+  CALL caller_ok(43);
+  SELECT count(*) FROM posts WHERE id=43;
+} {3 1}
+
+do_catchsql_test 3.11 {
+  CREATE PROCEDURE n7(x INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN CALL renamed(x); SELECT 1; END;
+} {1 {procedure n7 declares result shapes, so it may only CALL a procedure declared RETURNS NOTHING (renamed is not)}}
+
+# R5: "*" is not statically typeable
+do_catchsql_test 3.12 {
+  CREATE PROCEDURE n8(x INTEGER) RETURNS TABLE(a INTEGER, b TEXT, c TEXT)
+  BEGIN SELECT * FROM posts; END;
+} {1 {procedure n8 declares result shapes, so result set 1 may not use "*" -- list the columns explicitly}}
+
+# RETURNS NOTHING rejects a row-returning SELECT
+do_catchsql_test 3.13 {
+  CREATE PROCEDURE n9(x INTEGER) RETURNS NOTHING BEGIN SELECT 1; END;
+} {1 {procedure n9 declares RETURNS NOTHING but contains a row-returning SELECT}}
+
+# Declared shapes must presently agree in width (single-statement delivery)
+do_catchsql_test 3.14 {
+  CREATE PROCEDURE n10(x INTEGER)
+    RETURNS TABLE(a INTEGER, b INTEGER, c INTEGER)
+    RETURNS TABLE(d INTEGER)
+  BEGIN SELECT id, title, created_at FROM posts; SELECT id FROM posts; END;
+} {1 {procedure n10 declares result sets of differing widths (3 and 1); this build streams all sets through one statement, so every RETURNS TABLE must declare the same number of columns}}
+
+# Undeclared procedures are not checked at all
+do_execsql_test 3.15 {
+  CREATE PROCEDURE legacy(flag INTEGER)
+  BEGIN
+    IF flag > 0 THEN SELECT id FROM posts; ELSE SELECT name FROM users; END IF;
+  END;
+} {}
+
+#--------------------------------------------------------------------
+# 4.x: introspection pragmas
+#
+do_execsql_test 4.0 {
+  SELECT nparams, nresultsets, declared FROM pragma_proc_list
+   WHERE name='post_with_comments';
+} {1 2 1}
+
+do_execsql_test 4.1 {
+  SELECT nparams, nresultsets, declared FROM pragma_proc_list
+   WHERE name='mutate_only';
+} {1 0 1}
+
+do_execsql_test 4.2 {
+  SELECT nparams, nresultsets, declared FROM pragma_proc_list
+   WHERE name='legacy';
+} {1 0 0}
+
+do_execsql_test 4.3 {
+  PRAGMA proc_info(post_with_comments);
+} {0 0 pid INTEGER 1 0 id INTEGER 1 1 title TEXT 1 2 created_at TEXT 2 0 cid INTEGER 2 1 post_id INTEGER 2 2 body TEXT}
+
+# Undeclared: parameters only
+do_execsql_test 4.4 {
+  PRAGMA proc_info(legacy);
+} {0 0 flag INTEGER}
+
+# RETURNS NOTHING: parameters only
+do_execsql_test 4.5 {
+  PRAGMA proc_info(mutate_only);
+} {0 0 x INTEGER}
+
+# Unknown procedure: empty, not an error
+do_execsql_test 4.6 {
+  PRAGMA proc_info(nosuchproc);
+} {}
+
+#--------------------------------------------------------------------
+# 5.x: the declaration survives a reopen (schema reparse)
+#
+do_test 5.0 {
+  db close
+  sqlite3 db test.db
+  execsql {
+    CREATE TABLE t5(a INTEGER, b TEXT);
+    CREATE PROCEDURE persisted(x INTEGER) RETURNS TABLE(u INTEGER, w TEXT)
+    BEGIN SELECT a, b FROM t5 WHERE a = x; END;
+  }
+  db close
+  sqlite3 db test.db
+  execsql {SELECT nresultsets, declared FROM pragma_proc_list WHERE name='persisted'}
+} {1 1}
+
+do_test 5.1 {
+  set S [sqlite3_prepare_v2 db "CALL persisted(?)" -1 dummy]
+  set res [list [sqlite3_column_name $S 0] [sqlite3_column_decltype $S 1]]
+  sqlite3_finalize $S
+  set res
+} {u TEXT}
+
+finish_test
