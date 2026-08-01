@@ -236,8 +236,8 @@ the makefiles invoke freshly built tools by bare name.
 
 - `proc1.test` 33/33, `proc2.test` 31/31, `proc3.test` (cache) 29/29,
   `psm1.test` 35/35, no memory leaks
-- `proc4.test` (declared shapes) — **written but not yet executed**: it was
-  authored on a machine without Tcl headers, so `testfixture.exe` could not
-  be built there. Its cases were all verified by hand against `sqlite3.exe`
-  first; run it (and `veryquick`) before trusting the shape feature.
-- Full `veryquick`: **0 errors out of 392,870** (vanilla baseline: 0/392,771)
+- `proc4.test` (declared shapes, incl. the result-set boundary API) 47/47
+- Full `veryquick`: **0 errors out of 392,956**, no leaks (vanilla baseline:
+  0/392,771). `dbstatus` and `memsubsys2` — the memory-measurement suites
+  that caught a refcount leak in this fork once before — 26/26 each.
+
