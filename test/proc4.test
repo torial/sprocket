@@ -19,7 +19,103 @@ source $testdir/tester.tcl
 set testprefix proc4
 
 ifcapable {!trigger} {
-  finish_test
+  #--------------------------------------------------------------------
+# 6.x: the result-set boundary API
+#
+do_execsql_test 6.0 {
+  INSERT INTO comments VALUES(8,1,'again');
+  CREATE PROCEDURE two_sets(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT, created_at TEXT)
+    RETURNS TABLE(cid INTEGER, post_id INTEGER, body TEXT)
+  BEGIN
+    SELECT id, title, created_at FROM posts WHERE id = pid;
+    SELECT id, post_id, body FROM comments WHERE post_id = pid ORDER BY id;
+  END;
+} {}
+
+# Set 1 ends at its own boundary: DONE, and stepping again stays DONE
+do_test 6.1 {
+  set S [sqlite3_prepare_v2 db "CALL two_sets(1)" -1 dummy]
+  set res [list]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 1]
+  lappend res [sqlite3_step $S]
+  lappend res [sqlite3_step $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_ROW Hello SQLITE_DONE SQLITE_DONE}
+
+# Advancing exposes set 2, with its own declared metadata
+do_test 6.2 {
+  set S [sqlite3_prepare_v2 db "CALL two_sets(1)" -1 dummy]
+  sqlite3_step $S
+  sqlite3_step $S
+  set res [list [sqlite3_proc_next_resultset $S]]
+  lappend res [sqlite3_column_count $S] [sqlite3_column_name $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  lappend res [sqlite3_step $S]
+  lappend res [sqlite3_proc_next_resultset $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_OK 3 cid SQLITE_ROW 7 SQLITE_ROW 8 SQLITE_DONE SQLITE_DONE}
+
+# Sets of DIFFERENT widths -- impossible before the boundary API
+do_execsql_test 6.3 {
+  CREATE PROCEDURE wide_then_narrow(pid INTEGER)
+    RETURNS TABLE(a INTEGER, b TEXT, c TEXT)
+    RETURNS TABLE(n INTEGER)
+  BEGIN
+    SELECT id, title, created_at FROM posts WHERE id = pid;
+    SELECT count(*) FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+do_test 6.4 {
+  set S [sqlite3_prepare_v2 db "CALL wide_then_narrow(1)" -1 dummy]
+  set res [list [sqlite3_column_count $S]]
+  sqlite3_step $S
+  sqlite3_step $S
+  lappend res [sqlite3_proc_next_resultset $S]
+  lappend res [sqlite3_column_count $S] [sqlite3_column_name $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  sqlite3_finalize $S
+  set res
+} {3 SQLITE_OK 1 n SQLITE_ROW 2}
+
+# Reset restores the first set's metadata
+do_test 6.5 {
+  set S [sqlite3_prepare_v2 db "CALL wide_then_narrow(1)" -1 dummy]
+  sqlite3_step $S
+  sqlite3_step $S
+  sqlite3_proc_next_resultset $S
+  set mid [sqlite3_column_count $S]
+  sqlite3_reset $S
+  set res [list $mid [sqlite3_column_count $S] [sqlite3_column_name $S 0]]
+  sqlite3_finalize $S
+  set res
+} {1 3 a}
+
+# The API is a misuse on statements that have no declared shapes
+do_test 6.6 {
+  set S [sqlite3_prepare_v2 db "SELECT 1" -1 dummy]
+  set res [sqlite3_proc_next_resultset $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_MISUSE}
+
+# Undeclared procedures keep the legacy concatenated delivery
+do_test 6.7 {
+  execsql {
+    CREATE PROCEDURE legacy_two(pid INTEGER)
+    BEGIN
+      SELECT id FROM posts WHERE id = pid;
+      SELECT post_id FROM comments WHERE post_id = pid ORDER BY id;
+    END;
+  }
+  execsql {CALL legacy_two(1)}
+} {1 1 1}
+
+finish_test
   return
 }
 
@@ -208,15 +304,17 @@ do_execsql_test 3.9 {
 } {6}
 
 # R4: a declared procedure may only CALL a RETURNS NOTHING procedure
+# Counts only its own effect: a total would couple this case to every
+# earlier test that touched posts.
 do_execsql_test 3.10 {
   CREATE PROCEDURE caller_ok(x INTEGER) RETURNS TABLE(n INTEGER)
   BEGIN
     CALL mutate_only(x);
-    SELECT count(*) FROM posts;
+    SELECT count(*) FROM posts WHERE id = x;
   END;
   CALL caller_ok(43);
   SELECT count(*) FROM posts WHERE id=43;
-} {3 1}
+} {1 1}
 
 do_catchsql_test 3.11 {
   CREATE PROCEDURE n7(x INTEGER) RETURNS TABLE(a INTEGER)
@@ -234,13 +332,14 @@ do_catchsql_test 3.13 {
   CREATE PROCEDURE n9(x INTEGER) RETURNS NOTHING BEGIN SELECT 1; END;
 } {1 {procedure n9 declares RETURNS NOTHING but contains a row-returning SELECT}}
 
-# Declared shapes must presently agree in width (single-statement delivery)
-do_catchsql_test 3.14 {
+# Declared sets may differ in width: each is checked against its own shape,
+# and the boundary API switches the statement's metadata between them.
+do_execsql_test 3.14 {
   CREATE PROCEDURE n10(x INTEGER)
-    RETURNS TABLE(a INTEGER, b INTEGER, c INTEGER)
+    RETURNS TABLE(a INTEGER, b TEXT, c TEXT)
     RETURNS TABLE(d INTEGER)
   BEGIN SELECT id, title, created_at FROM posts; SELECT id FROM posts; END;
-} {1 {procedure n10 declares result sets of differing widths (3 and 1); this build streams all sets through one statement, so every RETURNS TABLE must declare the same number of columns}}
+} {}
 
 # Undeclared procedures are not checked at all
 do_execsql_test 3.15 {
@@ -309,5 +408,101 @@ do_test 5.1 {
   sqlite3_finalize $S
   set res
 } {u TEXT}
+
+#--------------------------------------------------------------------
+# 6.x: the result-set boundary API
+#
+do_execsql_test 6.0 {
+  INSERT INTO comments VALUES(8,1,'again');
+  CREATE PROCEDURE two_sets(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT, created_at TEXT)
+    RETURNS TABLE(cid INTEGER, post_id INTEGER, body TEXT)
+  BEGIN
+    SELECT id, title, created_at FROM posts WHERE id = pid;
+    SELECT id, post_id, body FROM comments WHERE post_id = pid ORDER BY id;
+  END;
+} {}
+
+# Set 1 ends at its own boundary: DONE, and stepping again stays DONE
+do_test 6.1 {
+  set S [sqlite3_prepare_v2 db "CALL two_sets(1)" -1 dummy]
+  set res [list]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 1]
+  lappend res [sqlite3_step $S]
+  lappend res [sqlite3_step $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_ROW Hello SQLITE_DONE SQLITE_DONE}
+
+# Advancing exposes set 2, with its own declared metadata
+do_test 6.2 {
+  set S [sqlite3_prepare_v2 db "CALL two_sets(1)" -1 dummy]
+  sqlite3_step $S
+  sqlite3_step $S
+  set res [list [sqlite3_proc_next_resultset $S]]
+  lappend res [sqlite3_column_count $S] [sqlite3_column_name $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  lappend res [sqlite3_step $S]
+  lappend res [sqlite3_proc_next_resultset $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_OK 3 cid SQLITE_ROW 7 SQLITE_ROW 8 SQLITE_DONE SQLITE_DONE}
+
+# Sets of DIFFERENT widths -- impossible before the boundary API
+do_execsql_test 6.3 {
+  CREATE PROCEDURE wide_then_narrow(pid INTEGER)
+    RETURNS TABLE(a INTEGER, b TEXT, c TEXT)
+    RETURNS TABLE(n INTEGER)
+  BEGIN
+    SELECT id, title, created_at FROM posts WHERE id = pid;
+    SELECT count(*) FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+do_test 6.4 {
+  set S [sqlite3_prepare_v2 db "CALL wide_then_narrow(1)" -1 dummy]
+  set res [list [sqlite3_column_count $S]]
+  sqlite3_step $S
+  sqlite3_step $S
+  lappend res [sqlite3_proc_next_resultset $S]
+  lappend res [sqlite3_column_count $S] [sqlite3_column_name $S 0]
+  lappend res [sqlite3_step $S] [sqlite3_column_text $S 0]
+  sqlite3_finalize $S
+  set res
+} {3 SQLITE_OK 1 n SQLITE_ROW 2}
+
+# Reset restores the first set's metadata
+do_test 6.5 {
+  set S [sqlite3_prepare_v2 db "CALL wide_then_narrow(1)" -1 dummy]
+  sqlite3_step $S
+  sqlite3_step $S
+  sqlite3_proc_next_resultset $S
+  set mid [sqlite3_column_count $S]
+  sqlite3_reset $S
+  set res [list $mid [sqlite3_column_count $S] [sqlite3_column_name $S 0]]
+  sqlite3_finalize $S
+  set res
+} {1 3 a}
+
+# The API is a misuse on statements that have no declared shapes
+do_test 6.6 {
+  set S [sqlite3_prepare_v2 db "SELECT 1" -1 dummy]
+  set res [sqlite3_proc_next_resultset $S]
+  sqlite3_finalize $S
+  set res
+} {SQLITE_MISUSE}
+
+# Undeclared procedures keep the legacy concatenated delivery
+do_test 6.7 {
+  execsql {
+    CREATE PROCEDURE legacy_two(pid INTEGER)
+    BEGIN
+      SELECT id FROM posts WHERE id = pid;
+      SELECT post_id FROM comments WHERE post_id = pid ORDER BY id;
+    END;
+  }
+  execsql {CALL legacy_two(1)}
+} {1 1 1}
 
 finish_test

@@ -376,26 +376,6 @@ static void procCheckConformance(Parse *pParse, Proc *pProc){
       conf.apShape[i] = pS;
     }
   }
-  /* The engine currently delivers every streamed set through one prepared
-  ** statement, which has a single column count, and rejects a body whose
-  ** row-producing SELECTs disagree in width.  Until the result-set
-  ** boundary API of the spec lands, declared shapes must therefore agree
-  ** in arity.  Catching it here converts a confusing CALL-time failure
-  ** into a precise CREATE-time one. */
-  for(i=1; i<conf.nShape; i++){
-    int n0 = conf.apShape[0]->pCols->nParam;
-    int nk = conf.apShape[i]->pCols->nParam;
-    if( n0!=nk ){
-      sqlite3ErrorMsg(pParse,
-        "procedure %s declares result sets of differing widths (%d and %d); "
-        "this build streams all sets through one statement, so every "
-        "RETURNS TABLE must declare the same number of columns",
-        pProc->zName, n0, nk);
-      sqlite3DbFree(db, conf.apShape);
-      return;
-    }
-  }
-
   iEnd = procCheckList(&conf, pProc->pBody, 0, &eEnd, 0);
   if( conf.nErr==0 && eEnd==PROC_PATH_FALLS && iEnd!=conf.nShape ){
     sqlite3ErrorMsg(pParse,
@@ -1232,7 +1212,16 @@ static void codeProcProgram(
           sqlite3Select(pParse, pSelect, &sDest);
           if( pParse->nErr==0 && pSelect ){
             int nCol = pSelect->pEList->nExpr;
-            if( pPrg->nResCol<0 ){
+            Proc *pProcC = pPrg->pProc;
+            if( pProcC && pProcC->eRet==PROC_RET_TABLES ){
+              /* A declared procedure delimits its sets explicitly.  Each
+              ** set was checked against its own declared shape at CREATE
+              ** time, so widths may differ between sets; the boundary
+              ** opcode switches the statement's metadata between them. */
+              sqlite3VdbeAddOp1(v, OP_ProcSetEnd, pPrg->nProcSet);
+              pPrg->nProcSet++;
+              if( pPrg->nResCol<nCol ) pPrg->nResCol = nCol;
+            }else if( pPrg->nResCol<0 ){
               pPrg->nResCol = nCol;
             }else if( pPrg->nResCol!=nCol ){
               sqlite3ErrorMsg(pParse, "all row-producing SELECT statements "
@@ -1617,18 +1606,10 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
     if( pProc->eRet==PROC_RET_NOTHING ){
       sqlite3VdbeSetNumCols(vTop, 0);
     }else{
-      ProcParamList *pC = pProc->pShapes->pCols;
-      int k;
-      assert( pProc->eRet==PROC_RET_TABLES && pC!=0 );
-      sqlite3VdbeSetNumCols(vTop, pC->nParam);
-      for(k=0; k<pC->nParam; k++){
-        sqlite3VdbeSetColName(vTop, k, COLNAME_NAME,
-                              pC->a[k].zName, SQLITE_TRANSIENT);
-#ifndef SQLITE_OMIT_DECLTYPE
-        sqlite3VdbeSetColName(vTop, k, COLNAME_DECLTYPE,
-                              pC->a[k].zType, SQLITE_TRANSIENT);
-#endif
-      }
+      /* Copies every declared shape onto the statement, sizes the column
+      ** name array for the widest one, and applies set 1.  Advancing
+      ** between sets at run time then swaps metadata without allocating. */
+      sqlite3VdbeSetProcShapes(vTop, pProc->pShapes);
     }
   }
 

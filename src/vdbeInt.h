@@ -425,6 +425,21 @@ struct sqlite3_context {
 **   instructions. A start value of 0 indicates an empty range.
 */
 typedef struct ScanStatus ScanStatus;
+#ifndef SQLITE_OMIT_PROCEDURE
+typedef struct VdbeProcSet VdbeProcSet;
+
+/*
+** One declared result set of a stored procedure, copied into memory owned
+** by the prepared CALL statement.  The copies exist because the Proc that
+** declared them is schema-owned: a statement must never point into schema
+** memory that a schema reload could free underneath it.
+*/
+struct VdbeProcSet {
+  u16 nCol;               /* Number of columns in this set */
+  char **azName;          /* Column names */
+  char **azType;          /* Declared types; entries may be NULL */
+};
+#endif
 struct ScanStatus {
   int addrExplain;                /* OP_Explain for loop */
   int aAddrRange[6];
@@ -496,6 +511,12 @@ struct Vdbe {
 #endif
   u16 nResColumn;         /* Number of columns in one row of the result set */
   u16 nResAlloc;          /* Column slots allocated to aColName[] */
+#ifndef SQLITE_OMIT_PROCEDURE
+  VdbeProcSet *aProcSet;  /* Declared result sets of a CALL, or NULL */
+  u8 nProcSet;            /* Number of entries in aProcSet[] */
+  u8 iProcSet;            /* Set currently being delivered */
+  u8 bAtSetEnd;           /* True when paused at a result-set boundary */
+#endif
   u8 errorAction;         /* Recovery action to do in case of an error */
   u8 minWriteFileFormat;  /* Minimum file format for writable database files */
   u8 prepFlags;           /* SQLITE_PREPARE_* flags */

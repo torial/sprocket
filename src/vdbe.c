@@ -1775,6 +1775,25 @@ case OP_ResultRow: {
   goto vdbe_return;
 }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/* Opcode: ProcSetEnd P1 * * * *
+**
+** Marks the end of declared result set P1 of a stored procedure body.
+** Execution pauses here exactly as it pauses for OP_ResultRow -- the
+** program counter is saved and the frame is left intact -- but no row is
+** delivered.  sqlite3_step() reports SQLITE_DONE for the finished set and
+** keeps reporting it until sqlite3_proc_next_resultset() advances to the
+** next set, so result sets can never silently run together.
+*/
+case OP_ProcSetEnd: {
+  p->pc = (int)(pOp - aOp) + 1;
+  p->bAtSetEnd = 1;
+  p->pResultRow = 0;
+  rc = SQLITE_ROW;      /* An internal pause; sqlite3Step() maps it to DONE */
+  goto vdbe_return;
+}
+#endif /* SQLITE_OMIT_PROCEDURE */
+
 /* Opcode: Concat P1 P2 P3 * *
 ** Synopsis: r[P3]=r[P2]+r[P1]
 **

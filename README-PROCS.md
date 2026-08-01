@@ -115,22 +115,36 @@ PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
 ```
 
-Two properties are intentionally **not** enforced:
+Multiple sets are delimited explicitly. `sqlite3_step()` reports
+`SQLITE_DONE` at the end of each declared set and keeps reporting it
+until the client advances:
+
+```c
+/* set 1 */
+while( sqlite3_step(pStmt)==SQLITE_ROW ){ ... }
+while( sqlite3_proc_next_resultset(pStmt)==SQLITE_OK ){
+  /* metadata now describes the next set, which may be a different width */
+  while( sqlite3_step(pStmt)==SQLITE_ROW ){ ... }
+}
+```
+
+`sqlite3_reset()` returns the statement to the first set. A CALL of a
+procedure with several declared shapes therefore no longer concatenates
+them, which is a deliberate behavior change for declared procedures only.
+
+One property is intentionally **not** enforced:
 
 - **Column types.** Declared types are authoritative for CALL metadata but
   are not checked against the body. In SQLite a declared type expresses
   affinity and intent rather than a constraint; this follows that model.
-- **Differing set widths.** Every streamed set is delivered through one
-  prepared statement, which has a single column count, so all declared
-  shapes must currently agree in arity. This is reported at CREATE time
-  with an explanation. Lifting it requires an explicit result-set boundary
-  API (`sqlite3_proc_next_resultset`), which is designed but not built.
 
 ## Known limitations (deliberate, v1)
 
 - No `OUT`/`INOUT` parameters (result sets cover most cases; planned later).
-- Declared shapes must all have the same number of columns, and per-column
-  types are advisory (see the section above).
+- Per-column types of declared shapes are advisory (see above).
+- `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is not
+  registered in the loadable-extension API table, so run-time-loaded
+  extensions cannot call it.
 - Multi-row `SELECT INTO` takes the first row silently (Sean's decision;
   MySQL-strict mode would be a small phase 4+ addition).
 - An uncorrelated **FROM-clause subquery** inside a WHILE/LOOP body
@@ -157,7 +171,9 @@ elsewhere are small and greppable by `SQLITE_OMIT_PROCEDURE`:
 | `src/callback.c`, `src/prepare.c` | schema hash lifecycle; `ProcPrg` cleanup |
 | `src/resolve.c` | variable resolution after column lookup fails (must set `pNC=pTopNC` — see git history) |
 | `src/trigger.c`, `src/attach.c` | step destructor/fixer recurse into PSM child lists |
-| `src/vdbe.c` | `OP_DropProc` |
+| `src/vdbe.c` | `OP_DropProc`, `OP_ProcSetEnd` (result-set boundary) |
+| `src/vdbeapi.c` | `sqlite3_proc_next_resultset`; boundary handling in `sqlite3Step`/`sqlite3_step` |
+| `src/test1.c` | `sqlite3_proc_next_resultset` TCL binding |
 | `src/vdbeaux.c` | `sqlite3VdbeTransferColumnNames` (CALL column names) |
 | `src/complete.c` | `CREATE PROCEDURE` uses the trigger ";END;" states |
 | `src/vdbe.h`, `src/vdbeInt.h` | `SubProgram.nRef`; `Vdbe.apSharedProg` (non-intrusive refs to cached bodies) |

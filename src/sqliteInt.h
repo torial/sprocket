@@ -3832,6 +3832,7 @@ struct TriggerPrg {
 */
 typedef struct ProcPrg ProcPrg;
 struct ProcPrg {
+  int nProcSet;             /* Declared result sets coded so far */
   Proc *pProc;            /* Procedure this program was coded from */
   ProcPrg *pNext;         /* Next entry in Parse.pProcPrg list */
   SubProgram *pProgram;   /* Program implementing the procedure body */
@@ -5421,6 +5422,8 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
   void sqlite3ProcCacheFlush(sqlite3*);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
+  void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*);
+  void sqlite3VdbeApplyProcSet(Vdbe*, int);
   char **sqlite3VdbeCaptureColumnNames(Vdbe*, int);
   TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);
   TriggerStep *sqlite3ProcSetStep(Parse*, Token*, Expr*);

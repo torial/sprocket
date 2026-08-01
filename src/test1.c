@@ -5661,6 +5661,34 @@ static int SQLITE_TCLAPI test_norm_sql(
 **
 ** Return the number of columns returned by the sql statement STMT.
 */
+#ifndef SQLITE_OMIT_PROCEDURE
+/*
+** Usage: sqlite3_proc_next_resultset STMT
+**
+** Advance a CALL statement to its next declared result set.  Returns the
+** symbolic result code (SQLITE_OK, SQLITE_DONE, SQLITE_MISUSE, ...).
+*/
+static int SQLITE_TCLAPI test_proc_next_resultset(
+  void * clientData,
+  Tcl_Interp *interp,
+  int objc,
+  Tcl_Obj *CONST objv[]
+){
+  sqlite3_stmt *pStmt;
+  int rc;
+
+  if( objc!=2 ){
+    Tcl_AppendResult(interp, "wrong # args: should be \"",
+       Tcl_GetString(objv[0]), " STMT", NULL);
+    return TCL_ERROR;
+  }
+  if( getStmtPointer(interp, Tcl_GetString(objv[1]), &pStmt) ) return TCL_ERROR;
+  rc = sqlite3_proc_next_resultset(pStmt);
+  Tcl_SetResult(interp, (char *)t1ErrorName(rc), TCL_STATIC);
+  return TCL_OK;
+}
+#endif /* SQLITE_OMIT_PROCEDURE */
+
 static int SQLITE_TCLAPI test_column_count(
   void * clientData,
   Tcl_Interp *interp,
@@ -9201,6 +9229,9 @@ int Sqlitetest1_Init(Tcl_Interp *interp){
 
      /* sqlite3_column_*() API */
      { "sqlite3_column_count",          test_column_count  ,0 },
+#ifndef SQLITE_OMIT_PROCEDURE
+     { "sqlite3_proc_next_resultset",   test_proc_next_resultset ,0 },
+#endif
      { "sqlite3_data_count",            test_data_count    ,0 },
      { "sqlite3_column_type",           test_column_type   ,0 },
      { "sqlite3_column_blob",           test_column_blob   ,0 },

@@ -1,6 +1,8 @@
 # Design note: multi-result-set delivery for CALL
 
-**Status:** design only — nothing here is implemented.
+**Status:** IMPLEMENTED 2026-07-31 along the lines recommended below
+(option A). What shipped, and how it differs from this note, is recorded
+in §7 at the end.
 **Context:** `SPROCKET_RETURNS_TABLE_SPEC.md` §5.3 asks for
 `sqlite3_proc_next_resultset()` and notes: *"sprocket already streams
 multiple sets through one CALL somehow — locate that mechanism and
@@ -148,3 +150,45 @@ against each set individually. That isolation was deliberate.
 - Naming: `sqlite3_proc_next_resultset` follows the spec; consider
   whether the fork wants a `sqlite3_` prefix that upstream might one day
   claim.
+
+---
+
+## 7. What was actually built (2026-07-31)
+
+Option A, essentially as described.
+
+- `OP_ProcSetEnd P1` is emitted after each row-returning SELECT of a
+  declared procedure (P1 = index of the set just finished). It saves the
+  program counter and pauses **exactly** the way `OP_ResultRow` does —
+  internally it returns `SQLITE_ROW` — but delivers no row and sets a
+  `Vdbe.bAtSetEnd` flag.
+- `sqlite3Step()` maps that internal pause to `SQLITE_DONE` for the
+  client, and `sqlite3_step()` keeps returning `SQLITE_DONE` while the
+  flag is set, so sets can never run together silently.
+- `sqlite3_proc_next_resultset(stmt)` swaps in the next set's metadata and
+  clears the flag: `SQLITE_OK` when another set is current, `SQLITE_DONE`
+  when the sequence is exhausted, `SQLITE_MISUSE` on a statement with no
+  declared shapes.
+- Per-set descriptors (`VdbeProcSet`) are copied into statement-owned
+  memory at prepare time; `aColName` is sized for the widest set, so
+  advancing never reallocates and `nResColumn` alone varies — the same
+  move `sqlite3_stmt_explain()` already makes.
+- `sqlite3VdbeReset()` restores set 1's metadata for a statement
+  abandoned part-way through a sequence.
+- The equal-width precondition is gone: the one loop in
+  `procCheckConformance()` that enforced it was deleted, as this note
+  predicted, and declared sets may now differ in arity.
+
+**Behavior change, deliberate and confined to declared procedures:** a
+`CALL` of a procedure with more than one `RETURNS TABLE` used to deliver
+every set's rows concatenated under set 1's column names. It now stops
+at each boundary. Undeclared procedures are untouched, and a declared
+procedure with a single shape behaves as before.
+
+**One bug this work uncovered** (in the previously committed
+`RETURNS NOTHING` path): `sqlite3VdbeSetNumCols(v, 0)` asked the
+allocator for zero bytes, and `dbMallocRawFinish()` reports a NULL
+return as OOM. It passed unnoticed because lookaside absorbs a 0-byte
+request; the full regression suite caught it in configurations where
+lookaside is unavailable. `sqlite3VdbeSetNumCols()` now handles a
+zero-column statement without allocating.

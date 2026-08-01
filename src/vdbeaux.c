@@ -2873,6 +2873,14 @@ void sqlite3VdbeSetNumCols(Vdbe *p, int nResColumn){
   }
   n = nResColumn*COLNAME_N;
   p->nResColumn = p->nResAlloc = (u16)nResColumn;
+  if( n==0 ){
+    /* A statement that returns no columns needs no name array.  Asking the
+    ** allocator for zero bytes would report OOM (dbMallocRawFinish() treats
+    ** a NULL return as a failure), which is how a procedure declared
+    ** RETURNS NOTHING once failed whenever lookaside was unavailable. */
+    p->aColName = 0;
+    return;
+  }
   p->aColName = (Mem*)sqlite3DbMallocRawNN(db, sizeof(Mem)*n );
   if( p->aColName==0 ) return;
   initMemArray(p->aColName, n, db, MEM_Null);
@@ -2911,6 +2919,99 @@ int sqlite3VdbeSetColName(
 }
 
 #ifndef SQLITE_OMIT_PROCEDURE
+/*
+** Load the metadata of declared result set iSet into the statement's
+** column-name array and make sqlite3_column_count() report its width.
+**
+** aColName[] is allocated for the widest declared set (see
+** sqlite3VdbeSetProcShapes), so no reallocation happens here and no
+** metadata pointer held by the caller is invalidated except the ones
+** being replaced.
+*/
+void sqlite3VdbeApplyProcSet(Vdbe *p, int iSet){
+  VdbeProcSet *pSet;
+  int i;
+  assert( p->aProcSet!=0 );
+  assert( iSet>=0 && iSet<p->nProcSet );
+  pSet = &p->aProcSet[iSet];
+  p->iProcSet = (u8)iSet;
+  p->nResColumn = pSet->nCol;
+  for(i=0; i<pSet->nCol; i++){
+    sqlite3VdbeSetColName(p, i, COLNAME_NAME, pSet->azName[i],
+                          SQLITE_TRANSIENT);
+#ifndef SQLITE_OMIT_DECLTYPE
+    sqlite3VdbeSetColName(p, i, COLNAME_DECLTYPE, pSet->azType[i],
+                          SQLITE_TRANSIENT);
+#endif
+  }
+}
+
+/*
+** Attach the declared result shapes of a procedure to a prepared CALL.
+** Column names and types are copied into statement-owned memory; the
+** column-name array is sized for the widest set so that advancing
+** between sets never reallocates.  Set 0's metadata is applied.
+**
+** A no-op (leaving legacy behavior in place) if the procedure declares
+** no shapes.
+*/
+void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
+  sqlite3 *db = p->db;
+  ProcShape *pS;
+  int nSet = 0, maxCol = 0, i;
+
+  for(pS=pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) return;               /* RETURNS NOTHING */
+    if( pS->pCols->nParam>maxCol ) maxCol = pS->pCols->nParam;
+    nSet++;
+  }
+  if( nSet==0 || maxCol==0 ) return;
+  if( nSet>255 ) return;                     /* Far beyond any real use */
+
+  p->aProcSet = sqlite3DbMallocZero(db, nSet*sizeof(VdbeProcSet));
+  if( p->aProcSet==0 ) return;
+  p->nProcSet = (u8)nSet;
+  for(i=0, pS=pShapes; pS; pS=pS->pNext, i++){
+    ProcParamList *pC = pS->pCols;
+    VdbeProcSet *pDest = &p->aProcSet[i];
+    int j;
+    pDest->nCol = (u16)pC->nParam;
+    pDest->azName = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
+    pDest->azType = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
+    if( pDest->azName==0 || pDest->azType==0 ) return;
+    for(j=0; j<pC->nParam; j++){
+      pDest->azName[j] = sqlite3DbStrDup(db, pC->a[j].zName);
+      pDest->azType[j] = sqlite3DbStrDup(db, pC->a[j].zType);
+    }
+  }
+  sqlite3VdbeSetNumCols(p, maxCol);
+  if( db->mallocFailed ) return;
+  sqlite3VdbeApplyProcSet(p, 0);
+}
+
+/*
+** Free the declared-result-set descriptors of a statement.
+*/
+static void vdbeFreeProcSets(sqlite3 *db, Vdbe *p){
+  int i, j;
+  if( p->aProcSet==0 ) return;
+  for(i=0; i<p->nProcSet; i++){
+    VdbeProcSet *pSet = &p->aProcSet[i];
+    for(j=0; pSet->azName && j<pSet->nCol; j++){
+      sqlite3DbFree(db, pSet->azName[j]);
+    }
+    for(j=0; pSet->azType && j<pSet->nCol; j++){
+      sqlite3DbFree(db, pSet->azType[j]);
+    }
+    sqlite3DbFree(db, pSet->azName);
+    sqlite3DbFree(db, pSet->azType);
+  }
+  sqlite3DbFree(db, p->aProcSet);
+  /* Fields are deliberately not zeroed: this also runs during
+  ** sqlite3_db_status() memory-measurement passes, which must leave the
+  ** object graph untouched. */
+}
+
 /*
 ** Copy the result-column count and column names from pFrom to pTo.
 **
@@ -3634,6 +3735,14 @@ static void vdbeInvokeSqllog(Vdbe *v){
 ** VDBE_READY_STATE.
 */
 int sqlite3VdbeReset(Vdbe *p){
+#ifndef SQLITE_OMIT_PROCEDURE
+  /* A statement abandoned part-way through a declared sequence must come
+  ** back describing the first set, exactly as a freshly prepared one. */
+  if( p->aProcSet && p->db && p->db->mallocFailed==0 ){
+    p->bAtSetEnd = 0;
+    if( p->iProcSet!=0 ) sqlite3VdbeApplyProcSet(p, 0);
+  }
+#endif
 #if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
   int i;
 #endif
@@ -3794,6 +3903,7 @@ static void sqlite3VdbeClearObject(sqlite3 *db, Vdbe *p){
     sqlite3SubProgramUnref(db, pSub);
   }
 #ifndef SQLITE_OMIT_PROCEDURE
+  vdbeFreeProcSets(db, p);
   if( p->apSharedProg ){
     int iSh;
     for(iSh=0; iSh<p->nSharedProg; iSh++){

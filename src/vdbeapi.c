@@ -870,6 +870,16 @@ static int sqlite3Step(Vdbe *p){
     db->nVdbeExec--;
   }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+  if( rc==SQLITE_ROW && p->bAtSetEnd ){
+    /* Paused at a declared result-set boundary.  The statement is still
+    ** running (as after any SQLITE_ROW pause), but the client sees the
+    ** current set as finished until it advances explicitly. */
+    assert( p->rc==SQLITE_OK );
+    db->errCode = SQLITE_DONE;
+    return SQLITE_DONE;
+  }
+#endif
   if( rc==SQLITE_ROW ){
     assert( p->rc==SQLITE_OK );
     assert( db->mallocFailed==0 );
@@ -911,6 +921,41 @@ end_of_step:
   return (rc&db->errMask);
 }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/*
+** Advance a CALL statement to its next declared result set.
+**
+** Returns SQLITE_OK if another set is now current (its rows are obtained
+** with ordinary sqlite3_step() calls, and the column-metadata functions
+** describe it), SQLITE_DONE if the declared sequence is exhausted, or an
+** error code.  Calling this on anything other than a paused CALL of a
+** procedure with declared shapes is SQLITE_MISUSE.
+*/
+int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  sqlite3 *db;
+  int rc;
+  if( p==0 ) return SQLITE_MISUSE_BKPT;
+  db = p->db;
+  sqlite3_mutex_enter(db->mutex);
+  if( p->aProcSet==0 ){
+    rc = SQLITE_MISUSE_BKPT;
+  }else if( p->bAtSetEnd==0 ){
+    /* Either the statement has not reached the end of the current set, or
+    ** it has finished entirely.  Both are "no further set available". */
+    rc = SQLITE_DONE;
+  }else if( p->iProcSet+1 >= p->nProcSet ){
+    rc = SQLITE_DONE;
+  }else{
+    sqlite3VdbeApplyProcSet(p, p->iProcSet+1);
+    p->bAtSetEnd = 0;
+    rc = SQLITE_OK;
+  }
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+#endif /* SQLITE_OMIT_PROCEDURE */
+
 /*
 ** This is the top-level implementation of sqlite3_step().  Call
 ** sqlite3Step() to do most of the work.  If a schema error occurs,
@@ -918,6 +963,15 @@ end_of_step:
 */
 int sqlite3_step(sqlite3_stmt *pStmt){
   int rc = SQLITE_OK;      /* Result from sqlite3Step() */
+#ifndef SQLITE_OMIT_PROCEDURE
+  if( pStmt && ((Vdbe*)pStmt)->bAtSetEnd ){
+    /* Stepping past the end of a declared result set returns DONE for as
+    ** long as the client has not advanced; sets never bleed together. */
+    Vdbe *pV = (Vdbe*)pStmt;
+    pV->db->errCode = SQLITE_DONE;
+    return SQLITE_DONE;
+  }
+#endif
   Vdbe *v = (Vdbe*)pStmt;  /* the prepared statement */
   int cnt = 0;             /* Counter to prevent infinite loop of reprepares */
   sqlite3 *db;             /* The database connection */

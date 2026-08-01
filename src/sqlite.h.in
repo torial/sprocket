@@ -5589,6 +5589,28 @@ int sqlite3_column_bytes16(sqlite3_stmt*, int iCol);
 int sqlite3_column_type(sqlite3_stmt*, int iCol);
 
 /*
+** CAPI3REF: Advance A CALL To Its Next Declared Result Set
+** METHOD: sqlite3_stmt
+**
+** ^A stored procedure created with more than one RETURNS TABLE clause
+** streams its result sets in order through a single prepared CALL
+** statement.  ^After sqlite3_step() reports SQLITE_DONE for the current
+** set, sqlite3_proc_next_resultset() advances to the next one.
+**
+** ^Returns SQLITE_OK if another set is now current, in which case its
+** rows are read with ordinary sqlite3_step() calls and the column
+** metadata functions describe that set; ^returns SQLITE_DONE when the
+** declared sequence is exhausted.
+**
+** ^Stepping past the end of a set without calling this interface keeps
+** returning SQLITE_DONE, so result sets can never run silently together.
+**
+** This interface is an extension of this build and is not part of
+** standard SQLite.
+*/
+SQLITE_API int sqlite3_proc_next_resultset(sqlite3_stmt*);
+
+/*
 ** CAPI3REF: Destroy A Prepared Statement Object
 ** DESTRUCTOR: sqlite3_stmt
 **
