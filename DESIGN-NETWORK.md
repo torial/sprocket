@@ -103,10 +103,46 @@ break-even at 1.0 µs instead of 0.2 µs — which changes nothing, since the
 conclusion needs only "far below 30 µs". Treat the break-even column as the
 result and the µs/op columns as context.
 
-**An optimization target this exposed.** The per-set cost is plausibly the
-declared-shape application on each advance (`sqlite3VdbeSetColName` and
-friends re-doing column metadata per result set). If someone wants the delta
-near zero, that is where to look first — not in the SubProgram machinery.
+**A hypothesis about the per-set cost, since refuted.** The obvious suspect was
+declared-shape application on each advance: `sqlite3VdbeApplyProcSet()` calls
+`sqlite3VdbeSetColName()` with `SQLITE_TRANSIENT` for every column name and
+decltype, which reads like two copies per column per result set.
+
+That is wrong, and the benchmark now proves it. Timing could not settle it —
+the delta is well under a microsecond per set and sits beneath the noise floor
+of a loaded workstation even with minimum-of-nine interleaved rounds. So the
+harness measures **allocations** instead, which is deterministic and is what
+the mechanism actually predicts:
+
+```
+   N   allocations/request:      A        B      B-A
+   2                          6.00     6.00    +0.00
+   5                         15.00    15.00    +0.00
+  10                         30.00    30.00    +0.00
+```
+
+A CALL performs **exactly the same number of allocations** as the loose
+statements it replaces. `SQLITE_TRANSIENT` does not allocate here, because
+`sqlite3VdbeMemGrow()` reuses `pMem->zMalloc` when the existing buffer is large
+enough — the column-name Mems are reused across advances and the strings are
+the same size every time, so the cost is a `strlen` plus a `memcpy` of a
+ten-byte string, not a malloc.
+
+Switching those calls to `SQLITE_STATIC` was tried and reverted: it is safe
+(the strings are owned by `aProcSet` and outlive the Mems), but it buys only
+those memcpys, and changing memory-management semantics in the VDBE for an
+effect that cannot be measured is a bad trade.
+
+Whatever remains of the per-set delta is therefore *not* metadata handling.
+The next suspect is `OP_Program` frame setup per result set. Unresolved, and
+not worth resolving until it matters against something other than a network.
+
+**A note on the instrument.** The allocation counter initially reported the
+per-request count *falling* as N rose (30 → 10), which is impossible. Cause:
+the default lookaside pool (~40 slots) is exhausted by ten result sets, after
+which allocations fall through to the general allocator and stop being counted
+as hits. The harness now sizes lookaside far beyond what any path holds live.
+A saturating counter that silently under-reports is worse than no counter.
 
 ## The three-part spine
 
@@ -245,8 +281,11 @@ magnitude more than any protocol choice. Optimize placement before transport.
 
 ## Open questions
 
-1. Does the per-result-set delta come from declared-shape application, as
-   guessed above? A profile would settle it, and if so the fix is cheap.
+1. ~~Does the per-result-set delta come from declared-shape application?~~
+   **Answered: no.** A CALL makes exactly as many allocations as the statements
+   it replaces; see above. The remaining suspect is `OP_Program` frame setup,
+   and it is not worth chasing while the effect is invisible against any
+   network.
 2. Is there value in a fan-out virtual table that presents N shard files as one
    logical table with constraint pushdown? It fits SQLite's philosophy and it
    is the one piece of the sharding story that could reasonably live in the

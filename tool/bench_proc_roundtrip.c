@@ -48,7 +48,19 @@ static double nowSeconds(void){
 #endif
 
 #define ROWS_PER_SET 10          /* rows each result set returns */
-#define MIN_SECONDS  1.0         /* run at least this long, per path */
+#define MIN_SECONDS  0.25        /* length of one timing round, per path */
+#define ROUNDS       9           /* interleaved A/B rounds; we keep the MIN */
+
+/*
+** Why minimum-of-N interleaved rounds rather than a single long mean:
+** the delta being measured here is well under a microsecond per result set,
+** and on a loaded workstation the mean moves by more than the effect.  Noise
+** is one-sided -- an interrupt, a scheduler preemption, or a competing build
+** can only ever make a round SLOWER, never faster -- so the minimum of several
+** rounds is the estimate closest to the true cost.  Interleaving A and B
+** within each round keeps any slow drift in machine state from landing on one
+** path more than the other.
+*/
 
 static void fatal(sqlite3 *db, const char *zWhat){
   fprintf(stderr, "FATAL: %s: %s\n", zWhat, db ? sqlite3_errmsg(db) : "(no db)");
@@ -82,6 +94,26 @@ static int drainSet(sqlite3_stmt *p, sqlite3_int64 *pSum){
     exit(1);
   }
   return n;
+}
+
+/*
+** Allocations are a DETERMINISTIC instrument, and timing is not.
+**
+** The hypothesis under test -- that applying a declared result shape on every
+** advance copies each column name and decltype -- predicts a specific number
+** of extra small allocations per CALL, not a specific number of microseconds.
+** On a loaded machine the sub-microsecond timing delta is under the noise
+** floor even with minimum-of-N rounds, but the allocation count does not move
+** at all.  Measure the thing the mechanism actually predicts.
+**
+** SQLITE_DBSTATUS_LOOKASIDE_HIT is a cumulative counter (only the high-water
+** value is meaningful; it is cleared by the reset flag), and column-name
+** strings are small enough to be served from lookaside.
+*/
+static int lookasideHits(sqlite3 *db, int reset){
+  int cur = 0, hi = 0;
+  sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_HIT, &cur, &hi, reset);
+  return hi;
 }
 
 /* Path A: N loose statements. */
@@ -188,14 +220,39 @@ static void benchOne(sqlite3 *db, int nSet){
   }
   if( tB>0 ) iters = (long long)(iters * (MIN_SECONDS/tB)) + 1;
 
-  /* --- measure ------------------------------------------------------------ */
-  t0 = nowSeconds();
-  for(n=0; n<iters; n++) runPathA(apStmt, nSet, &sumA);
-  tA = nowSeconds() - t0;
+  /* --- measure: interleaved rounds, keep the minimum of each -------------- */
+  {
+    int r;
+    double bestA = 1e300, bestB = 1e300;
+    for(r=0; r<ROUNDS; r++){
+      t0 = nowSeconds();
+      for(n=0; n<iters; n++) runPathA(apStmt, nSet, &sumA);
+      tA = nowSeconds() - t0;
+      if( tA < bestA ) bestA = tA;
 
-  t0 = nowSeconds();
-  for(n=0; n<iters; n++) runPathB(pCall, &sumB);
-  tB = nowSeconds() - t0;
+      t0 = nowSeconds();
+      for(n=0; n<iters; n++) runPathB(pCall, &sumB);
+      tB = nowSeconds() - t0;
+      if( tB < bestB ) bestB = tB;
+    }
+    tA = bestA;
+    tB = bestB;
+  }
+
+  /* --- deterministic: allocations charged to each path, per request ------- */
+  {
+    const int nAllocIter = 500;
+    int hitsA, hitsB;
+    lookasideHits(db, 1);
+    for(n=0; n<nAllocIter; n++) runPathA(apStmt, nSet, &sumA);
+    hitsA = lookasideHits(db, 1);
+    for(n=0; n<nAllocIter; n++) runPathB(pCall, &sumB);
+    hitsB = lookasideHits(db, 1);
+    printf("  %2d  allocations/request:  A = %6.2f   B = %6.2f   "
+           "B-A = %+6.2f\n",
+           nSet, (double)hitsA/nAllocIter, (double)hitsB/nAllocIter,
+           (double)(hitsB-hitsA)/nAllocIter);
+  }
 
   perA = tA / (double)iters * 1e6;    /* microseconds per request */
   perB = tB / (double)iters * 1e6;
@@ -226,6 +283,17 @@ int main(int argc, char **argv){
   (void)argc; (void)argv;
 
   if( sqlite3_open(":memory:", &db)!=SQLITE_OK ) fatal(db, "open");
+
+  /* Give lookaside far more slots than any path here can hold live at once.
+  ** The default (~40 slots) is exhausted by N=10 result sets, and once it is
+  ** full the allocations fall through to the general allocator and stop being
+  ** counted as hits -- which shows up as the per-request allocation count
+  ** going DOWN as N goes up.  An instrument that saturates silently is worse
+  ** than none; size it so it cannot. */
+  if( sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, (void*)0, 512, 2000)
+        !=SQLITE_OK ){
+    fatal(db, "enlarge lookaside");
+  }
 
   execOrDie(db, "PRAGMA journal_mode=WAL;");
   execOrDie(db, "CREATE TABLE items(grp INTEGER, id INTEGER, payload TEXT);");
