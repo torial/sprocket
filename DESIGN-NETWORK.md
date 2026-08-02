@@ -250,7 +250,23 @@ magnitude more than any protocol choice. Optimize placement before transport.
 
 ## What is missing for the networked case
 
-- **There is no wire protocol.** This is the real gap. Ascending in ambition:
+- **A wire codec now exists** (`tool/proc_wire.c`) — framing and encoding only,
+  no sockets, because that is where the design decisions live and a transport
+  is mechanical. Request is a CALL; response is a frame stream
+  (SHAPE / ROW / SETEND / DONE / ERROR) with bounds-checked decoding, since
+  this code would face a network and a malformed frame must be an error rather
+  than a read past the end.
+
+  It implements the mode this fork uniquely permits. Because a procedure's
+  result shape is fixed at CREATE time and checked against the body, it is a
+  **static contract** — so a client can cache it by (procedure, schema cookie)
+  and the server can then send rows carrying no schema at all. PostgreSQL must
+  re-describe because an arbitrary query's shape is only known after planning;
+  here it is known before the call is made. Measured on the self-test's own
+  payload: **301 bytes with shapes, 196 without — 34.9% saved**, and the
+  shape-free stream decodes to a bit-identical checksum.
+
+- **There is still no transport.** Ascending in ambition:
   an HTTP/JSON front (rqlite's approach); a PostgreSQL-wire shim so existing
   client libraries work unchanged; or a purpose-built binary protocol with
   pipelining (libSQL's Hrana). Whatever the choice, **support pipelining** —
