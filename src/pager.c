@@ -932,6 +932,7 @@ static int assert_pager_state(Pager *p){
         assert( isOpen(p->jfd)
              || p->journalMode==PAGER_JOURNALMODE_OFF
              || p->journalMode==PAGER_JOURNALMODE_WAL
+             || p->journalMode==PAGER_JOURNALMODE_WAL2
         );
       }
       assert( pPager->dbOrigSize==pPager->dbFileSize );
@@ -946,6 +947,7 @@ static int assert_pager_state(Pager *p){
       assert( isOpen(p->jfd)
            || p->journalMode==PAGER_JOURNALMODE_OFF
            || p->journalMode==PAGER_JOURNALMODE_WAL
+           || p->journalMode==PAGER_JOURNALMODE_WAL2
            || (sqlite3OsDeviceCharacteristics(p->fd)&SQLITE_IOCAP_BATCH_ATOMIC)
       );
       assert( pPager->dbOrigSize<=pPager->dbHintSize );
@@ -958,6 +960,7 @@ static int assert_pager_state(Pager *p){
       assert( isOpen(p->jfd)
            || p->journalMode==PAGER_JOURNALMODE_OFF
            || p->journalMode==PAGER_JOURNALMODE_WAL
+           || p->journalMode==PAGER_JOURNALMODE_WAL2
            || (sqlite3OsDeviceCharacteristics(p->fd)&SQLITE_IOCAP_BATCH_ATOMIC)
       );
       break;
@@ -2114,6 +2117,7 @@ static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
       assert( pPager->journalMode==PAGER_JOURNALMODE_DELETE
            || pPager->journalMode==PAGER_JOURNALMODE_MEMORY
            || pPager->journalMode==PAGER_JOURNALMODE_WAL
+           || pPager->journalMode==PAGER_JOURNALMODE_WAL2
       );
       sqlite3OsClose(pPager->jfd);
       if( bDelete ){
@@ -3307,6 +3311,10 @@ static int pagerBeginReadTransaction(Pager *pPager){
   if( rc!=SQLITE_OK || changed ){
     pager_reset(pPager);
     if( USEFETCH(pPager) ) sqlite3OsUnfetch(pPager->fd, 0, 0);
+    assert( pPager->journalMode==PAGER_JOURNALMODE_WAL
+         || pPager->journalMode==PAGER_JOURNALMODE_WAL2
+    );
+    pPager->journalMode = sqlite3WalJournalMode(pPager->pWal);
   }
 
   return rc;
@@ -3402,9 +3410,9 @@ static int pagerOpenWalIfPresent(Pager *pPager){
           rc = sqlite3OsDelete(pPager->pVfs, pPager->zWal, 0);
         }else{
           testcase( sqlite3PcachePagecount(pPager->pPCache)==0 );
-          rc = sqlite3PagerOpenWal(pPager, 0);
+          rc = sqlite3PagerOpenWal(pPager, 0, 0);
         }
-      }else if( pPager->journalMode==PAGER_JOURNALMODE_WAL ){
+      }else if( pPager->journalMode>=PAGER_JOURNALMODE_WAL ){
         pPager->journalMode = PAGER_JOURNALMODE_DELETE;
       }
     }
@@ -4925,6 +4933,7 @@ int sqlite3PagerOpen(
     (u64)nPathname + 8 + 1 +             /* Journal filename */
 #ifndef SQLITE_OMIT_WAL
     (u64)nPathname + 4 + 1 +             /* WAL filename */
+    nPathname + 5 + 1 +                  /* Second WAL filename */
 #endif
     3                                    /* Terminator */
   );
@@ -4977,6 +4986,8 @@ int sqlite3PagerOpen(
     sqlite3FileSuffix3(zFilename, pPager->zWal);
     pPtr = (u8*)(pPager->zWal + sqlite3Strlen30(pPager->zWal)+1);
 #endif
+    memcpy(pPtr, zPathname, nPathname);   pPtr += nPathname;
+    memcpy(pPtr, "-wal2", 5);             pPtr += 5 + 1;
   }else{
     pPager->zWal = 0;
   }
@@ -7413,7 +7424,8 @@ int sqlite3PagerSetJournalMode(Pager *pPager, int eMode){
             || eMode==PAGER_JOURNALMODE_OFF       /* 2 */
             || eMode==PAGER_JOURNALMODE_TRUNCATE  /* 3 */
             || eMode==PAGER_JOURNALMODE_MEMORY    /* 4 */
-            || eMode==PAGER_JOURNALMODE_WAL       /* 5 */ );
+            || eMode==PAGER_JOURNALMODE_WAL       /* 5 */
+            || eMode==PAGER_JOURNALMODE_WAL2      /* 6 */ );
 
   /* This routine is only called from the OP_JournalMode opcode, and
   ** the logic there will never allow a temporary file to be changed
@@ -7447,9 +7459,12 @@ int sqlite3PagerSetJournalMode(Pager *pPager, int eMode){
     assert( (PAGER_JOURNALMODE_MEMORY & 5)==4 );
     assert( (PAGER_JOURNALMODE_OFF & 5)==0 );
     assert( (PAGER_JOURNALMODE_WAL & 5)==5 );
+    assert( (PAGER_JOURNALMODE_WAL2 & 5)==4 );
 
     assert( isOpen(pPager->fd) || pPager->exclusiveMode );
-    if( !pPager->exclusiveMode && (eOld & 5)==1 && (eMode & 1)==0 ){
+    if( !pPager->exclusiveMode && (eOld & 5)==1 && (eMode & 1)==0 
+     && eMode!=PAGER_JOURNALMODE_WAL2       /* TODO: fix this if possible */
+    ){
       /* In this case we would like to delete the journal file. If it is
       ** not possible, then that is not a problem. Deleting the journal file
       ** here is an optimization only.
@@ -7624,7 +7639,7 @@ static int pagerExclusiveLock(Pager *pPager){
 ** lock on the database file and use heap-memory to store the wal-index
 ** in. Otherwise, use the normal shared-memory.
 */
-static int pagerOpenWal(Pager *pPager){
+static int pagerOpenWal(Pager *pPager, int bWal2){
   int rc = SQLITE_OK;
 
   assert( pPager->pWal==0 && pPager->tempFile==0 );
@@ -7645,7 +7660,7 @@ static int pagerOpenWal(Pager *pPager){
   if( rc==SQLITE_OK ){
     rc = sqlite3WalOpen(pPager->pVfs,
         pPager->fd, pPager->zWal, pPager->exclusiveMode,
-        pPager->journalSizeLimit, &pPager->pWal
+        pPager->journalSizeLimit, bWal2, &pPager->pWal
     );
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
     if( rc==SQLITE_OK ){
@@ -7676,6 +7691,7 @@ static int pagerOpenWal(Pager *pPager){
 */
 int sqlite3PagerOpenWal(
   Pager *pPager,                  /* Pager object */
+  int bWal2,                      /* Open in wal2 mode if not already open */
   int *pbOpen                     /* OUT: Set to true if call is a no-op */
 ){
   int rc = SQLITE_OK;             /* Return code */
@@ -7692,9 +7708,9 @@ int sqlite3PagerOpenWal(
     /* Close any rollback journal previously open */
     sqlite3OsClose(pPager->jfd);
 
-    rc = pagerOpenWal(pPager);
+    rc = pagerOpenWal(pPager, bWal2);
     if( rc==SQLITE_OK ){
-      pPager->journalMode = PAGER_JOURNALMODE_WAL;
+      pPager->journalMode = bWal2?PAGER_JOURNALMODE_WAL2:PAGER_JOURNALMODE_WAL;
       pPager->eState = PAGER_OPEN;
     }
   }else{
@@ -7716,7 +7732,9 @@ int sqlite3PagerOpenWal(
 int sqlite3PagerCloseWal(Pager *pPager, sqlite3 *db){
   int rc = SQLITE_OK;
 
-  assert( pPager->journalMode==PAGER_JOURNALMODE_WAL );
+  assert( pPager->journalMode==PAGER_JOURNALMODE_WAL 
+       || pPager->journalMode==PAGER_JOURNALMODE_WAL2
+  );
 
   /* If the log file is not already open, but does exist in the file-system,
   ** it may need to be checkpointed before the connection can switch to
@@ -7731,7 +7749,7 @@ int sqlite3PagerCloseWal(Pager *pPager, sqlite3 *db){
       );
     }
     if( rc==SQLITE_OK && logexists ){
-      rc = pagerOpenWal(pPager);
+      rc = pagerOpenWal(pPager, 0);
     }
   }
    

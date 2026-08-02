@@ -8103,6 +8103,7 @@ case OP_JournalMode: {    /* out2 */
        || eNew==PAGER_JOURNALMODE_OFF
        || eNew==PAGER_JOURNALMODE_MEMORY
        || eNew==PAGER_JOURNALMODE_WAL
+       || eNew==PAGER_JOURNALMODE_WAL2
        || eNew==PAGER_JOURNALMODE_QUERY
   );
   assert( pOp->p1>=0 && pOp->p1<db->nDb );
@@ -8121,16 +8122,25 @@ case OP_JournalMode: {    /* out2 */
   /* Do not allow a transition to journal_mode=WAL for a database
   ** in temporary storage or if the VFS does not support shared memory
   */
-  if( eNew==PAGER_JOURNALMODE_WAL
+  if( isWalMode(eNew)
    && (sqlite3Strlen30(zFilename)==0           /* Temp file */
        || !sqlite3PagerWalSupported(pPager))   /* No shared-memory support */
   ){
     eNew = eOld;
   }
 
-  if( (eNew!=eOld)
-   && (eOld==PAGER_JOURNALMODE_WAL || eNew==PAGER_JOURNALMODE_WAL)
-  ){
+  if( eNew!=eOld && (isWalMode(eNew) || isWalMode(eOld)) ){
+
+    /* Prevent changing directly to wal2 from wal mode. And vice versa. */
+    if( isWalMode(eNew) && isWalMode(eOld) ){
+      rc = SQLITE_ERROR;
+      sqlite3VdbeError(p, "cannot change from %s to %s mode",
+          sqlite3JournalModename(eOld), sqlite3JournalModename(eNew)
+      );
+      goto abort_due_to_error;
+    }
+
+    /* Prevent switching into or out of wal/wal2 mode mid-transaction */
     if( !db->autoCommit || db->nVdbeRead>1 ){
       rc = SQLITE_ERROR;
       sqlite3VdbeError(p,
@@ -8140,7 +8150,7 @@ case OP_JournalMode: {    /* out2 */
       goto abort_due_to_error;
     }else{
 
-      if( eOld==PAGER_JOURNALMODE_WAL ){
+      if( isWalMode(eOld) ){
         /* If leaving WAL mode, close the log file. If successful, the call
         ** to PagerCloseWal() checkpoints and deletes the write-ahead-log
         ** file. An EXCLUSIVE lock may still be held on the database file
@@ -8161,7 +8171,10 @@ case OP_JournalMode: {    /* out2 */
       */
       assert( sqlite3BtreeTxnState(pBt)!=SQLITE_TXN_WRITE );
       if( rc==SQLITE_OK ){
-        rc = sqlite3BtreeSetVersion(pBt, (eNew==PAGER_JOURNALMODE_WAL ? 2 : 1));
+        /* 1==rollback, 2==wal, 3==wal2 */
+        rc = sqlite3BtreeSetVersion(pBt, 
+            1 + isWalMode(eNew) + (eNew==PAGER_JOURNALMODE_WAL2)
+        );
       }
     }
   }

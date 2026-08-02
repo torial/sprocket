@@ -82,8 +82,9 @@ typedef struct PgHdr DbPage;
 #define PAGER_JOURNALMODE_TRUNCATE    3   /* Commit by truncating journal */
 #define PAGER_JOURNALMODE_MEMORY      4   /* In-memory journal file */
 #define PAGER_JOURNALMODE_WAL         5   /* Use write-ahead logging */
+#define PAGER_JOURNALMODE_WAL2        6   /* Use write-ahead logging mode 2 */
 
-#define isWalMode(x) ((x)==PAGER_JOURNALMODE_WAL)
+#define isWalMode(x) ((x)==PAGER_JOURNALMODE_WAL || (x)==PAGER_JOURNALMODE_WAL2)
 
 /*
 ** The argument to this macro is a file descriptor (type sqlite3_file*).
@@ -191,7 +192,7 @@ int sqlite3PagerSharedLock(Pager *pPager);
   int sqlite3PagerCheckpoint(Pager *pPager, sqlite3*, int, int*, int*);
   int sqlite3PagerWalSupported(Pager *pPager);
   int sqlite3PagerWalCallback(Pager *pPager);
-  int sqlite3PagerOpenWal(Pager *pPager, int *pisOpen);
+  int sqlite3PagerOpenWal(Pager *pPager, int, int *pisOpen);
   int sqlite3PagerCloseWal(Pager *pPager, sqlite3*);
 # ifdef SQLITE_ENABLE_SNAPSHOT
   int sqlite3PagerSnapshotGet(Pager*, sqlite3_snapshot **ppSnapshot);

@@ -395,6 +395,8 @@ set options(THREADSAFE) {
 #endif
 }
 
+set options(WAL2) { "WAL2", }
+
 proc trim_name {in} {
   set ret $in
   if {[string range $in 0 6]=="SQLITE_"} {
