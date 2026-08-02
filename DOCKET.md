@@ -48,7 +48,7 @@ through a nested CALL.
 Declared shapes are static, validated at `CREATE` time, and already
 introspectable via `PRAGMA proc_info`. So the full request/response contract of
 a database is machine-readable **without executing anything**. Emit client stubs
-— C, TypeScript, Python — straight from the schema.
+— C, TypeScript, Python, and Zebra — straight from the schema.
 
 This is what turns "SQLite has stored procedures" into "SQLite has a typed RPC
 layer," and it compounds with every phase of the transport plan.
@@ -82,19 +82,51 @@ correctness contract and is beautifully testable.
 **Effort: large. Value: this is the one that would make the fork worth using
 for reasons unrelated to procedures.**
 
-## 4. Carry `BEGIN CONCURRENT` + WAL2 — *strategy, not engineering*
+## 4. `wal2` and `BEGIN CONCURRENT` — *two decisions, not one*
 
-Both are written, both live in upstream branches, neither is in trunk. They
-allow multiple optimistic writers with page-level conflict detection, and WAL2
-fixes checkpoint starvation under continuous readers.
+**Corrected 2026-08-01 after actually looking.** This entry previously treated
+them as a single choice. They are not, and the difference is large.
 
-The highest-leverage thing in this whole document that **already exists**. The
-question is not whether they work but whether this fork wants the permanent
-merge burden of tracking two unmerged upstream branches on top of our own
-divergence.
+Both live in the **official** SQLite repository (`github.com/sqlite/sqlite`
+mirrors Hipp's Fossil at sqlite.org/src), among ~1,718 branches. Checked
+currency:
 
-**Decide before Phase 5 of the transport plan**, since group-commit design
-changes meaningfully if multiple writers become possible.
+| Branch | Last merged with trunk |
+|---|---|
+| `wal2` | **2026-07-13** — current |
+| `begin-concurrent` | **2026-07-13** — current |
+| `begin-concurrent-wal2` *(combined)* | **2019-01-11** |
+| `begin-concurrent-pnu-wal2` | 2023-02-02 |
+| `begin-concurrent-report-wal2` | 2021-11-17 |
+
+For reference this fork branched from trunk **2026-07-04** at 3.53.3, so each
+feature branch is nine days *ahead* of our fork point on trunk. There are
+periodic version pins (`wal2-3.51`, `begin-concurrent-3.51`) but none at 3.53.
+
+**The finding: the SQLite team keeps each feature current and has not kept the
+combination current since 2019.** Taking both is therefore not "carry two
+upstream branches" — it is doing integration work upstream stopped doing seven
+years ago. Do not plan on the pair.
+
+### 4a. `wal2` — take this one first
+
+Fixes checkpoint starvation: under continuous read traffic the WAL never
+resets and grows without bound until latency collapses. `DESIGN-NETWORK.md`
+already calls that "your production incident" — it is a problem this fork would
+actually hit, whereas multi-writer is one it would only hit at scale we have
+not reached.
+
+Merge shape is favourable: `wal2` lives almost entirely in `wal.c` and
+`pager.c`, **neither of which this fork touches**. Our 19 modified `src/` files
+are mostly additive (`proc.c` is new) plus small hooks. Genuine overlap risk is
+confined to `vdbe.c` / `vdbeaux.c` / `sqliteInt.h`, where we added opcodes and
+struct fields.
+
+### 4b. `BEGIN CONCURRENT` — decide at transport Phase 5
+
+Multiple optimistic writers with page-level conflict detection. Also current
+and mergeable, but it changes what group commit should look like, so it belongs
+to the Phase 5 design conversation rather than to this one.
 
 ## 5. System-versioned temporal tables — *SQLite has no story here at all*
 
