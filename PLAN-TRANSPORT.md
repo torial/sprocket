@@ -155,6 +155,18 @@ would serve a client wrong column names after a migration.
 **Deliverable.** Per database: a queue, one writer thread, drain up to K items
 into one `BEGIN IMMEDIATE` … `COMMIT`.
 
+**Carry into this phase (added 2026-08-02, after porting wal2):**
+- Run the queue's database in `journal_mode=wal2`. Group commit concentrates
+  writes, which is precisely the load that starves a classic-WAL checkpointer.
+- If replication is wired to `sqlite3_wal_hook` here, it must be wal2-aware:
+  the callback argument is total *uncheckpointed* pages across **both** wal
+  files (0 when the other is empty/checkpointed), and there are two files to
+  ship rather than one.
+- `BEGIN CONCURRENT` is still undecided and would change this design (multiple
+  writers make a single queue optional rather than necessary). Keep the queue
+  behind an interface so it can become one-queue-per-shard or be bypassed
+  entirely — that is the isolation tactic for this phase.
+
 **Test, written first — deterministic, not timed.** Submit N=1000 writes from
 M=8 threads. Assert (a) all 1000 rows present, exactly once; (b) the number of
 *transactions* is far below 1000, proving batching actually happened. Count

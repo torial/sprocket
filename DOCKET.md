@@ -108,7 +108,19 @@ combination current since 2019.** Taking both is therefore not "carry two
 upstream branches" — it is doing integration work upstream stopped doing seven
 years ago. Do not plan on the pair.
 
-### 4a. `wal2` — take this one first
+### 4a. `wal2` — ✅ **PORTED 2026-08-02** — 0 errors out of 393,363
+
+Ported (not merged) onto the 3.53.4 base; see the commit for why and how. wal2
+suites: 538 tests, 0 errors. Verified this fork still reads rollback-mode and
+classic-`wal` databases unchanged — only wal2 files are one-way, and that is
+reversible via `PRAGMA journal_mode=delete`.
+
+Two facts to carry: `sqlite3_wal_hook`'s argument means *uncheckpointed pages
+across both wal files* in wal2 mode (0 when the other file is done), and there
+are two files to ship for replication rather than one. wal2 bounds WAL growth;
+it does **not** add concurrent writers.
+
+*Original rationale, kept for the record:*
 
 Fixes checkpoint starvation: under continuous read traffic the WAL never
 resets and grows without bound until latency collapses. `DESIGN-NETWORK.md`

@@ -167,9 +167,32 @@ architecture. Two engine-adjacent settings matter:
   upgrade to a write lock, and deadlocks against another doing the same;
   `busy_timeout` cannot rescue it because neither side can yield.
 
-A dedicated checkpointer is not optional. Under continuous read traffic the
-WAL never resets and grows without bound until latency collapses. Monitor WAL
-size as a first-class metric.
+A dedicated checkpointer is not optional in classic WAL. Under continuous read
+traffic the WAL never resets and grows without bound until latency collapses.
+Monitor WAL size as a first-class metric.
+
+**Resolved 2026-08-02: this fork now carries `wal2`.** Upstream's two-WAL-file
+mode bounds WAL growth by construction — writers fill `-wal`, switch to
+`-wal2`, and the first file is checkpointed *and overwritten* while nobody is
+appending to it. Upstream's own summary: "wal files do not grow indefinitely
+even if the checkpointer never has a chance to finish uninterrupted." Enable
+with `PRAGMA journal_mode=wal2`.
+
+Two consequences worth carrying forward:
+
+- **A wal2 database cannot be read by stock SQLite** (`SQLITE_NOTADB`). It is
+  reversible via `PRAGMA journal_mode=delete`. Verified 2026-08-02 that this
+  fork still reads rollback-mode and classic-`wal` databases unchanged —
+  correct mode reported, data intact, `integrity_check` ok for all three. Only
+  wal2 files are one-way.
+- **`sqlite3_wal_hook`'s argument changes meaning.** In wal mode it is the page
+  count of the WAL; in wal2 it is the total *uncheckpointed* pages across both
+  files, or 0 when the other file is empty or already checkpointed. Anything
+  built on the wal-hook — notably the WAL-shipping replication described below —
+  must be wal2-aware from the start rather than retrofitted.
+
+wal2 does **not** provide concurrent writers. It bounds space and tail latency,
+not throughput. Multiple writers remain `BEGIN CONCURRENT`'s job.
 
 ### 2. Shard-per-tenant with key routing — *application, no engine change*
 
@@ -279,7 +302,9 @@ magnitude more than any protocol choice. Optimize placement before transport.
   therefore not a supported shape.
 - **Replication is unaddressed here.** The two credible directions, both
   needing no engine change: WAL shipping via `sqlite3_wal_hook` (the Litestream
-  model, ~200 lines to prototype, gives continuous backup and PITR); and the
+  model, ~200 lines to prototype, gives continuous backup and PITR — **but see
+  the wal2 note above: the hook's argument means something different in wal2
+  mode, and there are two files to ship, not one**); and the
   session extension's changesets, which are diffs with built-in conflict
   handlers and are the closest thing SQLite has to a replication primitive.
   Note that once writes funnel through the queue in step 1, **that queue is
