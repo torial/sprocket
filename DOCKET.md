@@ -116,11 +116,48 @@ already calls that "your production incident" — it is a problem this fork woul
 actually hit, whereas multi-writer is one it would only hit at scale we have
 not reached.
 
-Merge shape is favourable: `wal2` lives almost entirely in `wal.c` and
-`pager.c`, **neither of which this fork touches**. Our 19 modified `src/` files
-are mostly additive (`proc.c` is new) plus small hooks. Genuine overlap risk is
-confined to `vdbe.c` / `vdbeaux.c` / `sqliteInt.h`, where we added opcodes and
-struct fields.
+**Trial merge run 2026-08-01** (scratch branch, aborted, no trace left). The
+result changes the *method*, not the verdict.
+
+`wal2`'s own feature delta — measured against its trunk ancestor, not against
+our merge base — is **9 files, +1402/−477**, and 1784 of those changed lines are
+in `wal.c` alone. Touched: `wal.c`, `wal.h`, `pager.c`, `pager.h`, `btree.c`,
+`pragma.c`, `vdbe.c`, `vdbeaux.c`, `test_tclsh.c`. Its overlap with our files is
+three, and tiny: `pragma.c` (3 lines), `vdbe.c` (25), `vdbeaux.c` (3).
+
+**But `git merge origin/wal2` is the wrong instrument.** This fork is based on
+the *release branch* `branch-3.53` (merge base `92a6c5c`), while `wal2` tracks
+*trunk*. Merging the branch therefore drags in a month of unrelated trunk
+evolution — 61 files, +5299/−3389 — on top of the feature. The trial produced
+**23 conflicts**:
+
+| Kind | Count | Notes |
+|---|---|---|
+| Fossil metadata | 4 | `VERSION`, `manifest*` — trivial |
+| files we modify | **1** | `src/shell.c.in` only |
+| trunk drift in files we do not own | 18 | `btree.c`, `expr.c`, `func.c`, `os_win.c`, `pager.c`, `printf.c`, `ext/*`, `test/*` |
+
+**Zero conflicts in the stored-procedure implementation.** `proc.c`, `parse.y`,
+`vdbe.c`, `vdbeapi.c`, `vdbeaux.c`, `sqliteInt.h`, `pragma.c`, `resolve.c`,
+`trigger.c`, `attach.c`, `prepare.c`, `main.c`, `complete.c`, `sqlite.h.in` and
+`test1.c` all merged clean. The conflicts are release-branch-versus-trunk drift,
+not wal2-versus-procedures.
+
+Decisive detail: **`wal.c` and `wal.h` are identical between our 3.53.3 base and
+wal2's trunk ancestor.** Only `btree.c` (+70) and `pager.c` (+102) have drifted.
+So wal2's main payload applies to our base unchanged.
+
+**Recommended method — port the feature, do not merge the branch.** Apply the
+9-file delta onto 3.53.3; `wal.c`/`wal.h` land clean and only `btree.c` and
+`pager.c` need hand reconciliation (~172 lines of drift between them). Isolated,
+testable against our existing 392,950-test gate, and it does not destabilise a
+fork that currently passes it.
+
+**The alternative worth deciding deliberately rather than drifting into:** catch
+up to trunk first, then merge `wal2` cleanly. Bigger — those 22 drift conflicts
+are the price — but paid once, and it leaves every future upstream merge cheap.
+Related: upstream has shipped **3.53.4** since we forked, so a small catch-up on
+our own release line is available and low-risk regardless of which path we take.
 
 ### 4b. `BEGIN CONCURRENT` — decide at transport Phase 5
 
