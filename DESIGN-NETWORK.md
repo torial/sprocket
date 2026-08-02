@@ -10,10 +10,35 @@ costs nanoseconds, so bundling five queries into one `CALL` saves nothing worth
 the syntax — which is a large part of why SQLite never had them.
 
 **Put a network in front of SQLite and that calculus inverts.** Round trips
-become the dominant cost of a request, and a `CALL` that returns several
-declared result sets collapses N round trips into one. The feature this fork
-built for ergonomics turns out to be a *networking* feature that predates its
-network.
+become the dominant cost of a request. The feature this fork built for
+ergonomics turns out to be a *networking* feature that predates its network.
+
+But state the argument carefully, because the obvious version of it is weak.
+"One CALL replaces N round trips" is only half true: **pipelining gets most of
+that for free.** A client can send N queries without waiting and read N
+responses — 1 RTT, plain TCP, no procedures involved. Redis and HTTP/2 both do
+exactly this. Batching alone is therefore not a strong argument for stored
+procedures.
+
+The argument that survives is **data-dependent control flow.** Pipelining
+requires all N requests to be knowable in advance. The moment request 3 depends
+on the *result* of request 2, the client must round trip — unless the logic
+runs server-side. That is precisely what `IF`, `WHILE`, `SELECT … INTO`,
+`LEAVE`, and `RAISE(ABORT)` in a procedure body are: branches no transport can
+flatten.
+
+The `pay_down` procedure in README-PROCS.md is the canonical case — read a
+balance, branch on it, abort or update. Over a wire that is at minimum two
+round trips *with a race window between them*; as a CALL it is one round trip
+inside one statement-journal atom. No transport choice can collapse that, and
+no pipeline can either.
+
+So the honest ordering of benefits is:
+
+1. **Data-dependent control flow** — irreducible; only server-side logic wins.
+2. **Atomicity across dependent steps** — the race window above disappears.
+3. **Round-trip batching** — real, but partly available via pipelining.
+4. **Not sending N query texts** — minor.
 
 This note records what we measured, what is actually required to run SQLite
 under high traffic, and — importantly — which parts need no engine changes at
@@ -136,12 +161,65 @@ learn a procedure's full result contract **without executing it**. That is what
 lets a server generate a typed client, or validate a response, or pre-size
 buffers.
 
+## Transport choice: much less important than it looks
+
+A recurring instinct is to reach for UDP to cut protocol overhead. The
+arithmetic says otherwise, and it is worth recording so the question is not
+reopened from intuition.
+
+On a **pooled** connection with `TCP_NODELAY` set, a request/response costs
+exactly 1 RTT. UDP also costs 1 RTT. TCP adds no extra round trip per request;
+its handshake (1 RTT, plus 1 for TLS 1.3 unless resumed) is per *connection*
+and amortizes to roughly zero under pooling. UDP saves some kernel work — no
+congestion-control state, no reassembly — on the order of **2–10 µs against a
+~200 µs LAN round trip.**
+
+Against the measured numbers, on a 200 µs LAN serving a 5-result-set page:
+
+| Approach | Approx. cost |
+|---|---|
+| 5 separate queries, TCP | ~1000 µs |
+| 5 separate queries, UDP | ~980 µs |
+| **1 CALL, TCP** | **~200 µs** |
+| 1 CALL, UDP | ~195 µs |
+
+Removing round trips saves ~800 µs; swapping transport saves ~5–20 µs. **The
+round-trip count dominates transport choice by 40–80×.**
+
+UDP does win in three specific places: cold short-lived clients that cannot
+pool (serverless/edge pay the handshake every invocation); head-of-line
+blocking, which is TCP's real structural flaw — one lost packet stalls every
+multiplexed request behind it, including those whose bytes already arrived;
+and per-connection memory at millions-of-clients scale.
+
+It loses badly on the thing a database cares most about. **Retransmission plus
+writes equals double execution:** a lost response makes the client retry, and
+an `INSERT` runs twice. Correctness then requires request IDs and a server-side
+dedup cache with a retention window — a transaction log with extra steps. On
+top of that, results over ~1472 bytes need hand-rolled fragmentation (IP
+fragmentation is a trap: lose one fragment, lose the datagram, and middleboxes
+drop them), there is no congestion control to prevent collapse under retry
+storms, and NAT expires idle UDP flows in ~30 s versus TCP's hours.
+
+Rebuilding reliable, ordered, congestion-controlled delivery on UDP is exactly
+the project that took QUIC most of a decade. **If the UDP benefits are wanted,
+take QUIC** — it is UDP underneath with reliability, congestion control, 0-RTT
+resumption, and per-stream multiplexing free of cross-stream head-of-line
+blocking. The cost is a large dependency and userspace crypto CPU per packet.
+
+**The real latency lever is not a transport at all.** Same-host Unix domain
+socket is ~5–15 µs; in-process is ~0.1 µs. Routing a tenant to the machine
+holding its shard — step 2 of the spine — cuts RTT by 20–40×, an order of
+magnitude more than any protocol choice. Optimize placement before transport.
+
 ## What is missing for the networked case
 
 - **There is no wire protocol.** This is the real gap. Ascending in ambition:
   an HTTP/JSON front (rqlite's approach); a PostgreSQL-wire shim so existing
   client libraries work unchanged; or a purpose-built binary protocol with
-  pipelining (libSQL's Hrana).
+  pipelining (libSQL's Hrana). Whatever the choice, **support pipelining** —
+  it is cheap, it is orthogonal to procedures, and per the reframing above the
+  two solve different problems.
 - **`sqlite3_proc_next_resultset()` is not reachable from loadable
   extensions**, deliberately — see README-PROCS.md for the ABI reasoning. A
   network server is a statically-linked embedder, so this does not affect it.
