@@ -14,7 +14,9 @@ context loss — if you are a later session picking this up, this file plus
 | Wire **codec** (framing/encoding, no sockets) | done, `tool/proc_wire.c`, 22 checks |
 | Wire **transport** phase 1 (framing) | done, `tool/proc_frame.c`, 18 checks, 369 chunkings |
 | Wire **transport** phase 2 (TCP loopback) | done, `tool/proc_server.c`, 15 checks |
-| Wire **transport** phases 3-6 | ← this plan |
+| Wire **transport** phase 3 (arguments) | done |
+| Wire **transport** phase 4 (shape cache) | done, 34.9% saved on the wire |
+| Wire **transport** phases 5-6 | ← this plan |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into
@@ -111,7 +113,7 @@ instead of wedging. A hang is worse than a failure -- it reads as progress.
 
 ---
 
-## Phase 3 — requests carry arguments
+## Phase 3 — requests carry arguments — **DONE**
 
 **Deliverable.** Request frame: `[u8 REQ_CALL][str procname][u32 nArg][values…]`
 using the existing value tags. Server binds them to the prepared `CALL`.
@@ -126,7 +128,7 @@ the identity check must go red.
 
 ---
 
-## Phase 4 — the shape-cache handshake *(the fork's differentiator)*
+## Phase 4 — the shape-cache handshake *(the fork's differentiator)* — **DONE**
 
 **Deliverable.** Client sends `(procedure, schema cookie)`; if the server agrees
 the cookie is current it omits `WF_SHAPE` frames entirely. Because declared

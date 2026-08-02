@@ -41,9 +41,20 @@
 #define SRV_SHORT  1           /* declare N bytes, send N-1 (truncated)     */
 #define SRV_ALTERED 2          /* flip one payload byte before framing      */
 #define SRV_ALTERARG 3         /* flip one ARGUMENT byte before binding     */
+#define SRV_TRUSTCOOKIE 4      /* BROKEN on purpose: omit shapes regardless */
 
 /* Request opcodes.  A request is:
-**   [u8 REQ_CALL][u32 nameLen][name][u32 nArg][ (u8 tag)(payload) x nArg ]
+**   [u8 REQ_CALL][u32 nameLen][name][u32 cookie][u32 nArg][ (tag)(payload) x nArg ]
+**
+** `cookie` is the schema cookie the client believes it holds a cached result
+** shape for.  Zero means "I have nothing cached, describe the result".  If it
+** matches the server's current schema cookie, the response omits WF_SHAPE
+** frames entirely -- the mode this fork permits because declared shapes are
+** checked at CREATE time and are therefore a static contract.
+**
+** The response is TWO framed messages: the server's current cookie (4 bytes),
+** then the body.  Keeping the cookie out of the body means the codec did not
+** have to learn a new frame type for it.
 ** The argument encoding is deliberately the SAME value encoding the response
 ** rows use, so a round trip can be checked by folding both with one function
 ** rather than by two hand-written comparisons that could disagree. */
@@ -55,6 +66,10 @@ typedef struct ServerCtx {
   int mode;
   int bAccepted;               /* did a client actually arrive?             */
   int bBadRequest;             /* did we reject a malformed request?        */
+  unsigned clientCookie;       /* what the client claimed to have cached    */
+  unsigned serverCookie;       /* what the schema actually is               */
+  int bSentShapes;             /* did we describe the result this time?     */
+  int nBody;                   /* encoded body size, for the size assertion */
   HANDLE hReady;               /* signalled once listening, before accept   */
 } ServerCtx;
 
@@ -95,21 +110,40 @@ static void takeMsg(void *pArg, const unsigned char *z, int n){
 ** closes, the framer rejects the stream, or the receive timeout fires.
 ** Returns SQLITE_OK only when a whole message was assembled.
 */
-static int recvOneMessage(SOCKET s, OneMsg *pOut){
+/*
+** A connection OWNS its framer.  This is not a detail: a single recv() will
+** happily return the tail of one message and the head of the next, so a framer
+** created per-call throws those leftover bytes away and the following call
+** blocks forever waiting for bytes it already received and discarded.
+**
+** That is precisely the bug Phase 1 exists to prevent, and it reappeared here
+** the moment the response became two messages instead of one -- which is a
+** fair demonstration that the hazard is structural rather than a lapse.
+*/
+typedef struct Conn {
+  SOCKET s;
   Framer fr;
+} Conn;
+
+static void connInit(Conn *pc, SOCKET s){
+  memset(pc, 0, sizeof(*pc));
+  pc->s = s;
+}
+static void connFree(Conn *pc){ frFree(&pc->fr); }
+
+static int connRecvMessage(Conn *pc, OneMsg *pOut){
   unsigned char buf[64];        /* deliberately small: forces multiple reads
                                 ** and re-exercises the Phase 1 reassembly on
                                 ** boundaries the kernel actually produces */
-  int rc = SQLITE_OK;
-  memset(&fr, 0, sizeof(fr));
+  int rc;
   memset(pOut, 0, sizeof(*pOut));
-  while( pOut->nMsg==0 ){
-    int k = recv(s, (char*)buf, (int)sizeof(buf), 0);
+  /* A whole message may already be sitting in the buffer from a previous read. */
+  rc = frFeed(&pc->fr, 0, 0, takeMsg, pOut);
+  while( rc==SQLITE_OK && pOut->nMsg==0 ){
+    int k = recv(pc->s, (char*)buf, (int)sizeof(buf), 0);
     if( k<=0 ){ rc = SQLITE_IOERR; break; }        /* closed or timed out */
-    rc = frFeed(&fr, buf, k, takeMsg, pOut);
-    if( rc!=SQLITE_OK ) break;
+    rc = frFeed(&pc->fr, buf, k, takeMsg, pOut);
   }
-  frFree(&fr);
   if( pOut->nMsg==0 && rc==SQLITE_OK ) rc = SQLITE_IOERR;
   return rc;
 }
@@ -144,6 +178,7 @@ static int bindOneValue(sqlite3_stmt *pStmt, int idx, WireRd *rd){
 static DWORD WINAPI serverThread(LPVOID pArg){
   ServerCtx *p = (ServerCtx*)pArg;
   SOCKET sConn;
+  Conn conn;
   OneMsg req;
   sqlite3 *db = 0;
   sqlite3_stmt *pCall = 0;
@@ -158,6 +193,7 @@ static DWORD WINAPI serverThread(LPVOID pArg){
   if( sConn==INVALID_SOCKET ) return 0;
   p->bAccepted = 1;
   setTimeouts(sConn);
+  connInit(&conn, sConn);
 
   /* Parse the request.  Every field is bounds-checked before anything is
   ** prepared or executed: a malformed request must cost us a closed socket,
@@ -169,7 +205,7 @@ static DWORD WINAPI serverThread(LPVOID pArg){
     char zArgs[160];
     int nName = 0, nArg, i;
 
-    if( recvOneMessage(sConn, &req)!=SQLITE_OK ){
+    if( connRecvMessage(&conn, &req)!=SQLITE_OK ){
       p->bBadRequest = 1;
       free(req.a);
       closesocket(sConn);
@@ -181,6 +217,7 @@ static DWORD WINAPI serverThread(LPVOID pArg){
     rdInit(&rd, req.a, req.n);
     zName = 0;
     if( rdU8(&rd)==REQ_CALL ) zName = rdBytes(&rd, &nName);
+    p->clientCookie = rd.bad ? 0 : rdU32(&rd);
     nArg = rd.bad ? 0 : (int)rdU32(&rd);
     if( rd.bad || zName==0 || nName<=0 || nName>64 || nArg<0 || nArg>32 ){
       p->bBadRequest = 1;
@@ -222,12 +259,31 @@ static DWORD WINAPI serverThread(LPVOID pArg){
   }
 
   {
-    if( procWireEncode(pCall, 1, &body)==SQLITE_OK ){
+    /* Does the client already hold this schema's shapes? */
+    sqlite3_stmt *pV = 0;
+    unsigned cur = 0;
+    if( sqlite3_prepare_v2(db, "PRAGMA schema_version;", -1, &pV, 0)==SQLITE_OK ){
+      if( sqlite3_step(pV)==SQLITE_ROW ) cur = (unsigned)sqlite3_column_int64(pV, 0);
+      sqlite3_finalize(pV);
+    }
+    p->serverCookie = cur;
+    p->bSentShapes = (p->mode==SRV_TRUSTCOOKIE)
+                       ? 0
+                       : !(p->clientCookie!=0 && p->clientCookie==cur);
+    {
+      WireBuf ck;
+      memset(&ck, 0, sizeof(ck));
+      wbU32(&ck, cur);
+      frWrap(&out, ck.a, ck.n);          /* frame 1: the server's cookie */
+      wbFree(&ck);
+    }
+    if( procWireEncode(pCall, p->bSentShapes, &body)==SQLITE_OK ){
       if( p->mode==SRV_ALTERED && body.n>0 ){
         body.a[body.n/2] ^= 0xA5;                    /* corrupt one byte */
       }
-      frWrap(&out, body.a, body.n);
+      frWrap(&out, body.a, body.n);                  /* frame 2: the body */
       if( p->mode==SRV_SHORT && out.n>1 ) out.n--;   /* one byte short */
+      p->nBody = body.n;
       sendAll(sConn, out.a, out.n);
     }
     sqlite3_finalize(pCall);
@@ -235,6 +291,7 @@ static DWORD WINAPI serverThread(LPVOID pArg){
   if( db ) sqlite3_close(db);
   wbFree(&body);
   wbFree(&out);
+  connFree(&conn);
   closesocket(sConn);
   return 0;
 }
@@ -296,22 +353,29 @@ static SOCKET dialLoopback(int port){
 ** Send a request, read a framed reply, decode it.  Returns SQLITE_OK only on
 ** a complete, well-formed response.
 */
-static int callOverSocket(
+static int callFull(
   int port,
   const char *zProc,
   const WireBuf *pArgs,          /* concatenated encoded values, may be NULL */
   int nArg,
+  unsigned cookieIn,             /* 0 = "describe the result to me"          */
+  const int *aNCol,              /* non-NULL = decode WITHOUT shape frames   */
+  int nSet,
+  unsigned *pCookieOut,
+  int *pnBody,
   DecodeStats *pSt
 ){
   SOCKET s = dialLoopback(port);
   WireBuf body, req;
   OneMsg rsp;
+  Conn conn;
   int rc;
   if( s==INVALID_SOCKET ) return SQLITE_IOERR;
   memset(&body, 0, sizeof(body));
   memset(&req, 0, sizeof(req));
   wbU8(&body, REQ_CALL);
   wbStr(&body, zProc);
+  wbU32(&body, cookieIn);
   wbU32(&body, (unsigned)nArg);
   if( pArgs && pArgs->n>0 && wbNeed(&body, pArgs->n)==0 ){
     memcpy(body.a + body.n, pArgs->a, pArgs->n);
@@ -321,11 +385,38 @@ static int callOverSocket(
   wbFree(&body);
   if( sendAll(s, req.a, req.n) ){ wbFree(&req); closesocket(s); return SQLITE_IOERR; }
   wbFree(&req);
-  rc = recvOneMessage(s, &rsp);
-  if( rc==SQLITE_OK ) rc = procWireDecode(rsp.a, rsp.n, pSt);
+  connInit(&conn, s);
+  /* frame 1: the server's current schema cookie */
+  rc = connRecvMessage(&conn, &rsp);
+  if( rc==SQLITE_OK ){
+    if( rsp.n==4 && pCookieOut ){
+      *pCookieOut = ((unsigned)rsp.a[0]<<24) | ((unsigned)rsp.a[1]<<16)
+                  | ((unsigned)rsp.a[2]<<8)  | ((unsigned)rsp.a[3]);
+    }else if( rsp.n!=4 ){
+      rc = SQLITE_CORRUPT;
+    }
+  }
   free(rsp.a);
+  /* frame 2: the body */
+  if( rc==SQLITE_OK ){
+    rc = connRecvMessage(&conn, &rsp);
+    if( rc==SQLITE_OK ){
+      if( pnBody ) *pnBody = rsp.n;
+      rc = aNCol ? procWireDecodeKnown(rsp.a, rsp.n, aNCol, nSet, pSt)
+                 : procWireDecode(rsp.a, rsp.n, pSt);
+    }
+    free(rsp.a);
+  }
+  connFree(&conn);
   closesocket(s);
   return rc;
+}
+
+/* Thin wrapper for the phases that predate the cookie. */
+static int callOverSocket(
+  int port, const char *zProc, const WireBuf *pArgs, int nArg, DecodeStats *pSt
+){
+  return callFull(port, zProc, pArgs, nArg, 0, 0, 0, 0, 0, pSt);
 }
 
 /* ============================== self-test ================================= */
@@ -412,10 +503,13 @@ int main(int argc, char **argv){
     check(s!=INVALID_SOCKET, "connected in order to send garbage");
     if( s!=INVALID_SOCKET ){
       OneMsg rsp;
+      Conn gc;
+      connInit(&gc, s);
       sendAll(s, junk, (int)sizeof(junk));
-      check(recvOneMessage(s, &rsp)!=SQLITE_OK,
+      check(connRecvMessage(&gc, &rsp)!=SQLITE_OK,
             "garbage yields no response, and no crash");
       free(rsp.a);
+      connFree(&gc);
       closesocket(s);
     }
     Sleep(50);
@@ -508,6 +602,76 @@ int main(int argc, char **argv){
 
     wbFree(&args);
     wbFree(&expect);
+  }
+
+  /* ---- 7. PHASE 4: the shape-cache handshake -------------------------- */
+  /* The differentiator. A procedure's result shape is fixed at CREATE time and
+  ** checked against the body, so it is a STATIC contract -- a client can cache
+  ** it and the server can then send rows carrying no schema at all. Postgres
+  ** must re-describe because an arbitrary query's shape is only known after
+  ** planning; here it is known before the call is ever made. */
+  {
+    static const int aNCol[2] = { 5, 2 };     /* fetch_all's declared shapes */
+    unsigned cookie = 0;
+    int nDescribed = 0, nLean = 0, nStale = 0;
+    DecodeStats stD, stL, stS;
+
+    /* (a) cold client: cookie 0 means "describe it to me" */
+    if( startServer(&srv, SRV_NORMAL)==0 ){
+      check(callFull(srv.port, "fetch_all", 0, 0, 0, 0, 0,
+                     &cookie, &nDescribed, &stD)==SQLITE_OK,
+            "cold call (cookie 0) succeeds");
+      check(cookie != 0, "server reports a non-zero schema cookie");
+      check(srv.bSentShapes==1, "and it DID describe the result");
+      stopServer(&srv);
+    }else{
+      check(0, "server failed to start (cold)");
+    }
+
+    /* (b) warm client: presents the cookie, gets rows with no schema */
+    if( startServer(&srv, SRV_NORMAL)==0 ){
+      check(callFull(srv.port, "fetch_all", 0, 0, cookie, aNCol, 2,
+                     0, &nLean, &stL)==SQLITE_OK,
+            "warm call (matching cookie) succeeds");
+      check(srv.bSentShapes==0, "and the server OMITTED the shapes");
+      check(nLean < nDescribed, "the shape-free body is smaller");
+      check(stL.checksum==stD.checksum,
+            "and carries BIT-IDENTICAL data (checksums match)");
+      printf("  shape cache: %d bytes described, %d bytes lean (%.1f%% saved)\n",
+             nDescribed, nLean, 100.0*(nDescribed-nLean)/(double)nDescribed);
+      stopServer(&srv);
+    }else{
+      check(0, "server failed to start (warm)");
+    }
+
+    /* (c) SAFETY: a stale cookie must force a re-describe.  If this fails, a
+    ** client that migrated its schema would be handed rows under the OLD
+    ** column names -- silently, and with no way to notice. */
+    if( startServer(&srv, SRV_NORMAL)==0 ){
+      check(callFull(srv.port, "fetch_all", 0, 0, cookie+1, 0, 0,
+                     0, &nStale, &stS)==SQLITE_OK,
+            "stale-cookie call still succeeds");
+      check(srv.bSentShapes==1, "STALE COOKIE FORCES A RE-DESCRIBE");
+      check(nStale==nDescribed, "and the response is the full described size");
+      check(stS.checksum==stD.checksum, "with the same data");
+      stopServer(&srv);
+    }else{
+      check(0, "server failed to start (stale)");
+    }
+
+    /* (d) can-fail: a server that trusts the cookie blindly must break the
+    ** client that relied on the re-describe.  This proves check (c) is
+    ** load-bearing rather than incidentally true. */
+    if( startServer(&srv, SRV_TRUSTCOOKIE)==0 ){
+      int rcBad = callFull(srv.port, "fetch_all", 0, 0, cookie+1, 0, 0,
+                           0, 0, &stS);
+      check(rcBad!=SQLITE_OK,
+            "a server that ignores a stale cookie breaks its client (as it must)");
+      printf("  blind-trust probe: client rc=%d (non-zero is correct)\n", rcBad);
+      stopServer(&srv);
+    }else{
+      check(0, "server failed to start (trust-cookie)");
+    }
   }
 
   wbFree(&ref);
