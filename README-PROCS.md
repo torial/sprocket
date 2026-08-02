@@ -269,6 +269,10 @@ the makefiles invoke freshly built tools by bare name.
   392,950**. The total differs by 6 from the run above; `veryquick`'s count is
   not perfectly stable across environments, so treat the *error* count as the
   contract and the total as informational.
+- **Upstream 3.53.4 merged 2026-08-02: 0 errors out of 392,985.** Zero
+  conflicts. `resolve.c` and `shell.c.in` auto-merged, and `resolve.c` is the
+  one that mattered — it carries the procedure parameter-resolution branch and
+  the `pNC = pTopNC` fix noted above. Verified present afterwards, not assumed.
 
 ### Running the suite on Windows (hard-won)
 
@@ -280,9 +284,20 @@ unqualified and Windows may not search the working directory).
 
     set PATH=C:\Projects\sqlite;C:\Tcl\bin;%PATH%
 
-Always make the fixture prove it loaded before believing a result:
+**Build BOTH binaries.** The `shellB-*` tests exec the **CLI**, not the
+fixture, so `nmake testfixture.exe` alone leaves a stale `sqlite3.exe` behind.
+After the 3.53.4 merge that produced 3 failures in `shellB-intck01.sql` which
+read exactly like a regression and were nothing of the kind: 3.53.4 ships a
+*new* intck test, and the old shell had no `.intck` support for it. One command
+settled it — `sqlite3.exe --version` said 3.53.3 while the fixture said 3.53.4.
 
-    testfixture.exe -               # or any trivial script that prints
+    nmake /f Makefile.msc sqlite3.exe
+    nmake /f Makefile.msc testfixture.exe
+
+Always make both binaries prove what they are before believing a result:
+
+    sqlite3.exe --version           # must match the tree you think you built
+    testfixture.exe <script>        # any trivial script that prints
     testfixture.exe test\veryquick.test
 
 A real `veryquick` run emits roughly **400,000 lines** and takes minutes. If
