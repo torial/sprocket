@@ -5,6 +5,23 @@
 
 Active work is `PLAN-TRANSPORT.md`. This file is what comes after, or instead.
 
+**Companion roadmap.** Zebra's ORM ("Tack") is designed on top of this fork —
+`ZEBRA_ORM_ARCHITECTURE.md` in the language project. Its §14 works each item
+below from the ORM's side, so the two roadmaps are planned together. Three
+couplings worth knowing before picking anything up here:
+
+- **Authorization (#1) gates the ORM too.** Tack makes procedures a
+  network-facing application surface, so the proc boundary becomes its security
+  boundary. It is currently unguarded on both sides.
+- **Typed client generation (#2) is the same mechanism as Tack's build-time
+  pre-pass**, pointed at different languages. `PRAGMA proc_info` is the shared
+  interface; do not build the introspection twice.
+- **The shape-cache handshake has a stronger form for a generated client.**
+  Tack knows every result shape at *build* time, so it never needs a describe
+  at all — and a cookie mismatch means the binary was compiled against a
+  different schema than the server runs, which is a deployment error to fail on
+  rather than a cache miss to recover from.
+
 ---
 
 ## 1. Authorization for procedures — *we created this hole*
