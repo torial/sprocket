@@ -5608,7 +5608,7 @@ int sqlite3_column_type(sqlite3_stmt*, int iCol);
 ** This interface is an extension of this build and is not part of
 ** standard SQLite.
 */
-SQLITE_API int sqlite3_proc_next_resultset(sqlite3_stmt*);
+int sqlite3_proc_next_resultset(sqlite3_stmt*);
 
 /*
 ** CAPI3REF: Destroy A Prepared Statement Object

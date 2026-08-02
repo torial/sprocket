@@ -142,9 +142,34 @@ One property is intentionally **not** enforced:
 
 - No `OUT`/`INOUT` parameters (result sets cover most cases; planned later).
 - Per-column types of declared shapes are advisory (see above).
-- `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is not
-  registered in the loadable-extension API table, so run-time-loaded
-  extensions cannot call it.
+- `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is **not**
+  registered in the loadable-extension API table (`sqlite3_api_routines` in
+  `sqlite3ext.h` / `sqlite3Apis` in `loadext.c`), so run-time-loaded
+  extensions cannot call it. Statically-linked embedders — who are the
+  audience for multiple result sets — are unaffected.
+
+  **This is a decision, not an oversight.** Two reasons, recorded so nobody
+  "fixes" it by reflex:
+
+  1. *Upstream precedent runs the same way.* Conditionally-compiled API
+     families are generally kept out of that table: `sqlite3_preupdate_*`,
+     `sqlite3_snapshot_*`, and `sqlite3_stmt_scanstatus*` are all absent.
+     `carray_bind` is the lone counter-example, added with an
+     `#ifdef`→`0` placeholder to hold its slot.
+  2. *Appending to the table is a permanent ABI commitment, and this is a
+     fork.* `sqlite3_api_routines` is a flat, order-dependent struct;
+     extensions bind by slot offset. Our tail is `/* Version 3.52.0 and
+     later */`. If we append a slot, we take the offset upstream will use
+     for **its** next API — and then an extension compiled against upstream
+     `sqlite3ext.h` that calls that future function, loaded into a library
+     built from this fork, jumps into `proc_next_resultset` instead. Wrong
+     signature, no diagnostic. That is the one class of divergence a fork
+     cannot walk back later.
+
+  If it is ever wanted, the `carray_bind` shape is the correct one
+  (`#ifndef SQLITE_OMIT_PROCEDURE` → function, `#else` → `0`, appended at
+  the very end and never reordered), and the divergence above should be
+  stated loudly at the same time.
 - Multi-row `SELECT INTO` takes the first row silently (Sean's decision;
   MySQL-strict mode would be a small phase 4+ addition).
 - An uncorrelated **FROM-clause subquery** inside a WHILE/LOOP body
@@ -240,4 +265,26 @@ the makefiles invoke freshly built tools by bare name.
 - Full `veryquick`: **0 errors out of 392,956**, no leaks (vanilla baseline:
   0/392,771). `dbstatus` and `memsubsys2` — the memory-measurement suites
   that caught a refcount leak in this fork once before — 26/26 each.
+- Re-verified 2026-08-01 after the `SQLITE_API` header fix: **0 errors out of
+  392,950**. The total differs by 6 from the run above; `veryquick`'s count is
+  not perfectly stable across environments, so treat the *error* count as the
+  contract and the total as informational.
+
+### Running the suite on Windows (hard-won)
+
+`testfixture.exe` links Tcl dynamically. If `tcl86t.dll` is not on `PATH` the
+binary **exits 0 having printed nothing**, which reads exactly like a clean
+run — a green that means the tests never started. Likewise the repository
+directory must be on `PATH` (`jimsh0.exe` and `testfixture.exe` are invoked
+unqualified and Windows may not search the working directory).
+
+    set PATH=C:\Projects\sqlite;C:\Tcl\bin;%PATH%
+
+Always make the fixture prove it loaded before believing a result:
+
+    testfixture.exe -               # or any trivial script that prints
+    testfixture.exe test\veryquick.test
+
+A real `veryquick` run emits roughly **400,000 lines** and takes minutes. If
+the output is small or the run is fast, it did not happen.
 
