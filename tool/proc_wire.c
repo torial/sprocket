@@ -462,6 +462,16 @@ static sqlite3 *procWireTestDb(void){
     "  SELECT k, i, f, t, b FROM vals ORDER BY k;\n"
     "  SELECT id, body FROM notes ORDER BY id;\n"
     "END;");
+
+  /* Identity procedure: hands back exactly what it was given.  Phase 3 of the
+  ** transport uses this to prove arguments survive the wire -- what goes in
+  ** must come out, which is a control that needs no fixed expected value. */
+  execOrDie(db,
+    "CREATE PROCEDURE echo6(p1, p2, p3, p4, p5, p6)\n"
+    "  RETURNS TABLE(a INTEGER, b INTEGER, c REAL, d TEXT, e TEXT, f BLOB)\n"
+    "BEGIN\n"
+    "  SELECT p1, p2, p3, p4, p5, p6;\n"
+    "END;");
   return db;
 }
 
