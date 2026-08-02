@@ -154,6 +154,7 @@ static int driveChunked(
   }
 }
 
+#ifndef PROC_FRAME_NO_MAIN
 int main(int argc, char **argv){
   sqlite3 *db;
   sqlite3_stmt *pCall = 0;
@@ -309,3 +310,4 @@ int main(int argc, char **argv){
          nFail ? "PROC_FRAME FAILED" : "PROC_FRAME OK", nCheck, nFail);
   return nFail ? 1 : 0;
 }
+#endif /* PROC_FRAME_NO_MAIN */

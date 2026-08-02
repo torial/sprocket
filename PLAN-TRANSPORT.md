@@ -13,7 +13,8 @@ context loss — if you are a later session picking this up, this file plus
 | Thesis + measurements | `DESIGN-NETWORK.md` |
 | Wire **codec** (framing/encoding, no sockets) | done, `tool/proc_wire.c`, 22 checks |
 | Wire **transport** phase 1 (framing) | done, `tool/proc_frame.c`, 18 checks, 369 chunkings |
-| Wire **transport** phases 2-6 | ← this plan |
+| Wire **transport** phase 2 (TCP loopback) | done, `tool/proc_server.c`, 15 checks |
+| Wire **transport** phases 3-6 | ← this plan |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into
@@ -81,7 +82,7 @@ not validating and the phase is not done.
 
 ---
 
-## Phase 2 — loopback echo of one real CALL
+## Phase 2 — loopback echo of one real CALL — **DONE**
 
 **Deliverable.** `tool/proc_server.c` (single-threaded, blocking, one
 connection) and a client in the same binary behind `--client`, so the whole
@@ -102,7 +103,11 @@ prints the chosen port, accepts, reads one framed request, executes a fixed
 loudly and promptly, not hang. Have the server send one byte fewer than the
 frame declares — client must report incomplete.
 
-*This is the natural stopping point for a session with limited context.*
+**Built as a server THREAD in one binary** rather than two processes: the
+socket path is genuine TCP on 127.0.0.1, but the test cannot hang on a dead
+process, cannot leak an orphan listener, and needs no shell orchestration.
+Every socket carries a 5s timeout, so each negative case fails promptly
+instead of wedging. A hang is worse than a failure -- it reads as progress.
 
 ---
 
