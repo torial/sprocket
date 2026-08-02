@@ -12,7 +12,8 @@ context loss — if you are a later session picking this up, this file plus
 | `sqlite3_proc_next_resultset()` boundary API | done; deliberately NOT in the extension table (README-PROCS.md says why) |
 | Thesis + measurements | `DESIGN-NETWORK.md` |
 | Wire **codec** (framing/encoding, no sockets) | done, `tool/proc_wire.c`, 22 checks |
-| Wire **transport** | ← this plan |
+| Wire **transport** phase 1 (framing) | done, `tool/proc_frame.c`, 18 checks, 369 chunkings |
+| Wire **transport** phases 2-6 | ← this plan |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into
@@ -53,7 +54,7 @@ cl /nologo /W3 /O2 /I. tool\<file>.c sqlite3.c /Fe:<out>.exe /Fo:obj\
 
 ---
 
-## Phase 1 — framing over a byte stream *(no sockets)*
+## Phase 1 — framing over a byte stream *(no sockets)* — **DONE**
 
 **Deliverable.** `tool/proc_frame.c`: a length-prefixed framer that reassembles
 messages from arbitrary chunk boundaries. A stream reader that only works when

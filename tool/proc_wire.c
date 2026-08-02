@@ -427,21 +427,17 @@ static void execOrDie(sqlite3 *db, const char *zSql){
   }
 }
 
-int main(int argc, char **argv){
+/*
+** The shared fixture: an in-memory database holding a two-result-set procedure
+** whose rows deliberately include every value class that breaks naive codecs.
+**
+** Exposed as a function so the framer's test (tool/proc_frame.c) can build the
+** SAME payload and reuse the SAME checksum as its positive control -- which
+** ties the transport path to a value already proven without any transport.
+*/
+static sqlite3 *procWireTestDb(void){
   sqlite3 *db = 0;
-  sqlite3_stmt *pCall = 0;
-  WireBuf full, lean;
-  DecodeStats st, st2;
-  int rc, i;
-  int aNCol[2];
-
-  (void)argc; (void)argv;
-  memset(&full, 0, sizeof(full));
-  memset(&lean, 0, sizeof(lean));
-
-  printf("proc_wire self-test -- SQLite %s\n\n", sqlite3_libversion());
-
-  if( sqlite3_open(":memory:", &db)!=SQLITE_OK ){ printf("open failed\n"); return 1; }
+  if( sqlite3_open(":memory:", &db)!=SQLITE_OK ) return 0;
 
   /* Positive controls: every value class the codec claims to carry, including
   ** the ones that break naive encoders -- NULL, a negative 64-bit integer, a
@@ -466,6 +462,26 @@ int main(int argc, char **argv){
     "  SELECT k, i, f, t, b FROM vals ORDER BY k;\n"
     "  SELECT id, body FROM notes ORDER BY id;\n"
     "END;");
+  return db;
+}
+
+#ifndef PROC_WIRE_NO_MAIN
+int main(int argc, char **argv){
+  sqlite3 *db = 0;
+  sqlite3_stmt *pCall = 0;
+  WireBuf full, lean;
+  DecodeStats st, st2;
+  int rc, i;
+  int aNCol[2];
+
+  (void)argc; (void)argv;
+  memset(&full, 0, sizeof(full));
+  memset(&lean, 0, sizeof(lean));
+
+  printf("proc_wire self-test -- SQLite %s\n\n", sqlite3_libversion());
+
+  db = procWireTestDb();
+  if( db==0 ){ printf("fixture failed\n"); return 1; }
 
   if( sqlite3_prepare_v2(db, "CALL fetch_all();", -1, &pCall, 0)!=SQLITE_OK ){
     printf("prepare failed: %s\n", sqlite3_errmsg(db));
@@ -582,3 +598,5 @@ int main(int argc, char **argv){
          nFail ? "PROC_WIRE FAILED" : "PROC_WIRE OK", nCheck, nFail);
   return nFail ? 1 : 0;
 }
+
+#endif /* PROC_WIRE_NO_MAIN */
