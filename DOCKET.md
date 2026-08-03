@@ -220,6 +220,58 @@ A and B are complementary rather than rival: A handles parent/child collections,
 B handles a genuinely scalar-shaped nested value. It may be right to build A
 and never need B.
 
+### POC 1 (2026-08-03) — does nesting earn its place at all?
+
+`tool/proc_nestpoc.c`. Before choosing syntax, measure whether the feature is
+needed: SQL already has three ways to return a parent with its children, and
+Tack implements all three. Measured on 10 parents x 20 children, bytes counted
+through the **real wire codec**, values counted exactly — no timings.
+
+| strategy | bytes | values | |
+|---|---|---|---|
+| S1 join-flatten | 29,861 | 1200 | parent columns repeat per child row |
+| **S3 JSON fold** | **12,501** | 50 | children as JSON text |
+| S4 two result sets | 15,511 | 640 | no repetition; needs correlation |
+
+**The result argues against the obvious motivation.** S4 beats join-flatten by
+48%, which is the number one would quote — but **JSON fold is smaller still, by
+24%**. So "fewer bytes" cannot be the case for nested shapes. Something already
+in the box does better.
+
+**Control, and the honest half:** with *one* child per parent there is nothing
+to deduplicate and S4 must lose. It does — 1721 bytes against join-flatten's
+1593. A feature that looked good on every input would mean the measurement was
+wrong.
+
+### What POC 1 changed about the argument
+
+If bytes are not the case, what is? **Type fidelity — and it is not a matter of
+degree.**
+
+```
+SELECT json_group_array(blob_col) FROM att;
+Error: JSON cannot hold BLOB values
+```
+
+JSON fold does not merely encode a BLOB awkwardly; it **refuses**. A result set
+carries the same column as `SQLITE_BLOB` untouched. The same flattening applies
+less dramatically to the integer/real distinction, which JSON has no way to
+preserve.
+
+So the thesis for DOCKET #3 is now:
+
+> Nested shapes are not a compression feature. They are the only way to return
+> a parent with typed, streamable children — JSON fold is smaller but lossy and
+> outright rejects binary; join-flatten is faithful but quadratic in the parent.
+
+That is a narrower and more defensible claim than the one this entry started
+with, and it should be the sentence any syntax is judged against.
+
+**Still to prototype:** whether declared-metadata correlation (candidate A)
+actually lets a client reassemble more cheaply than it can today, and what the
+syntax costs. POC 1 says the feature is worth *a* design; it does not yet say
+which.
+
 ### How to decide — Sean's steer, 2026-08-02
 
 Explicitly **do not rush this**, on the Andrew Kelley model: keep searching for
