@@ -1,0 +1,277 @@
+# 2026-08-03
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Test cases for NESTED RESULT SHAPES on stored procedures:
+#
+#   RETURNS TABLE(id INTEGER, title TEXT,
+#                 comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+#
+# covering the grammar and storage (PLAN-NESTED phase 1) and the CREATE-time
+# conformance walk (phase 2), which requires the body to emit the parent
+# SELECT followed by one SELECT per nested table.
+#
+# NOT covered here, because it does not exist yet: CALL of a nested procedure.
+# Until phase 3 imposes the child ordering and phase 5 adds the flat-client
+# column, a nested procedure streams its parent and child sets raw, which does
+# not satisfy the invariant in PLAN-NESTED.md.  That is why this work is on a
+# branch.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc6
+
+ifcapable {!trigger} {
+  finish_test
+  return
+}
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body TEXT);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,1,'a'),(2,1,'b'),(3,2,'c');
+} {}
+
+#--------------------------------------------------------------------
+# 1.x: the grammar costs no keywords
+#
+# TABLE and KEY are both existing tokens, and KEY is in the non-reserved
+# fallback list.  The fork's other keywords carry the guarantee that they
+# remain usable as identifiers, and this one must too.
+#
+do_execsql_test 1.0 {
+  CREATE TABLE key(key INTEGER, [table] TEXT);
+  INSERT INTO key VALUES(1,'x');
+  SELECT key, [table] FROM key;
+} {1 x}
+
+#--------------------------------------------------------------------
+# 2.x: a conforming nested declaration is ACCEPTED
+#
+# This is the positive control for the whole file.  Every other test here
+# asserts a rejection; without this one, a conformance walk that rejected
+# every nested procedure would pass them all.
+#
+do_execsql_test 2.0 {
+  CREATE PROCEDURE pwc(pid INTEGER)
+    RETURNS TABLE(
+      id INTEGER,
+      title TEXT,
+      comments TABLE(post_id INTEGER, cid INTEGER, body TEXT) KEY(post_id = id)
+    )
+  BEGIN
+    SELECT id, title FROM posts WHERE id = pid;
+    SELECT post_id, cid, body FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+# It survives a reopen: the declaration round-trips through sqlite_schema.
+do_test 2.1 {
+  db close
+  sqlite3 db test.db
+  execsql {SELECT name, nresultsets FROM pragma_proc_list WHERE name = 'pwc'}
+} {pwc 1}
+
+# Two nested tables in one shape: three SELECTs, parent first.
+do_execsql_test 2.2 {
+  CREATE PROCEDURE pwc2(pid INTEGER)
+    RETURNS TABLE(
+      id INTEGER,
+      comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id),
+      tags TABLE(pid2 INTEGER, tag TEXT) KEY(pid2 = id)
+    )
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+    SELECT 1, 'x';
+  END;
+} {}
+
+# A nested table in the SECOND of two declared shapes.
+do_execsql_test 2.3 {
+  CREATE PROCEDURE pwc3(pid INTEGER)
+    RETURNS TABLE(n INTEGER)
+    RETURNS TABLE(
+      id INTEGER,
+      comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id)
+    )
+  BEGIN
+    SELECT count(*) FROM posts;
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+#--------------------------------------------------------------------
+# 3.x: phase 1 -- the declaration itself
+#
+# KEY's child half must name a column of the nested table.
+do_catchsql_test 3.0 {
+  CREATE PROCEDURE b1(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(body TEXT) KEY(post_id = id))
+  BEGIN SELECT 1; SELECT 'x'; END;
+} {1 {KEY names post_id, which is not a column of the nested table}}
+
+# KEY's parent half must name a column of the shape that contains it.  This
+# is checked once the shape is complete, so it holds even when the nested
+# table is declared BEFORE the column it correlates on.
+do_catchsql_test 3.1 {
+  CREATE PROCEDURE b2(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = nope))
+  BEGIN SELECT 1; SELECT 1,'x'; END;
+} {1 {nested table comments of procedure b2 correlates on nope, which is not a column of the result set that contains it}}
+
+do_execsql_test 3.2 {
+  CREATE PROCEDURE fwd(pid INTEGER)
+    RETURNS TABLE(comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id),
+                  id INTEGER)
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+# Depth 2 is out of scope and is rejected explicitly rather than accepted
+# and mishandled.
+do_catchsql_test 3.3 {
+  CREATE PROCEDURE b3(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER,
+                                 grand TABLE(g INTEGER) KEY(g = post_id))
+                    KEY(post_id = id))
+  BEGIN SELECT 1; END;
+} {1 {nested tables may not themselves nest: grand}}
+
+# A shape that is nothing but nested tables has no column to correlate on.
+do_catchsql_test 3.4 {
+  CREATE PROCEDURE b4(pid INTEGER)
+    RETURNS TABLE(comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN SELECT 1; END;
+} {1 {result set of procedure b4 declares only nested tables; a result set must have at least one column of its own to correlate on}}
+
+#--------------------------------------------------------------------
+# 4.x: phase 2 -- the body must emit parent then children, in order
+#
+# The child SELECT is missing entirely.
+do_catchsql_test 4.0 {
+  CREATE PROCEDURE m1(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts WHERE id = pid;
+  END;
+} {1 {procedure m1 streams 1 result set but declares 2}}
+
+# Wrong arity on the child SELECT: the message names the nested table, not
+# just the ordinal, because the author is looking at a body whose SELECTs
+# have no labels.
+do_catchsql_test 4.1 {
+  CREATE PROCEDURE m2(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts WHERE id = pid;
+    SELECT post_id, cid, body FROM comments WHERE post_id = pid;
+  END;
+} {1 {result set 2 of procedure m2 carries nested table comments, which declares 2 columns, but that SELECT has 3}}
+
+# Wrong arity on the parent SELECT.  The message must not say "declares 2"
+# against a RETURNS TABLE that visibly holds three entries.
+do_catchsql_test 4.2 {
+  CREATE PROCEDURE m3(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+  END;
+} {1 {result set 1 of procedure m3 has 1 column but its RETURNS TABLE declares 2 before its 1 nested table, which are streamed by the SELECTs that follow}}
+
+# Transposed: child SELECT first.  Caught because the arities differ.
+do_catchsql_test 4.3 {
+  CREATE PROCEDURE m4(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+    SELECT id FROM posts WHERE id = pid;
+  END;
+} {1 {result set 1 of procedure m4 has 2 columns but its RETURNS TABLE declares 1 before its 1 nested table, which are streamed by the SELECTs that follow}}
+
+# One SELECT too many.
+do_catchsql_test 4.4 {
+  CREATE PROCEDURE m5(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+    SELECT 1;
+  END;
+} {1 {procedure m5 streams more result sets than the 2 declared by its RETURNS clauses}}
+
+# "*" is still refused, on a child SELECT as much as a parent one.
+do_catchsql_test 4.5 {
+  CREATE PROCEDURE m6(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT * FROM comments WHERE post_id = pid;
+  END;
+} {1 {procedure m6 declares result shapes, so result set 2 may not use "*" -- list the columns explicitly}}
+
+# RETURN mid-sequence, after the parent but before the child.
+do_catchsql_test 4.6 {
+  CREATE PROCEDURE m7(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    RETURN;
+  END;
+} {1 {procedure m7 returns after streaming 1 of 2 declared result sets}}
+
+# Branch symmetry still counts emissions, so a branch that streams the
+# parent but not the child is caught.
+do_catchsql_test 4.7 {
+  CREATE PROCEDURE m8(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    IF pid > 0 THEN
+      SELECT post_id, body FROM comments WHERE post_id = pid;
+    END IF;
+  END;
+} {1 {branches of IF in procedure m8 stream different numbers of result sets (2 and 1); every path must stream the declared sequence in order}}
+
+#--------------------------------------------------------------------
+# 5.x: nothing that did not nest behaves differently
+#
+# The flattened expectation must be identical to the old shape array when
+# no column nests, or the diagnostics above would have drifted.
+#
+do_catchsql_test 5.0 {
+  CREATE PROCEDURE f1(x INTEGER) RETURNS TABLE(a INTEGER, b TEXT)
+  BEGIN SELECT 1; END;
+} {1 {result set 1 of procedure f1 has 1 column but its RETURNS TABLE declares 2}}
+
+do_execsql_test 5.1 {
+  CREATE PROCEDURE f2(x INTEGER) RETURNS NOTHING
+  BEGIN INSERT INTO posts VALUES(99,'n'); END;
+  CALL f2(0);
+  SELECT title FROM posts WHERE id = 99;
+} {n}
+
+finish_test

@@ -188,7 +188,7 @@ void sqlite3ProcShapeListDelete(sqlite3 *db, ProcShape *pList){
 **
 ** The walk carries a "shape cursor": the number of result sets streamed
 ** so far on the path being examined.  Streaming SELECTs advance it;
-** every complete path must end with the cursor at nShape.
+** every complete path must end with the cursor at nEmit.
 **
 ** Enforced: R1 (set count per path; RAISE exempt), R2 arity, R3 (branch
 ** symmetry), R3L (no row-returning SELECT inside a loop), R4 (a declared
@@ -202,13 +202,32 @@ void sqlite3ProcShapeListDelete(sqlite3 *db, ProcShape *pList){
 ** constraint.  Arity, ordering and set count -- the properties a static
 ** consumer cannot recover at runtime -- are checked strictly.
 */
+
+/*
+** One result set the body is required to emit, in wire order.
+**
+** A declared shape holding k nested tables expands to 1+k of these: the
+** parent, then one per nested table in declaration order.  Flattening here
+** rather than in the walk is what keeps nesting out of the control-flow
+** machinery entirely -- IF branches, loops and RETURN still reason about a
+** single integer cursor, and a procedure that nests nothing produces exactly
+** the array the checker used before nesting existed, so its diagnostics are
+** unchanged to the byte.
+*/
+typedef struct ProcEmit ProcEmit;
+struct ProcEmit {
+  int nCol;               /* Columns the emitting SELECT must have */
+  int nNested;            /* Nested tables in this shape (parent rows only) */
+  const char *zNested;    /* Nested table name, or NULL if this is the parent */
+};
+
 typedef struct ProcConf ProcConf;
 struct ProcConf {
   Parse *pParse;          /* Parse context for error reporting */
   Proc *pProc;            /* Procedure being defined (not yet in the hash) */
   const char *zName;      /* Its name, for error messages */
-  int nShape;             /* Number of declared shapes (0 = RETURNS NOTHING) */
-  ProcShape **apShape;    /* Declared shapes, indexed */
+  int nEmit;              /* Result sets required (0 = RETURNS NOTHING) */
+  ProcEmit *aEmit;        /* Those result sets, in wire order */
   const char *zWhere;     /* " in the THEN branch" etc, or "" at top level */
   int nErr;               /* Nonzero once an error has been reported */
 };
@@ -325,17 +344,17 @@ static int procCheckList(
         int nCol;
         if( pStep->pIdList!=0 ) break;   /* SELECT ... INTO streams nothing */
         if( bInLoop ) break;             /* Already reported by R3L */
-        if( p->nShape==0 ){
+        if( p->nEmit==0 ){
           sqlite3ErrorMsg(p->pParse,
             "procedure %s declares RETURNS NOTHING but contains a "
             "row-returning SELECT", p->zName);
           p->nErr = 1;
           break;
         }
-        if( i>=p->nShape ){
+        if( i>=p->nEmit ){
           sqlite3ErrorMsg(p->pParse,
             "procedure %s streams more result sets than the %d declared "
-            "by its RETURNS clauses", p->zName, p->nShape);
+            "by its RETURNS clauses", p->zName, p->nEmit);
           p->nErr = 1;
           break;
         }
@@ -347,11 +366,33 @@ static int procCheckList(
           p->nErr = 1;
           break;
         }
-        if( nCol!=p->apShape[i]->pCols->nParam ){
-          sqlite3ErrorMsg(p->pParse,
-            "result set %d of procedure %s%s has %d column%s but its "
-            "RETURNS TABLE declares %d", i+1, p->zName, p->zWhere, nCol,
-            nCol==1 ? "" : "s", p->apShape[i]->pCols->nParam);
+        if( nCol!=p->aEmit[i].nCol ){
+          ProcEmit *pE = &p->aEmit[i];
+          if( pE->zNested ){
+            /* The body's Nth SELECT is the one feeding a nested table, so
+            ** name the table rather than leaving the author to count. */
+            sqlite3ErrorMsg(p->pParse,
+              "result set %d of procedure %s%s carries nested table %s, "
+              "which declares %d column%s, but that SELECT has %d",
+              i+1, p->zName, p->zWhere, pE->zNested, pE->nCol,
+              pE->nCol==1 ? "" : "s", nCol);
+          }else if( pE->nNested ){
+            /* Distinguished from the flat message below because the RETURNS
+            ** TABLE visibly holds more entries than the parent SELECT is
+            ** meant to supply -- saying "declares 2" against a clause with
+            ** three entries would read as a bug in the checker. */
+            sqlite3ErrorMsg(p->pParse,
+              "result set %d of procedure %s%s has %d column%s but its "
+              "RETURNS TABLE declares %d before its %d nested table%s, "
+              "which are streamed by the SELECTs that follow",
+              i+1, p->zName, p->zWhere, nCol, nCol==1 ? "" : "s",
+              pE->nCol, pE->nNested, pE->nNested==1 ? "" : "s");
+          }else{
+            sqlite3ErrorMsg(p->pParse,
+              "result set %d of procedure %s%s has %d column%s but its "
+              "RETURNS TABLE declares %d", i+1, p->zName, p->zWhere, nCol,
+              nCol==1 ? "" : "s", pE->nCol);
+          }
           p->nErr = 1;
           break;
         }
@@ -396,10 +437,10 @@ static int procCheckList(
         break;
       }
       case TK_RETURN: {
-        if( !bInLoop && i!=p->nShape ){
+        if( !bInLoop && i!=p->nEmit ){
           sqlite3ErrorMsg(p->pParse,
             "procedure %s returns after streaming %d of %d declared "
-            "result sets", p->zName, i, p->nShape);
+            "result sets", p->zName, i, p->nEmit);
           p->nErr = 1;
         }
         *peEnd = PROC_PATH_ENDS;
@@ -420,6 +461,80 @@ static int procCheckList(
 }
 
 /*
+** Flatten pProc's declared shapes into the sequence of result sets the body
+** must emit, and fill conf.aEmit/nEmit with it.  Returns non-zero if an error
+** was reported.
+**
+** The parent half of each KEY is checked here rather than at the grammar
+** action that builds the nested column: that action sees only the columns
+** declared BEFORE the nested one, so a shape whose key column is declared
+** after its nested table would be rejected wrongly.  By this point the shape
+** is complete.
+*/
+static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
+  sqlite3 *db = pParse->db;
+  ProcShape *pS;
+  int n = 0, i, j;
+
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    n++;
+    for(i=0; i<pS->pCols->nParam; i++){
+      if( pS->pCols->a[i].pNested ) n++;
+    }
+  }
+  pConf->nEmit = n;
+  if( n==0 ) return 0;
+  pConf->aEmit = sqlite3DbMallocZero(db, n*sizeof(ProcEmit));
+  if( pConf->aEmit==0 ) return 1;
+
+  n = 0;
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    ProcParamList *pCols = pS->pCols;
+    int iParent, nScalar = 0, nNested = 0;
+    if( pCols==0 ) continue;
+    iParent = n++;
+    for(i=0; i<pCols->nParam; i++){
+      if( pCols->a[i].pNested ) nNested++; else nScalar++;
+    }
+    pConf->aEmit[iParent].nCol = nScalar;
+    pConf->aEmit[iParent].nNested = nNested;
+    /* Diagnosed before the key check below, which would otherwise report the
+    ** parent column as missing and send the author looking for the wrong
+    ** mistake. */
+    if( nScalar==0 ){
+      sqlite3ErrorMsg(pParse,
+        "result set of procedure %s declares only nested tables; a result "
+        "set must have at least one column of its own to correlate on",
+        pProc->zName);
+      return 1;
+    }
+    for(i=0; i<pCols->nParam; i++){
+      ProcParam *pCol = &pCols->a[i];
+      if( pCol->pNested==0 ) continue;
+      /* The parent side of the correlation must name a scalar column of this
+      ** same shape -- it is the value the child rows are matched against, and
+      ** a name that resolves to nothing would only surface at CALL. */
+      for(j=0; j<pCols->nParam; j++){
+        if( pCols->a[j].pNested==0
+         && sqlite3StrICmp(pCols->a[j].zName, pCol->zKeyParent)==0 ) break;
+      }
+      if( j>=pCols->nParam ){
+        sqlite3ErrorMsg(pParse,
+          "nested table %s of procedure %s correlates on %s, which is not a "
+          "column of the result set that contains it",
+          pCol->zName, pProc->zName, pCol->zKeyParent);
+        return 1;
+      }
+      pConf->aEmit[n].nCol = pCol->pNested->nParam;
+      pConf->aEmit[n].zNested = pCol->zName;
+      n++;
+    }
+  }
+  return 0;
+}
+
+/*
 ** Check a procedure body against its declared result shapes, reporting
 ** errors through pParse.  Procedures with no RETURNS clause are not
 ** checked (legacy dynamic behavior).
@@ -427,8 +542,7 @@ static int procCheckList(
 static void procCheckConformance(Parse *pParse, Proc *pProc){
   sqlite3 *db = pParse->db;
   ProcConf conf;
-  ProcShape *pS;
-  int i, iEnd, eEnd;
+  int iEnd, eEnd;
 
   if( pProc->eRet==PROC_RET_UNDECLARED ) return;
   memset(&conf, 0, sizeof(conf));
@@ -436,21 +550,17 @@ static void procCheckConformance(Parse *pParse, Proc *pProc){
   conf.pProc = pProc;
   conf.zName = pProc->zName;
   conf.zWhere = "";
-  for(pS=pProc->pShapes; pS; pS=pS->pNext) conf.nShape++;
-  if( conf.nShape>0 ){
-    conf.apShape = sqlite3DbMallocRaw(db, conf.nShape*sizeof(ProcShape*));
-    if( conf.apShape==0 ) return;
-    for(i=0, pS=pProc->pShapes; pS; pS=pS->pNext, i++){
-      conf.apShape[i] = pS;
-    }
+  if( procBuildEmits(pParse, pProc, &conf) ){
+    sqlite3DbFree(db, conf.aEmit);
+    return;
   }
   iEnd = procCheckList(&conf, pProc->pBody, 0, &eEnd, 0);
-  if( conf.nErr==0 && eEnd==PROC_PATH_FALLS && iEnd!=conf.nShape ){
+  if( conf.nErr==0 && eEnd==PROC_PATH_FALLS && iEnd!=conf.nEmit ){
     sqlite3ErrorMsg(pParse,
       "procedure %s streams %d result set%s but declares %d",
-      pProc->zName, iEnd, iEnd==1 ? "" : "s", conf.nShape);
+      pProc->zName, iEnd, iEnd==1 ? "" : "s", conf.nEmit);
   }
-  sqlite3DbFree(db, conf.apShape);
+  sqlite3DbFree(db, conf.aEmit);
 }
 
 /*

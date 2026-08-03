@@ -28,13 +28,21 @@ CREATE PROCEDURE post_with_comments(pid INTEGER)
   RETURNS TABLE(
     id INTEGER,
     title TEXT,
-    comments TABLE(cid INTEGER, body TEXT) KEY(post_id = id)
+    comments TABLE(post_id INTEGER, cid INTEGER, body TEXT) KEY(post_id = id)
   )
 BEGIN
   SELECT id, title FROM posts WHERE id = pid;
   SELECT post_id, cid, body FROM comments WHERE post_id = pid;
 END;
 ```
+
+*Corrected 2026-08-03, during phase 2.* The draft above declared the child as
+`(cid, body)` while its `SELECT` emitted three columns. **The correlation
+column is part of the child's declared shape**, because it is a column the
+child result set actually carries on the wire and the declaration may not hide
+what the wire carries. Both halves of `KEY` are now checked at CREATE: the
+child half against the nested column list (phase 1), the parent half against
+the scalar columns of the shape that contains it (phase 2).
 
 ## The invariant, restated as a test
 
@@ -59,7 +67,7 @@ Build recipe, PATH requirements and the stale-binary trap: see
 
 ---
 
-## Phase 1 — grammar and storage
+## Phase 1 — grammar and storage — **DONE** (`nested-shapes`)
 
 **Deliverable.** Parse `name TABLE(cols) KEY(child = parent)` inside
 `RETURNS TABLE(...)`. Store the nested shape and the correlation pair on the
@@ -82,7 +90,34 @@ non-existent column; it must be an error at CREATE, not at CALL.
 
 ---
 
-## Phase 2 — conformance
+## Phase 2 — conformance — **DONE** (`nested-shapes`)
+
+**How it landed.** The declared shapes are flattened, once, into the sequence
+of result sets the body must emit: a shape with *k* nested tables expands to
+the parent followed by *k* children, in declaration order. The control-flow
+walk then reasons about a single integer cursor exactly as it did before
+nesting existed — `IF` branch symmetry, loops and `RETURN` needed no change —
+and a procedure that nests nothing produces the same array the checker used
+before, so its diagnostics are unchanged to the byte. `test/proc6.test`
+section 5 pins that.
+
+Two rules the plan had not anticipated, both found by writing the flattening:
+
+- **The parent half of `KEY` must name a scalar column of its own shape.**
+  This cannot be checked in the grammar action, which sees only the columns
+  declared *before* the nested one; by conformance time the shape is complete,
+  so `RETURNS TABLE(comments TABLE(...) KEY(post_id = id), id INTEGER)` is
+  accepted (proc6-3.2).
+- **A shape may not consist only of nested tables** — it would have no column
+  to correlate on. Reported before the key check, which would otherwise blame
+  the missing parent column and send the author after the wrong mistake.
+
+**Not yet true, and why this stays on a branch:** `CALL` of a nested procedure
+streams the parent and child sets raw. It does not satisfy the invariant until
+phase 5 adds the flat-client column, so `proc6.test` deliberately contains no
+`CALL` of a nested procedure.
+
+### As originally planned
 
 **Deliverable.** The body must emit the parent `SELECT` then the child
 `SELECT`, checked at CREATE time against the declaration, on the existing
