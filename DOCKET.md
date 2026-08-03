@@ -399,6 +399,58 @@ Yes, both directions, and **localised to the offending parent** rather than
 merely reporting a total that is wrong. The last line is the control: a check
 that never goes quiet is an alarm, not a check.
 
+### R7 — the correlation column should be index-advised (Sean, 2026-08-03)
+
+Option 1.5 has the engine *impose* the child ordering. If the correlation
+column has no index behind it, that ordering costs a full sort on every CALL —
+and the author never sees it, because they never wrote the `ORDER BY`. Making
+the engine responsible for the ordering makes it responsible for saying when
+the ordering is expensive.
+
+**Do not reimplement index reasoning. The planner already knows.**
+
+```
+no index :  SCAN c
+            USE TEMP B-TREE FOR ORDER BY
+index    :  SCAN c USING INDEX i
+```
+
+Since 1.5 is the thing imposing the ordering, it can observe whether the
+ordering came free — `sqlite3WhereIsOrdered()` reports exactly that, already
+computed, no heuristics about which index might apply, and correct for cases a
+column-lookup would get wrong (expression indexes, partial indexes, a child
+source that is a view or a join rather than a table).
+
+**Precedent for the channel already exists.** `SQLITE_WARNING_AUTOINDEX`
+(`src/where.c:1056`, logged through `sqlite3_log`) is the same class of message:
+non-fatal, advisory, "the planner had to build something you could have
+provided." Follow it rather than inventing a warning mechanism.
+
+**Surface it twice, per R5's division of labour:**
+
+1. **Runtime backstop** — log once at prepare, in the AUTOINDEX style. Catches
+   the case where an index is dropped after deployment.
+2. **Build time, which is where it is actionable** — make the fact
+   introspectable so `procgen` reports it while generating the client. A
+   developer can add an index when they are looking at the schema; they cannot
+   when they are reading a production log.
+
+**Constraints on the advice itself:**
+
+- **Never an error.** A ten-row child table does not need an index, and the
+  author may well know better than the check.
+- **Say why, not just what.** "The declared correlation `comments.post_id`
+  requires an ordering that no index supplies" is actionable; "add an index"
+  is nagging.
+- **Only knowable at prepare, not at CREATE.** The body is conformance-checked
+  at CREATE but not fully planned there. `procgen` already opens the database
+  and reads `proc_info`; preparing each CALL to collect this is a small
+  extension of what it does.
+
+**Honest limit:** performance advice ages badly. This says the ordering costs a
+sort, which is a fact; whether that matters is a judgement the tool cannot
+make. Report the fact, let the developer judge.
+
 ### POC 3 (2026-08-03) — how cardinality should travel. **Answer: per-parent.**
 
 `tool/proc_nestpoc3.c`. The temptation is to choose by cost. The right way is
