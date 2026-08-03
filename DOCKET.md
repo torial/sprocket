@@ -272,6 +272,91 @@ actually lets a client reassemble more cheaply than it can today, and what the
 syntax costs. POC 1 says the feature is worth *a* design; it does not yet say
 which.
 
+### Rulings — Sean, 2026-08-03, after POC 1
+
+**R1. The nested thing is a real column. `column_count` reports 3.**
+This selects candidates B/C over A: **one** result set whose third value holds
+the children, not two sequential sets. Sean's reasoning, and it corrected mine:
+the invariant is *"an unmodified client still works,"* **not** *"column count
+matches the flat form."* A third column carrying JSON satisfies it completely —
+a flat client reads three columns, the third being text, and nothing breaks; an
+aware client reads the same column through a structured accessor and gets full
+fidelity. That is **graceful degradation**, where candidate A's "declared as a
+column but physically a second set" was a small lie in a contract language.
+
+*Background, recorded because it was the genuinely confusing part:* today's two
+declared shapes are not two things side by side. They are one cursor before and
+after `sqlite3_proc_next_resultset()` — a tape with two segments, with the
+statement's own column metadata rewritten between them. Candidate A's
+`comments TABLE(...)` was only a *name for the second segment*.
+
+**R2. Nested-table syntax, not `FOR EACH`.**
+`RETURNS TABLE(id, title, comments TABLE(cid, body))` reads more intuitively
+than declaring a related set separately — and under R1 it is now also literally
+true, since the nested thing really is a column.
+
+**R3. Validation stays lightweight.**
+The engine records **cardinality** — how many child rows belong to each parent —
+and nothing more. That catches the failure that actually happens (children lost
+or duplicated) for one integer per parent. A monotonicity assertion on the
+correlation key in debug builds is the natural companion and is nearly free.
+
+Deliberately **not** done by the engine: enforcing `ORDER BY`, validating that
+the key is a real foreign key, or any referential-integrity check. Those are
+expensive and they belong to the reassembler.
+
+**R4. Notation is punted, deliberately.**
+MetaKit's succinctness is still attractive but the broader consequences are
+unclear, and notation only becomes expensive once it is in a persisted schema.
+Punting therefore means *not shipping syntax yet*, which is where POC 2 leaves
+us anyway.
+
+**R5. Division of labour — the database is a compiled API.**
+Sean's framing: *"the database w/ sprocs / remote calls has a sort of compiled
+api... the reassembler does the quality work, not the DB necessarily."*
+
+- The engine **declares**. It does not enforce ordering, does not reassemble,
+  does not validate keys.
+- **`procgen` emits the reassembler**, so the ordering assumption and the
+  cardinality check live in generated, per-language, schema-versioned code.
+- The engine's whole obligation shrinks to: record the relationship, record the
+  cardinality, keep both introspectable.
+
+This collapses several open questions at once and makes the engine change much
+smaller than it was heading toward. It also moves the reference reassembler
+onto **#2's** side of the line rather than #3's.
+
+**R6. Binary children in the JSON fallback: base64.**
+SQLite ships both `ext/misc/base64.c` and `ext/misc/base85.c` (Brasfield's own
+variant, whose alphabet already excludes the double quote).
+
+| | expansion | JSON | availability |
+|---|---|---|---|
+| base64 | 1.333x | safe | **every stdlib** |
+| base85 | 1.25x, plus `\` escaping ~1.265x | needs `\` escaped | bespoke decoder per language |
+
+base64 wins on the shape of the path rather than the ratio: **the JSON fallback
+is the degraded route for unaware clients** — aware clients get the BLOB
+natively and pay nothing. The encoding therefore only ever matters where
+compatibility matters most and bytes matter least. Trading a stdlib one-liner
+in every language for 5% on the path you hope nobody takes is the wrong side of
+that trade.
+
+### POC 2 — scoped, not yet built
+
+Build the **lazy nested column** and answer three things:
+
+1. What does materialisation actually cost? A JSON fallback means a parent's
+   children must be materialised before that parent row can be handed out —
+   unless the column is lazy and materialises only when a flat client reads it.
+   Measure both.
+2. Does declared correlation buy anything over the convention Tack already
+   uses? Tack knows the FK graph at build time and its S2 ordered-merge already
+   reassembles from two sets. **POC 2 must be allowed to answer "no"** — in
+   which case the outcome is documentation, not grammar.
+3. Confirm the cardinality check (R3) catches lost and duplicated children, by
+   breaking it on purpose.
+
 ### How to decide — Sean's steer, 2026-08-02
 
 Explicitly **do not rush this**, on the Andrew Kelley model: keep searching for
