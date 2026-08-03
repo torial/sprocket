@@ -74,7 +74,12 @@ may CALL an untrusted one, or the reverse; and how it interacts with the
 existing conformance rule that a shape-declaring procedure may only CALL a
 `RETURNS NOTHING` one.
 
-**Priority: the remaining piece before anything listens on a socket.**
+**Priority — corrected.** An earlier draft of this entry said the security
+level was "the remaining piece before anything listens on a socket." That
+overstates it. `SQLITE_CALL` supplies the *restrictive* direction, which is the
+safety-critical one; the security level supplies *elevation*, which is a
+capability rather than a hole. A socket can listen safely without it. It is
+wanted, not blocking.
 
 ## 2. Typed client generation — *cheapest thing with the largest multiplier*
 
@@ -89,6 +94,37 @@ layer," and it compounds with every phase of the transport plan.
 **Done means:** `sqlite3 db.sqlite ".procgen ts"` emits typed callables; a
 round-trip test that generates, compiles, and calls; regeneration is
 deterministic (byte-identical for an unchanged schema).
+
+### ✅ C generator done 2026-08-03 — `tool/procgen.c`
+
+`procgen.exe app.db > app_client.h` emits a self-contained header of `static`
+functions: `_prepare` / typed `_bind` / `_step` / per-set typed accessors
+(`greet_rs1_msg`, `two_rs2_b`) / `_next_resultset` / `_reset` / `_finalize`.
+
+Design notes worth keeping:
+
+- **Accessors, not materialised structs.** Keeps SQLite's zero-copy semantics
+  and raises no question about who owns a string.
+- **Two type maps, not one.** `sqlite3_column_text()` returns
+  `const unsigned char *` but a caller binding a parameter holds a
+  `const char *`. Emitting the accessor type on the bind side made every call
+  site cast — exactly the friction a generated client exists to remove. Caught
+  by reading the emitted signature, not by a test.
+- **Deterministic by construction** — procedures ordered by name (`proc_list`'s
+  natural order is hash order and would churn), columns by
+  `(resultset_index, position)`.
+- Identifiers sanitised, so a column named `order by` cannot emit
+  uncompilable source.
+
+**Verified end to end** (`tool/procgen_test.c`, 17 checks): the generated
+header is *compiled* and *called*, and every result is compared against the
+same CALL issued through plain `sqlite3_prepare()` on the same database. That
+comparison is the positive control — the generated client cannot pass by
+agreeing with itself. Regeneration is byte-identical.
+
+**Still open:** TypeScript, Python and Zebra emitters (the introspection and
+ordering logic is shared; only the emit differs), and wiring it into the shell
+as `.procgen` rather than a standalone tool.
 
 **Effort: small. Differentiation: high.**
 

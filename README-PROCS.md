@@ -76,6 +76,22 @@ CALL pay_down(42, 19.99);
   invalidates on schema change (cookie), function/collation registration,
   DETACH, and close.
 
+## Typed clients from the schema
+
+Because declared shapes are validated at CREATE time and exposed through
+`PRAGMA proc_list` / `PRAGMA proc_info`, a database's whole request/response
+contract is machine-readable **without executing anything**:
+
+```
+procgen.exe app.db > app_client.h     # tool/procgen.c
+```
+
+emits a self-contained header of `static` functions — `_prepare`, a typed
+`_bind`, `_step`, per-result-set typed accessors, `_next_resultset`,
+`_finalize`. Output is deterministic, so a diff means the contract moved.
+`tool/procgen_test.c` compiles and calls the generated header and compares
+every result against the same CALL issued by hand.
+
 ## Semantics worth knowing
 
 - **Name resolution**: inside body statements, columns shadow
