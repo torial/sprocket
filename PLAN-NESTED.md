@@ -224,7 +224,45 @@ that stops this becoming a check that rejects everything.
 
 ---
 
-## Phase 3 — the lowering (body form 1½)
+## Phase ordering: 3 and 5 must swap
+
+*Found 2026-08-03, on starting phase 3.*
+
+Phase 3's stated test is **reassembly of a known fixture** — which requires
+`CALL`. Phase 2's guard refuses `CALL` of a nested procedure, so phase 3 is
+not testable in the order written. The plan assumed `CALL` stayed available;
+the guard, which was the right thing to add, coupled the two phases.
+
+Three ways out, and only one of them is good:
+
+- *Lift the guard for phase 3.* Reinstates the fabricated column. No.
+- *Report only the value columns until phase 5.* `CALL` works, segments stream,
+  and it is exactly the unfolded view `procgen` wants — but a stock CLI then
+  sees a two-column result and no indication the nested table exists. A
+  narrower lie than the fabricated value, still a lie.
+- **Do phase 5 first, then phase 3.** Phase 5 makes `CALL` correct and the
+  guard liftable: three columns, the third readable as JSON, invariant
+  satisfied against the unpatched shell.
+
+The swap is not merely tolerable, it is *better*, because of what it does to
+phase 3's control. Phase 3's stated way-to-fail is:
+
+> Disable the imposed ordering and the reassembly test must go red with the
+> POC 2 signature — far fewer pairs than expected, **without** an error.
+
+Run in this order, that control costs nothing and is not a simulation: the
+state *before* phase 3 **is** the disabled-ordering state. So phase 5 writes
+the reassembly test pinned to the **wrong** answer, with POC 2's signature
+recorded in the expectation, and phase 3 flips it to the right one. The suite
+stays green throughout, and the ordering's value is demonstrated by a test that
+was observed failing for the real reason rather than by one that has only ever
+been green.
+
+The risk this accepts: phase 5 briefly lands a fold that mis-groups children.
+It is on a branch, phase 3 immediately follows, and the mis-grouping is pinned
+by a test rather than unknown.
+
+## Phase 3 — the lowering (body form 1½) *(runs after phase 5 — see above)*
 
 **Deliverable.** The engine adds the `ORDER BY` to the child query itself,
 derived from the declared `KEY`. **The author never writes it.**
