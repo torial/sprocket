@@ -59,7 +59,113 @@ deterministic (byte-identical for an unchanged schema).
 
 **Effort: small. Differentiation: high.**
 
-## 3. Incremental view maintenance — *the big one, and the one I most want*
+## 3. Nested result shapes — *MetaKit's idea, and an open design question*
+
+**Status: not decided. This entry exists to be prototyped, not implemented.**
+
+### The problem it solves
+
+`Tack`'s stitch layer (`ZEBRA_ORM_ARCHITECTURE.md` §6) carries **four separate
+strategies** — join-flatten, ordered merge-join, JSON fold, multi-set proc —
+and every one of them exists for a single reason: **SQL cannot return a tree.**
+They are all machinery for flattening parent-with-children into rectangles and
+reassembling it on the client.
+
+MetaKit (Jean-Claude Wippler, Equi4, c. 1996–2005) simply returned the tree. A
+cell could contain an entire subtable, declared in a notation of admirable
+succinctness:
+
+```
+posts[id:I,title:S,comments[cid:I,body:S]]
+```
+
+Columnar storage was its famous idea and DuckDB has long since done that
+better. **Nested views are the idea nobody picked up**, and they are the one
+that would pay here.
+
+### The invariant — non-negotiable
+
+> **A `CALL` must continue to look exactly like a `SELECT` to any client that
+> has not opted in.** `sqlite3_column_count/_name/_decltype` keep working;
+> `sqlite3_step()` keeps yielding flat rows. Nothing that compiles today may
+> behave differently tomorrow.
+
+This property is why declared shapes were worth building at all — it is what
+makes every existing driver, GUI, and language binding work against procedures
+for free. **No design that trades it away should be adopted, however elegant.**
+
+### Candidate designs, to be prototyped rather than argued about
+
+**A. Nesting as declared metadata over flat result sets — *current favourite*.**
+`RETURNS TABLE(id, title, comments TABLE(cid, body))` compiles to exactly the
+multi-set form we already have: set 1 parents, set 2 children carrying the
+parent key. The rows on the wire and through the C API are **unchanged**. What
+is new is only that `PRAGMA proc_info` records the parent/child relationship
+and the correlation key.
+
+Why this looks strongest: it adds nothing to the data model, so the invariant
+is preserved *by construction* rather than by a compatibility shim. And it
+converts Tack §6's S4 proc-author contract — "emit sets in declared order, each
+ordered by the correlation key," currently a documented convention with a debug
+assertion — into something the engine **declares and can enforce**. The
+hardest part of the stitch layer stops being convention.
+
+**B. A nested value, via subtype-tagged JSONB.** SQLite already has
+`sqlite3_result_subtype` / `sqlite3_value_subtype`, which the JSON functions
+use. A nested column could be JSONB carrying a subtype tag: legacy clients see
+a blob or text, aware clients decode structure. Uses existing machinery, adds
+no type. Weaker fidelity than A, but it is the only candidate that gives a
+genuine single-value nesting.
+
+**C. A true nested value type.** MetaKit-faithful: a `sqlite3_value` that *is*
+a result set. Highest fidelity, and it breaks the invariant outright —
+`sqlite3_column_type()` has nothing to return. Recorded so the option is
+explicit; almost certainly wrong for SQLite's philosophy.
+
+**D. Opt-in statement mode.** Nested by request (`sqlite3_proc_config(stmt,
+…)`), flat otherwise. Preserves the invariant but doubles the engine's paths,
+which is the cost that keeps compounding.
+
+A and B are complementary rather than rival: A handles parent/child collections,
+B handles a genuinely scalar-shaped nested value. It may be right to build A
+and never need B.
+
+### How to decide — Sean's steer, 2026-08-02
+
+Explicitly **do not rush this**, on the Andrew Kelley model: keep searching for
+the right representation rather than shipping the first workable one, and
+accept slow version numbers as the price. **Build multiple POCs and compare
+them on real shapes** before choosing. Prototypes are cheap here because the
+wire codec, the declared-shape checker and `proc_info` all already exist.
+
+A POC should demonstrate, at minimum:
+
+1. The invariant holds — an unmodified client (the `sqlite3` CLI is the honest
+   test) sees today's behaviour exactly.
+2. A nested shape survives `CREATE PROCEDURE` conformance checking.
+3. `PRAGMA proc_info` expresses the nesting.
+4. The wire protocol carries it, and shape-free mode still works.
+5. Tack could collapse S1–S4 into one decoder against it.
+
+### Succinctness
+
+MetaKit's schema string is worth borrowing as **notation** regardless of which
+design wins. `posts[id:I,title:S,comments[cid:I,body:S]]` nests without
+ceremony, is human-writable and machine-parseable, and is a far better
+candidate than anything we would invent — relevant to nested declarations,
+to `PRAGMA proc_info` output, and to typed client generation (#2).
+
+*(Sean used MetaKit's types to spec data designs in his notebooks twenty-plus
+years ago, which is where this came from.)*
+
+### Caveat recorded
+
+MetaKit is dormant and its headline idea (columnar) is superseded. The goal
+here is **to push SQLite as far as it will go**, not to reimplement MetaKit —
+its other features are likely not part of this journey. Nesting earns its place
+on merit, not lineage.
+
+## 4. Incremental view maintenance — *the big one, and the one I most want*
 
 Materialized views that update as writes land rather than being recomputed.
 
@@ -82,7 +188,7 @@ correctness contract and is beautifully testable.
 **Effort: large. Value: this is the one that would make the fork worth using
 for reasons unrelated to procedures.**
 
-## 4. `wal2` and `BEGIN CONCURRENT` — *two decisions, not one*
+## 5. `wal2` and `BEGIN CONCURRENT` — *two decisions, not one*
 
 **Corrected 2026-08-01 after actually looking.** This entry previously treated
 them as a single choice. They are not, and the difference is large.
@@ -108,7 +214,7 @@ combination current since 2019.** Taking both is therefore not "carry two
 upstream branches" — it is doing integration work upstream stopped doing seven
 years ago. Do not plan on the pair.
 
-### 4a. `wal2` — ✅ **PORTED 2026-08-02** — 0 errors out of 393,363
+### 5a. `wal2` — ✅ **PORTED 2026-08-02** — 0 errors out of 393,363
 
 Ported (not merged) onto the 3.53.4 base; see the commit for why and how. wal2
 suites: 538 tests, 0 errors. Verified this fork still reads rollback-mode and
@@ -171,13 +277,13 @@ are the price — but paid once, and it leaves every future upstream merge cheap
 Related: upstream has shipped **3.53.4** since we forked, so a small catch-up on
 our own release line is available and low-risk regardless of which path we take.
 
-### 4b. `BEGIN CONCURRENT` — decide at transport Phase 5
+### 5b. `BEGIN CONCURRENT` — decide at transport Phase 5
 
 Multiple optimistic writers with page-level conflict detection. Also current
 and mergeable, but it changes what group commit should look like, so it belongs
 to the Phase 5 design conversation rather than to this one.
 
-## 5. System-versioned temporal tables — *SQLite has no story here at all*
+## 6. System-versioned temporal tables — *SQLite has no story here at all*
 
 SQL:2011 `AS OF` / `FOR SYSTEM_TIME`. Every row carries a validity interval;
 updates close the old version and open a new one; queries can ask what the
@@ -191,14 +297,14 @@ naturally with the append-only ledger pattern and with #3.
 retention/pruning policy, and a proof that a point-in-time query equals a
 from-scratch replay to that point.
 
-## 6. Fan-out shard virtual table — *the one sharding piece that belongs in the engine*
+## 7. Fan-out shard virtual table — *the one sharding piece that belongs in the engine*
 
 A vtab presenting N shard files as one logical table with constraint pushdown,
 so cross-shard reporting queries do not have to be written by hand. Everything
 else about sharding is application architecture and explicitly does not belong
 in this fork (`DESIGN-NETWORK.md`); this is the exception.
 
-## 7. `OUT` / `INOUT` parameters — *listed in README-PROCS as planned*
+## 8. `OUT` / `INOUT` parameters — *listed in README-PROCS as planned*
 
 Result sets cover most cases, which is why this was deferred. Worth revisiting
 only if the typed-client work (#2) makes the absence awkward at the boundary.
@@ -208,7 +314,10 @@ only if the typed-client work (#2) makes the absence awkward at the boundary.
 ## Ordering I would actually recommend
 
 **Authorization → typed clients → incremental views**, with the transport plan
-running alongside. Authorization because we opened the hole and it gates
+running alongside, and **nested result shapes (#3) prototyped in parallel
+rather than scheduled** — it is a design question that wants several POCs and
+no deadline, and it makes typed clients substantially more useful whenever it
+lands. Authorization because we opened the hole and it gates
 anything network-facing; typed clients because they are cheap and multiply the
 value of everything else; incremental views because that is the one that
 changes what the fork *is*.
