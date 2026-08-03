@@ -120,6 +120,25 @@ do_execsql_test 2.3 {
   END;
 } {}
 
+# nresultsets counts SEGMENTS, not declared shapes.  pwc declares 1 shape
+# holding 1 nested table = 2; pwc2 declares 1 shape holding 2 = 3; pwc3
+# declares 2 shapes, one of which holds 1 nested table = 3.  Those three
+# disagree with each other under any counting rule but the right one, so a
+# helper stuck on "count shapes" or "count nested tables" cannot pass.
+do_execsql_test 2.4 {
+  SELECT name, nresultsets FROM pragma_proc_list
+   WHERE name IN ('pwc','pwc2','pwc3') ORDER BY name;
+} {pwc 2 pwc2 3 pwc3 3}
+
+# CONTROL: a procedure that nests nothing still reports its shape count, so
+# the redefinition is invisible to everything that existed before nesting.
+do_execsql_test 2.5 {
+  CREATE PROCEDURE twoflat(x INTEGER)
+    RETURNS TABLE(a INTEGER) RETURNS TABLE(b INTEGER)
+  BEGIN SELECT 1; SELECT 2; END;
+  SELECT nresultsets FROM pragma_proc_list WHERE name = 'twoflat';
+} {2}
+
 #--------------------------------------------------------------------
 # 3.x: phase 1 -- the declaration itself
 #

@@ -462,6 +462,28 @@ static int procCheckList(
 }
 
 /*
+** The number of result sets -- SEGMENTS -- a procedure's body must stream.
+**
+** A shape holding k nested tables expands to 1+k segments: the parent, then
+** one per nested table in declaration order.  This is what
+** sqlite3_proc_next_resultset() advances through and what
+** PRAGMA proc_list.nresultsets reports; it equals the number of declared
+** shapes for every procedure that does not nest.
+*/
+int sqlite3ProcSegmentCount(Proc *pProc){
+  ProcShape *pS;
+  int n = 0, i;
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    n++;
+    for(i=0; i<pS->pCols->nParam; i++){
+      if( pS->pCols->a[i].pNested ) n++;
+    }
+  }
+  return n;
+}
+
+/*
 ** True if any declared shape holds a nested table.
 */
 static int procShapesNest(ProcShape *pShapes){
@@ -490,15 +512,9 @@ static int procShapesNest(ProcShape *pShapes){
 static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
   sqlite3 *db = pParse->db;
   ProcShape *pS;
-  int n = 0, i, j;
+  int n, i, j;
 
-  for(pS=pProc->pShapes; pS; pS=pS->pNext){
-    if( pS->pCols==0 ) continue;
-    n++;
-    for(i=0; i<pS->pCols->nParam; i++){
-      if( pS->pCols->a[i].pNested ) n++;
-    }
-  }
+  n = sqlite3ProcSegmentCount(pProc);
   pConf->nEmit = n;
   if( n==0 ) return 0;
   pConf->aEmit = sqlite3DbMallocZero(db, n*sizeof(ProcEmit));

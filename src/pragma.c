@@ -1464,7 +1464,9 @@ void sqlite3Pragma(
   **   PRAGMA [schema.]proc_list
   **
   ** Return one row per stored procedure: name, parameter count, number of
-  ** declared result sets, and whether the procedure declares its shapes.
+  ** result sets, and whether the procedure declares its shapes.  The count
+  ** is of SEGMENTS -- what sqlite3_proc_next_resultset() advances through --
+  ** which exceeds the number of declared shapes when a shape nests.
   ** Procedures of every attached schema are listed (schema-qualified form
   ** restricts to one).
   */
@@ -1480,15 +1482,13 @@ void sqlite3Pragma(
       if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
       for(k=sqliteHashFirst(&pSchema->procHash); k; k=sqliteHashNext(k)){
         Proc *pProc = (Proc*)sqliteHashData(k);
-        int nShape = 0;
-        ProcShape *pS;
-        for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
+        int nSeg = sqlite3ProcSegmentCount(pProc);
         /* `security` is spelled out rather than reported as a bit: a client
         ** generator has to reproduce the clause, and a human reading the
         ** pragma should not have to remember which way round 0 and 1 go. */
         sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
-            pProc->eRet==PROC_RET_TABLES ? nShape : 0,
+            pProc->eRet==PROC_RET_TABLES ? nSeg : 0,
             pProc->eRet!=PROC_RET_UNDECLARED,
             pProc->bDefiner ? "DEFINER" : "INVOKER");
       }
@@ -1499,15 +1499,13 @@ void sqlite3Pragma(
       for(k=sqliteHashFirst(&db->aDb[1].pSchema->procHash); k;
           k=sqliteHashNext(k)){
         Proc *pProc = (Proc*)sqliteHashData(k);
-        int nShape = 0;
-        ProcShape *pS;
-        for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
+        int nSeg = sqlite3ProcSegmentCount(pProc);
         /* `security` is spelled out rather than reported as a bit: a client
         ** generator has to reproduce the clause, and a human reading the
         ** pragma should not have to remember which way round 0 and 1 go. */
         sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
-            pProc->eRet==PROC_RET_TABLES ? nShape : 0,
+            pProc->eRet==PROC_RET_TABLES ? nSeg : 0,
             pProc->eRet!=PROC_RET_UNDECLARED,
             pProc->bDefiner ? "DEFINER" : "INVOKER");
       }

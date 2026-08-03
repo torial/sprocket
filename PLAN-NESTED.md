@@ -194,8 +194,20 @@ not impose the ordering it validates — closer to POC 3's warning about a check
 drawn from the same source as the data. Phase 4 must carry the count from where
 the ordering was imposed rather than recomputing it at the boundary.
 
-**Meanwhile:** `nresultsets` keeps meaning *declared shapes*. Do not read it as
-a segment count.
+**Resolved:** `nresultsets` now counts **segments**, so it agrees with
+`sqlite3_proc_next_resultset()` and is exactly the number of sets a client will
+step through. Shapes and segments are equal for every procedure that does not
+nest, so no existing value changed — which is why this was worth doing now
+rather than after the feature ships.
+
+**Left open, and it belongs to phase 7.** `PRAGMA proc_info`'s
+`resultset_index` still enumerates *declared shapes*, and a nested table's own
+columns are not listed anywhere. `procgen` cannot generate a typed child
+accessor without them. Adding them raises a question worth deciding rather than
+defaulting: whether the child's columns become their own `resultset_index`
+(making `proc_info` count segments too, at the cost of an implicit
+declaration-order link back to the parent column) or gain an explicit
+parent-column field (a wider result, which the existing `proc4` cases pin).
 
 ### As originally planned
 

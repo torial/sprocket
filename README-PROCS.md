@@ -126,7 +126,7 @@ control-flow graph -- there is **no cost at CALL time**:
 Introspection (both read the in-memory catalog; no storage change):
 
 ```
-PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets, declared
+PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments), declared
 PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
 ```
@@ -195,17 +195,22 @@ the declaration does not hide what the wire carries.
 
 ### Segments and declared shapes are different counts
 
-Once a shape nests, two more numbers diverge, and both are currently spelled
-"result set" somewhere:
+Once a shape nests, the declaration and the wire diverge:
 
-| Count | Here | Reported by |
+| Count | Here | Where |
 |---|---|---|
-| declared shapes | 1 | `PRAGMA proc_list.nresultsets` |
-| segments | 2 | what `sqlite3_proc_next_resultset()` advances through |
+| declared shapes | 1 | one `RETURNS TABLE` clause |
+| **segments** | **2** | `PRAGMA proc_list.nresultsets`; what `sqlite3_proc_next_resultset()` advances through |
 
-For every procedure that does not nest these are equal, which is why one word
-served until now. **Do not read `nresultsets` as the number of times to call
-`next_resultset()`** when a shape nests.
+`nresultsets` counts **segments** — so it is exactly the number of sets a
+client will step through, and it agrees with the API that shares its name.
+For every procedure that does not nest, shapes and segments are equal and the
+value is unchanged from previous releases.
+
+Note the one place this vocabulary is still split: `PRAGMA proc_info`'s
+`resultset_index` enumerates **declared shapes**, not segments, and it does not
+yet list a nested table's own columns at all. Closing that is phase 7 work —
+`procgen` needs those columns to generate a typed child accessor.
 
 One property is intentionally **not** enforced:
 
