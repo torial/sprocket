@@ -324,6 +324,18 @@ do_execsql_test 6.2 {
 # next to the decision it supports.  If this ever goes red, that decision has
 # to be revisited, not the test adjusted.
 #
+# THIS SECTION MUST STAY AFTER 2.1, which does "db close; sqlite3 db test.db".
+# Moving it earlier silently discards the tally registration below, and 7.0
+# then goes red for a reason that has nothing to do with what it measures.
+#
+# Confirmed separately, with the CALL guard temporarily bypassed in a scratch
+# build, that a ONE-shape procedure holding a nested table behaves identically
+# to the two-shape "seg" below -- 1 row delivered, 0 children scanned.  The set
+# boundary comes from the body's structure (each top-level SELECT ends a set),
+# not from the number of declared shapes, so this result governs the nested
+# case and not merely a similar one.  That check cannot live here while CALL is
+# refused; phase 5 must re-pin it.
+#
 proc tally_cb {v} { incr ::nscan ; return $v }
 db function tally tally_cb
 

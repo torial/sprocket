@@ -163,6 +163,24 @@ invoked. A flat client also already stops at set 1 on its own, since
 `sqlite3_step()` returns `SQLITE_DONE` at set end, so half the invariant works
 today with no new code.
 
+**And it was confirmed for the case it governs, not merely a similar one.**
+Section 7 declares *two shapes*, so its set boundary could have been an
+artifact of the declaration rather than of the body — while `pwc` declares
+*one* shape whose child segment the declaration never mentions. If the step
+loop ran past that boundary, a flat client would scan the children whether or
+not it read column 3, and this rationale would not apply to nesting at all.
+Measured with `procShapesNest` temporarily bypassed in a scratch build:
+
+| | rows delivered | children scanned |
+|---|---|---|
+| `seg` — two declared shapes | 1 | 0 |
+| `pwc` — one shape, nested table | 1 | 0 |
+
+Identical. The set boundary is produced by the **body's** structure — each
+top-level `SELECT` ends a set — not by the number of declared shapes, so
+laziness carries over unchanged. This cannot be a permanent test while `CALL`
+is refused; **phase 5 must re-pin it** as one the moment the guard is lifted.
+
 **The cost this accepts, explicitly.** Metadata will say 3 while the result row
 holds 2 — the same configuration that produced the fabricated value, now
 deliberate and handled. Every reader (`sqlite3_column_*`, `sqlite3_data_count`,
