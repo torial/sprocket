@@ -461,6 +461,21 @@ static int procCheckList(
 }
 
 /*
+** True if any declared shape holds a nested table.
+*/
+static int procShapesNest(ProcShape *pShapes){
+  ProcShape *pS;
+  int i;
+  for(pS=pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    for(i=0; i<pS->pCols->nParam; i++){
+      if( pS->pCols->a[i].pNested ) return 1;
+    }
+  }
+  return 0;
+}
+
+/*
 ** Flatten pProc's declared shapes into the sequence of result sets the body
 ** must emit, and fill conf.aEmit/nEmit with it.  Returns non-zero if an error
 ** was reported.
@@ -1766,6 +1781,23 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
     goto call_cleanup;
   }
 #endif
+
+  /* Nested result shapes are declarable and conformance-checked (PLAN-NESTED
+  ** phases 1-2) but not yet streamable, so CALL is refused rather than served
+  ** wrong.  Measured before this guard existed: sqlite3_column_count reported
+  ** the 3 DECLARED columns while the parent SELECT wrote 2 result registers,
+  ** so the third column read a register the body never assigned and handed the
+  ** client a fabricated value.  Reporting the scalar count instead would be
+  ** quieter and no more honest -- it would drop the nested table with no
+  ** indication it was declared.  Phase 5 removes this by materialising the
+  ** nested column; until then the feature is absent at CALL rather than
+  ** half-present.  See test/proc6.test section 6. */
+  if( pProc->eRet==PROC_RET_TABLES && procShapesNest(pProc->pShapes) ){
+    sqlite3ErrorMsg(pParse,
+      "procedure %s declares a nested result table, which cannot yet be "
+      "streamed by CALL", pProc->zName);
+    goto call_cleanup;
+  }
 
   v = sqlite3GetVdbe(pParse);
   if( v==0 ) goto call_cleanup;

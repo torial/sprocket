@@ -112,10 +112,35 @@ Two rules the plan had not anticipated, both found by writing the flattening:
   to correlate on. Reported before the key check, which would otherwise blame
   the missing parent column and send the author after the wrong mistake.
 
-**Not yet true, and why this stays on a branch:** `CALL` of a nested procedure
-streams the parent and child sets raw. It does not satisfy the invariant until
-phase 5 adds the flat-client column, so `proc6.test` deliberately contains no
-`CALL` of a nested procedure.
+**`CALL` is refused, and this was measured rather than assumed.** Phase 1's
+arity check had been the only thing making a nested `CALL` unreachable; phase 2
+removed it. With the guard absent, `CALL pwc(1)` returned `1 first 0.0` —
+`sqlite3_column_count` reported the **3 declared** columns while the parent
+`SELECT` wrote **2** result registers, so the third column read a register the
+body never assigned and handed the client a fabricated value.
+
+Reporting the scalar count instead would be quieter and no more honest: it
+drops the nested table with no indication it was declared, which is a
+shape-declaring feature lying about the shape. So `CALL` of a nested procedure
+errors at prepare until phase 5 can materialise the column. Introspection
+(`PRAGMA proc_info`) still works, which is what lets `procgen` run ahead of the
+runtime. `proc6` section 6 pins both the refusal and — as its control — that a
+procedure declaring a shape and nesting nothing still calls.
+
+### Open contract question, for phase 5
+
+`PRAGMA proc_list.nresultsets` reports **declared shapes** (1 for `pwc`), while
+the body emits **2** result sets and `sqlite3_proc_next_resultset()` advances
+per emission. These are different quantities and only one of them has a name.
+
+Which one a client wants depends on which client: the invariant requires the
+flat client to see *one* result set with three columns, so the child segment
+must be folded away before it is visible — but `procgen`'s typed reassembler
+wants the segments *unfolded*, precisely to avoid paying for the JSON. Phase 5
+has to decide whether the fold happens in the engine (and the typed client asks
+for it to be suppressed) or at the boundary API (and the flat client never sees
+the extra segment). **Do not read `nresultsets` as a segment count in the
+meantime.**
 
 ### As originally planned
 

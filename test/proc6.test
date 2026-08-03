@@ -74,11 +74,21 @@ do_execsql_test 2.0 {
 } {}
 
 # It survives a reopen: the declaration round-trips through sqlite_schema.
+# Asserting the name alone would be satisfied by a re-parse that silently
+# dropped the nesting, so this pins the nested column's position in the shape
+# AND the CALL refusal, which is true only while pNested is actually present.
 do_test 2.1 {
   db close
   sqlite3 db test.db
-  execsql {SELECT name, nresultsets FROM pragma_proc_list WHERE name = 'pwc'}
-} {pwc 1}
+  execsql {
+    SELECT resultset_index, position, name FROM pragma_proc_info('pwc')
+     WHERE resultset_index = 1
+  }
+} {1 0 id 1 1 title 1 2 comments}
+
+do_catchsql_test 2.1b {
+  CALL pwc(1)
+} {1 {procedure pwc declares a nested result table, which cannot yet be streamed by CALL}}
 
 # Two nested tables in one shape: three SELECTs, parent first.
 do_execsql_test 2.2 {
@@ -273,5 +283,35 @@ do_execsql_test 5.1 {
   CALL f2(0);
   SELECT title FROM posts WHERE id = 99;
 } {n}
+
+#--------------------------------------------------------------------
+# 6.x: CALL is refused until the nested column can be streamed
+#
+# Measured before the guard existed: sqlite3_column_count reported the 3
+# DECLARED columns while the parent SELECT wrote 2 result registers, so
+# "CALL pwc(1)" returned "1 first 0.0" -- a third value read from a register
+# the body never assigned.  Reporting the scalar count instead would drop the
+# nested table with no indication it was declared, which is quieter and no
+# more honest.  Phase 5 lifts this.
+#
+do_catchsql_test 6.0 {
+  CALL pwc(1)
+} {1 {procedure pwc declares a nested result table, which cannot yet be streamed by CALL}}
+
+# The refusal is about nesting, not about declared shapes: a procedure that
+# declares a shape and nests nothing still calls.  Without this the guard
+# could be refusing everything.
+do_execsql_test 6.1 {
+  CREATE PROCEDURE flat(pid INTEGER) RETURNS TABLE(id INTEGER, title TEXT)
+  BEGIN SELECT id, title FROM posts WHERE id = pid; END;
+  CALL flat(1);
+} {1 first}
+
+# Introspection is unaffected -- a nested declaration remains readable even
+# though it cannot be executed, which is what lets procgen work ahead of the
+# runtime.
+do_execsql_test 6.2 {
+  SELECT resultset_index, position, name, decltype FROM pragma_proc_info('pwc');
+} {0 0 pid INTEGER 1 0 id INTEGER 1 1 title TEXT 1 2 comments {}}
 
 finish_test
