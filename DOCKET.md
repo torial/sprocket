@@ -399,6 +399,62 @@ Yes, both directions, and **localised to the offending parent** rather than
 merely reporting a total that is wrong. The last line is the control: a check
 that never goes quiet is an alarm, not a check.
 
+### POC 3 (2026-08-03) — how cardinality should travel. **Answer: per-parent.**
+
+`tool/proc_nestpoc3.c`. The temptation is to choose by cost. The right way is
+to choose by **what each option can see**, so this is a detection matrix: five
+ways the child stream goes wrong, three ways of carrying cardinality.
+
+| failure mode | total | per-parent | constant |
+|---|---|---|---|
+| *(control: correct data)* | quiet | quiet | quiet |
+| ordering broken | CAUGHT | CAUGHT | CAUGHT |
+| children lost | CAUGHT | CAUGHT | CAUGHT |
+| children duplicated | CAUGHT | CAUGHT | CAUGHT |
+| misattributed, one child moved | **missed** | CAUGHT | CAUGHT |
+| misattributed, balanced swap | missed | **missed** | missed |
+| *(legitimate variable counts)* | quiet | quiet | **FALSE ALARM** |
+
+Cost through the real codec: total **9 bytes**, per-parent **450 bytes** for 50
+parents (~9 per parent), constant **0**.
+
+**CONSTANT is disqualified**, and not on cost. It false-alarms on legitimate
+variable cardinality — which is the normal case for real data, since posts do
+not all have the same number of comments. Its apparent 4-of-5 detection rate is
+an artefact of alarming at nearly everything.
+
+**PER-PARENT is the choice.** It catches exactly one thing a total does not:
+*unbalanced misattribution*, the realistic shape of an off-by-one in a
+correlation key. That costs ~9 bytes per parent row — about 3% of a response
+that is already ~15 KB at this size — which is cheap for a real bug class.
+
+**The limit, recorded so nobody assumes cardinality means correctness:**
+a *balanced* swap (two equal-sized parents exchanged) is invisible to **every**
+count-based check at any granularity and any cost. Counting is simply the wrong
+instrument for content. Catching that needs a checksum over the correlation
+keys, which is a different feature and not proposed.
+
+### The subtlety that matters more than the choice
+
+A cardinality check only detects if the count is computed **independently of
+the child stream it is checking**. If the engine derives per-parent counts by
+running the same child query, a mislabeled correlation key produces consistent
+— and consistently wrong — counts, and the check passes while the data is
+wrong. That is the positive-control problem in another costume: a check drawn
+from the same source as the data cannot validate it.
+
+So the honest scope of this feature is narrower than "cardinality catches
+errors":
+
+> **Cardinality checks transport integrity, not query correctness.**
+> Truncation, framing bugs, a dropped frame, a reassembler that loses a run —
+> all caught, because the declared count is genuinely independent of what
+> arrives. A logic error *inside the procedure body* is not caught, because
+> the count and the rows come from the same place.
+
+That is still worth having: POC 2 showed the transport-shaped failure loses 98%
+of rows silently. But it should be documented as integrity, not validation.
+
 ### Where POC 2 leaves the design
 
 1. The feature earns its place on **type fidelity** (POC 1) and on **detection**
