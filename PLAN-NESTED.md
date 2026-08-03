@@ -127,20 +127,57 @@ errors at prepare until phase 5 can materialise the column. Introspection
 runtime. `proc6` section 6 pins both the refusal and — as its control — that a
 procedure declaring a shape and nesting nothing still calls.
 
-### Open contract question, for phase 5
+### Where the fold happens — **decided: at the boundary API**
 
-`PRAGMA proc_list.nresultsets` reports **declared shapes** (1 for `pwc`), while
+`PRAGMA proc_list.nresultsets` reports **declared shapes** (1 for `pwc`) while
 the body emits **2** result sets and `sqlite3_proc_next_resultset()` advances
-per emission. These are different quantities and only one of them has a name.
+per emission. Two different quantities, one name — and the invariant wants the
+flat client to see one set of three columns while `procgen` wants the segments
+*unfolded*, to avoid paying for JSON it will throw away.
 
-Which one a client wants depends on which client: the invariant requires the
-flat client to see *one* result set with three columns, so the child segment
-must be folded away before it is visible — but `procgen`'s typed reassembler
-wants the segments *unfolded*, precisely to avoid paying for the JSON. Phase 5
-has to decide whether the fold happens in the engine (and the typed client asks
-for it to be suppressed) or at the boundary API (and the flat client never sees
-the extra segment). **Do not read `nresultsets` as a segment count in the
-meantime.**
+So the nested column is synthesized by the **statement API** for clients that
+never call `next_resultset()`. The VDBE keeps streaming both segments.
+
+**Decided on a measurement, not on taste.** The argument for folding inside the
+VDBE is that column count 3 would then be structural, with no synthesized
+column and no metadata/register mismatch — the mismatch that produced the
+`0.0`. The argument against it is that folding is *inherently eager*: a parent
+row cannot be delivered until every one of its children has been buffered, so
+phase 5's laziness test would be false by construction and would have to be
+weakened to match the design. That is the wrong direction — it trades the
+sharpest instrument in this plan for a tidier implementation.
+
+That argument only holds if the existing two-segment path really is lazy, so it
+was measured rather than reasoned about (`proc6` section 7):
+
+| | |
+|---|---|
+| step set 1 only, then finalize | **0** child rows scanned |
+| advance to set 2 and drain *(control)* | 2 |
+| advance to set 2, **one** step | **1** |
+
+Lazy per **row**, not merely per segment. The control uses the same statement
+text and the same UDF as the measurement, so the only variable is whether
+`next_resultset()` was called — the zero cannot be a function the body never
+invoked. A flat client also already stops at set 1 on its own, since
+`sqlite3_step()` returns `SQLITE_DONE` at set end, so half the invariant works
+today with no new code.
+
+**The cost this accepts, explicitly.** Metadata will say 3 while the result row
+holds 2 — the same configuration that produced the fabricated value, now
+deliberate and handled. Every reader (`sqlite3_column_*`, `sqlite3_data_count`,
+the shell's printer, blob lifetimes) must agree about the synthesized index, so
+phase 5 routes it through a *single* accessor rather than special-casing each
+entry point. And reading the column means stepping the child segment mid-row,
+then restoring set-1 metadata so a later `next_resultset()` still behaves.
+
+**Consequence for phase 4.** The cardinality check now sits at a layer that did
+not impose the ordering it validates — closer to POC 3's warning about a check
+drawn from the same source as the data. Phase 4 must carry the count from where
+the ordering was imposed rather than recomputing it at the boundary.
+
+**Meanwhile:** `nresultsets` keeps meaning *declared shapes*. Do not read it as
+a segment count.
 
 ### As originally planned
 

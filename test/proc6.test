@@ -314,4 +314,72 @@ do_execsql_test 6.2 {
   SELECT resultset_index, position, name, decltype FROM pragma_proc_info('pwc');
 } {0 0 pid INTEGER 1 0 id INTEGER 1 1 title TEXT 1 2 comments {}}
 
+#--------------------------------------------------------------------
+# 7.x: the step model is lazy per ROW, which is what phase 5's fold rests on
+#
+# No nesting here on purpose -- this measures the two-segment behaviour a
+# nested procedure will lower onto.  It lives in this file because it is the
+# evidence for a design decision recorded in PLAN-NESTED.md (fold the nested
+# column at the boundary API rather than in the VDBE), and evidence belongs
+# next to the decision it supports.  If this ever goes red, that decision has
+# to be revisited, not the test adjusted.
+#
+proc tally_cb {v} { incr ::nscan ; return $v }
+db function tally tally_cb
+
+# LIVENESS.  Expected magnitude stated first: 3 comment rows exist, so a
+# working counter reads 3.  If this is not 3, every zero below is meaningless.
+do_test 7.0 {
+  set ::nscan 0
+  execsql {SELECT tally(body) FROM comments}
+  set ::nscan
+} {3}
+
+do_execsql_test 7.1 {
+  CREATE PROCEDURE seg(pid INTEGER)
+    RETURNS TABLE(id INTEGER, title TEXT)
+    RETURNS TABLE(post_id INTEGER, cid INTEGER, body TEXT)
+  BEGIN
+    SELECT id, title FROM posts WHERE id = pid;
+    SELECT post_id, cid, tally(body) FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+# Step set 1 to exhaustion, never advance to set 2, finalize.  The child query
+# must not have run.  Post 1 has 2 comments, so a non-lazy path reads 2.
+do_test 7.2 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL seg(1)} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {0}
+
+# CONTROL: the same statement text and the same UDF, advanced into set 2.
+# The only variable between this and 7.2 is next_resultset, so the zero above
+# cannot be a UDF the body never calls.
+do_test 7.3 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL seg(1)} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {2}
+
+# One step into set 2 scans exactly one row.  This separates "lazy per
+# segment" from "lazy per row"; only the latter lets a boundary fold decline
+# work the client did not ask for.
+do_test 7.4 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL seg(1)} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  sqlite3_step $S
+  set n $::nscan
+  sqlite3_finalize $S
+  set n
+} {1}
+
 finish_test
