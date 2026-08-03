@@ -224,7 +224,48 @@ that stops this becoming a check that rejects everything.
 
 ---
 
-## Phase ordering: 3 and 5 must swap
+## Blocker found on starting phase 5: segments cannot interleave
+
+*Found 2026-08-03, before writing any phase 5 code.*
+
+The boundary fold assumed the statement API could materialise column 3 for a
+parent row by draining that parent's children on demand. **It cannot**, and the
+reason is structural rather than subtle: the body is two statements, so the
+child `SELECT`'s opcodes do not begin until the parent `SELECT`'s loop has
+ended. The two streams are sequential in time, never live together. To serve
+column 3 of parent row 1 the API would have to advance past every remaining
+parent row — and there is no rewind.
+
+This does not sink the decision to fold at the boundary, but it does mean the
+fold needs a buffer somewhere, and where that buffer sits is a real choice:
+
+1. **Buffer the parent segment, stream the children.** Parents are the small
+   side (posts, not comments). With the ordering imposed, children arrive
+   grouped, so at most one parent's children are held at a time. Memory is
+   parents + one group. Laziness survives: untouched column 3 means the child
+   segment is never stepped at all.
+2. **Compile the child `SELECT` as a coroutine** (`OP_InitCoroutine`/`OP_Yield`)
+   so the parent loop can pull child rows on demand. This is an *engine* fold —
+   but a lazy one, because a coroutine only runs when yielded to, which is
+   precisely the objection that ruled engine-fold out. Elegant, and a much
+   larger change to `codeProcProgram`.
+3. **Re-execute the child query per parent.** N+1 executions, simplest to write,
+   changes the body's execution model and abandons the single-scan property.
+
+**All three want the ordering first.** Option 1 is bounded only when children
+arrive grouped; option 2 needs the merge to be monotonic; option 3 does not care
+but is the weakest. So the swap recorded below is wrong in one respect: phase 3
+is not merely testable-after-5, it is a *prerequisite* for 5 being bounded.
+
+**Recommendation: land 3 and 5 as one unit, implemented as option 1.** The
+ordering is imposed and the fold consumes it in the same change, which is also
+the only arrangement in which phase 3's control is honest — an ordering nobody
+consumes cannot be shown to matter.
+
+Option 2 is the better long-term shape and should be revisited if the parent
+side ever stops being small; recorded here rather than lost.
+
+## Phase ordering: 3 and 5 must swap *(superseded by the above)*
 
 *Found 2026-08-03, on starting phase 3.*
 
