@@ -383,10 +383,11 @@ static int procCheckList(
             ** three entries would read as a bug in the checker. */
             sqlite3ErrorMsg(p->pParse,
               "result set %d of procedure %s%s has %d column%s but its "
-              "RETURNS TABLE declares %d before its %d nested table%s, "
-              "which are streamed by the SELECTs that follow",
+              "RETURNS TABLE declares %d value column%s before its %d nested "
+              "table%s, which are streamed by the SELECTs that follow",
               i+1, p->zName, p->zWhere, nCol, nCol==1 ? "" : "s",
-              pE->nCol, pE->nNested, pE->nNested==1 ? "" : "s");
+              pE->nCol, pE->nCol==1 ? "" : "s",
+              pE->nNested, pE->nNested==1 ? "" : "s");
           }else{
             sqlite3ErrorMsg(p->pParse,
               "result set %d of procedure %s%s has %d column%s but its "
@@ -512,6 +513,9 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
     for(i=0; i<pCols->nParam; i++){
       if( pCols->a[i].pNested ) nNested++; else nScalar++;
     }
+    /* nScalar is what README-PROCS.md calls a VALUE COLUMN -- a column that
+    ** carries a value directly, as opposed to a nested table.  The user-facing
+    ** identity is columns = value columns + nested tables. */
     pConf->aEmit[iParent].nCol = nScalar;
     pConf->aEmit[iParent].nNested = nNested;
     /* Diagnosed before the key check below, which would otherwise report the

@@ -117,7 +117,7 @@ control-flow graph -- there is **no cost at CALL time**:
 | Rule | What is enforced |
 |---|---|
 | count | every complete path streams exactly the declared sequence; `RAISE` may abort mid-sequence |
-| arity | the k-th row-returning SELECT must have the width of shape k (names need not match: the declaration is the interface) |
+| arity | the k-th row-returning SELECT must have the width of segment k (names need not match: the declaration is the interface). A shape that nests expands to more than one segment -- see *Counting columns when a shape nests* below |
 | branches | IF branches must make equal progress; the error names the divergent branch |
 | loops | a loop body may not contain a row-returning SELECT (`SELECT ... INTO` is fine) |
 | calls | a declared procedure may only CALL a `RETURNS NOTHING` procedure |
@@ -132,8 +132,10 @@ PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
 ```
 
 Multiple sets are delimited explicitly. `sqlite3_step()` reports
-`SQLITE_DONE` at the end of each declared set and keeps reporting it
-until the client advances:
+`SQLITE_DONE` at the end of each **segment** -- each top-level `SELECT` in the
+body ends one -- and keeps reporting it until the client advances. For a
+procedure that does not nest, one declared shape is one segment and the two
+words are interchangeable:
 
 ```c
 /* set 1 */
@@ -148,6 +150,63 @@ while( sqlite3_proc_next_resultset(pStmt)==SQLITE_OK ){
 procedure with several declared shapes therefore no longer concatenates
 them, which is a deliberate behavior change for declared procedures only.
 
+### Counting columns when a shape nests
+
+This is the one place the numbers surprise people, so it is worth stating
+before you hit it. Given
+
+```sql
+RETURNS TABLE(
+  id INTEGER,
+  title TEXT,
+  comments TABLE(post_id INTEGER, cid INTEGER, body TEXT) KEY(post_id = id)
+)
+```
+
+the shape has **three columns**, two of which are **value columns** -- columns
+that carry a value directly, as opposed to a nested table. Both numbers are
+correct at once, and each is visible somewhere:
+
+| Count | Here | Where you see it |
+|---|---|---|
+| columns | 3 | `PRAGMA proc_info`; `sqlite3_column_count()` |
+| **value columns** | **2** | the width the parent `SELECT` must have |
+| nested tables | 1 | one extra `SELECT` in the body; one extra segment on the wire |
+
+`columns = value columns + nested tables`, always.
+
+The consequence worth internalising: **the parent `SELECT` is narrower than the
+declaration.** Each nested table is streamed by its own `SELECT` that follows,
+in declaration order -- so widening the parent to three columns is an error,
+not the fix:
+
+```sql
+BEGIN
+  SELECT id, title FROM posts WHERE id = pid;                  -- 2 value columns
+  SELECT post_id, cid, body FROM comments WHERE post_id = pid; -- the nested table
+END;
+```
+
+Both halves of `KEY(child = parent)` are checked at CREATE: the child name
+against the nested table's own columns, the parent name against the value
+columns of the shape containing it. The correlation column is part of the
+child's declared columns because the child result set genuinely carries it --
+the declaration does not hide what the wire carries.
+
+### Segments and declared shapes are different counts
+
+Once a shape nests, two more numbers diverge, and both are currently spelled
+"result set" somewhere:
+
+| Count | Here | Reported by |
+|---|---|---|
+| declared shapes | 1 | `PRAGMA proc_list.nresultsets` |
+| segments | 2 | what `sqlite3_proc_next_resultset()` advances through |
+
+For every procedure that does not nest these are equal, which is why one word
+served until now. **Do not read `nresultsets` as the number of times to call
+`next_resultset()`** when a shape nests.
+
 One property is intentionally **not** enforced:
 
 - **Column types.** Declared types are authoritative for CALL metadata but
@@ -156,6 +215,11 @@ One property is intentionally **not** enforced:
 
 ## Known limitations (deliberate, v1)
 
+- **`CALL` of a procedure with a nested table is refused** (branch
+  `nested-shapes`). The declaration parses, is conformance-checked and is
+  introspectable, so `procgen` can consume it; streaming it needs the
+  client-visible column, which is not built yet. The error is explicit at
+  prepare rather than a silently narrowed or fabricated column.
 - No `OUT`/`INOUT` parameters (result sets cover most cases; planned later).
 - Per-column types of declared shapes are advisory (see above).
 - `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is **not**

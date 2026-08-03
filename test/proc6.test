@@ -205,7 +205,7 @@ do_catchsql_test 4.2 {
     SELECT id FROM posts WHERE id = pid;
     SELECT post_id, body FROM comments WHERE post_id = pid;
   END;
-} {1 {result set 1 of procedure m3 has 1 column but its RETURNS TABLE declares 2 before its 1 nested table, which are streamed by the SELECTs that follow}}
+} {1 {result set 1 of procedure m3 has 1 column but its RETURNS TABLE declares 2 value columns before its 1 nested table, which are streamed by the SELECTs that follow}}
 
 # Transposed: child SELECT first.  Caught because the arities differ.
 do_catchsql_test 4.3 {
@@ -216,7 +216,7 @@ do_catchsql_test 4.3 {
     SELECT post_id, body FROM comments WHERE post_id = pid;
     SELECT id FROM posts WHERE id = pid;
   END;
-} {1 {result set 1 of procedure m4 has 2 columns but its RETURNS TABLE declares 1 before its 1 nested table, which are streamed by the SELECTs that follow}}
+} {1 {result set 1 of procedure m4 has 2 columns but its RETURNS TABLE declares 1 value column before its 1 nested table, which are streamed by the SELECTs that follow}}
 
 # One SELECT too many.
 do_catchsql_test 4.4 {
