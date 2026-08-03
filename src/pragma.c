@@ -1470,7 +1470,7 @@ void sqlite3Pragma(
   */
   case PragTyp_PROC_LIST: {
     int ii;
-    pParse->nMem = 4;
+    pParse->nMem = 5;
     for(ii=0; ii<db->nDb; ii++){
       HashElem *k;
       Schema *pSchema;
@@ -1483,10 +1483,14 @@ void sqlite3Pragma(
         int nShape = 0;
         ProcShape *pS;
         for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
-        sqlite3VdbeMultiLoad(v, 1, "siii", pProc->zName,
+        /* `security` is spelled out rather than reported as a bit: a client
+        ** generator has to reproduce the clause, and a human reading the
+        ** pragma should not have to remember which way round 0 and 1 go. */
+        sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
             pProc->eRet==PROC_RET_TABLES ? nShape : 0,
-            pProc->eRet!=PROC_RET_UNDECLARED);
+            pProc->eRet!=PROC_RET_UNDECLARED,
+            pProc->bDefiner ? "DEFINER" : "INVOKER");
       }
     }
     if( !OMIT_TEMPDB && (zDb==0
@@ -1498,10 +1502,14 @@ void sqlite3Pragma(
         int nShape = 0;
         ProcShape *pS;
         for(pS=pProc->pShapes; pS; pS=pS->pNext) nShape++;
-        sqlite3VdbeMultiLoad(v, 1, "siii", pProc->zName,
+        /* `security` is spelled out rather than reported as a bit: a client
+        ** generator has to reproduce the clause, and a human reading the
+        ** pragma should not have to remember which way round 0 and 1 go. */
+        sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
             pProc->eRet==PROC_RET_TABLES ? nShape : 0,
-            pProc->eRet!=PROC_RET_UNDECLARED);
+            pProc->eRet!=PROC_RET_UNDECLARED,
+            pProc->bDefiner ? "DEFINER" : "INVOKER");
       }
     }
   }

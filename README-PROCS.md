@@ -207,12 +207,34 @@ One property is intentionally **not** enforced:
   caller may touch every table the body uses. It also gates mutation-only
   procedures, which have no result shape to filter on. Tests: `proc5.test`.
 
-  Still open: a per-procedure **security level**, so that a procedure may
-  optionally run its body *without* authorizing each statement (Sean's
-  "guest"/"everyone" level, 2026-08-03). Default stays as today — bodies are
-  always authorized — and elevation would be explicit opt-in at CREATE time.
-  `SQLITE_CALL` is a prerequisite: if a trusted body is not checked, the call
-  gate becomes the only gate.
+  **Security level (added 2026-08-03).**
+
+  ```sql
+  CREATE PROCEDURE p() RETURNS TABLE(x INTEGER) SECURITY DEFINER
+  BEGIN SELECT x FROM restricted; END;
+  ```
+
+  `SECURITY INVOKER` is the default and is exactly the previous behaviour:
+  every body statement is authorized against the caller's policy. `SECURITY
+  DEFINER` compiles the body with the authorizer detached, so the procedure may
+  touch what its caller may not — which is what makes a procedure a privilege
+  *boundary* rather than a macro.
+
+  This is safe only because `SQLITE_CALL` fires *before* the body is compiled
+  or fetched from cache, so an unchecked body is reachable exclusively through
+  a gate the application opened deliberately. The two features are one design;
+  do not adopt either half alone.
+
+  The level is reported by `PRAGMA proc_list` in a `security` column (spelled
+  `INVOKER`/`DEFINER`, not a bit — a client generator has to reproduce the
+  clause), and it survives schema reload because it lives in the stored CREATE
+  text. `SECURITY`, `DEFINER` and `INVOKER` are **non-reserved**, so schemas
+  already using them as identifiers keep working.
+
+  Compatibility note: a schema containing a `SECURITY` clause cannot be read by
+  a build of this fork that predates the feature — it is a parse error on
+  schema load, not corruption. Stock SQLite cannot read `CREATE PROCEDURE` at
+  all, so nothing changes there.
 - The expression form of RAISE inside a SELECT remains trigger-only; the
   statement form covers procedures.
 

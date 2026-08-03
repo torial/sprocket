@@ -190,4 +190,86 @@ do_test 6.1 {
   execsql {CALL p_read()}
 } {1 one 2 two}
 
+#-------------------------------------------------------------------------
+# 7. SECURITY DEFINER / INVOKER.
+#
+# INVOKER (the default) authorizes body statements as before.  DEFINER runs the
+# body WITHOUT consulting the authorizer, so the procedure may touch what its
+# caller may not -- which makes SQLITE_CALL the only remaining gate.
+#
+do_execsql_test 7.0 {
+  CREATE TABLE ledger(amt INTEGER);
+  INSERT INTO ledger VALUES(100);
+  CREATE PROCEDURE r_plain()   RETURNS TABLE(amt INTEGER)
+    BEGIN SELECT amt FROM ledger; END;
+  CREATE PROCEDURE r_invoker() RETURNS TABLE(amt INTEGER) SECURITY INVOKER
+    BEGIN SELECT amt FROM ledger; END;
+  CREATE PROCEDURE r_definer() RETURNS TABLE(amt INTEGER) SECURITY DEFINER
+    BEGIN SELECT amt FROM ledger; END;
+} {}
+
+# The default is INVOKER, and the level is introspectable -- a client generator
+# has to be able to reproduce the clause.
+do_execsql_test 7.1 {
+  SELECT name, security FROM pragma_proc_list
+   WHERE name IN ('r_plain','r_invoker','r_definer') ORDER BY name;
+} {r_definer DEFINER r_invoker INVOKER r_plain INVOKER}
+
+proc auth_deny_ledger {op args} {
+  if {$op eq "SQLITE_READ" && [lindex $args 0] eq "ledger"} { return SQLITE_DENY }
+  return SQLITE_OK
+}
+
+# CONTROL: the policy really does deny this table inline.  Without this the
+# DEFINER result below proves nothing.
+do_test 7.2 {
+  db authorizer ::auth_deny_ledger
+  catchsql {SELECT amt FROM ledger}
+} {1 {access to ledger.amt is prohibited}}
+
+# CONTROL: nothing written before this feature existed changes behaviour.
+do_test 7.3 {
+  db authorizer ::auth_deny_ledger
+  catchsql {CALL r_plain()}
+} {1 {access to ledger.amt is prohibited}}
+
+# CONTROL: the explicit spelling matches the default exactly.
+do_test 7.4 {
+  db authorizer ::auth_deny_ledger
+  catchsql {CALL r_invoker()}
+} {1 {access to ledger.amt is prohibited}}
+
+# The feature itself.
+do_test 7.5 {
+  db authorizer ::auth_deny_ledger
+  execsql {CALL r_definer()}
+} {100}
+
+# And the call gate still applies -- it must, because the body is unchecked and
+# this is then the ONLY gate.
+proc auth_deny_definer_call {op args} {
+  if {$op eq "SQLITE_CALL" && [lindex $args 0] eq "r_definer"} { return SQLITE_DENY }
+  return SQLITE_OK
+}
+do_test 7.6 {
+  db authorizer ::auth_deny_definer_call
+  catchsql {CALL r_definer()}
+} {1 {not authorized}}
+
+# The level survives a schema reload -- it lives in the stored CREATE text.
+do_test 7.7 {
+  db authorizer {}
+  db close
+  sqlite3 db test.db
+  execsql {SELECT security FROM pragma_proc_list WHERE name='r_definer'}
+} {DEFINER}
+
+# The new words stay NON-RESERVED, as the fork's other keywords do: existing
+# schemas that use them as identifiers must keep working.
+do_execsql_test 7.8 {
+  CREATE TABLE security(definer TEXT, invoker INTEGER);
+  INSERT INTO security VALUES('a', 1);
+  SELECT definer, invoker FROM security;
+} {a 1}
+
 finish_test

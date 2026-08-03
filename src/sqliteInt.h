@@ -4275,6 +4275,8 @@ struct Proc {
   Schema *pSchema;          /* Schema containing the procedure */
   ProcShape *pShapes;       /* Declared result shapes (PROC_RET_TABLES) */
   u8 eRet;                  /* One of the PROC_RET_* values */
+  u8 bDefiner;              /* True for SECURITY DEFINER: body is not
+                            ** authorized.  Default 0 = SECURITY INVOKER. */
 };
 
 /*
@@ -5408,7 +5410,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
 
 #ifndef SQLITE_OMIT_PROCEDURE
   void sqlite3FinishProc(Parse*,Token*,Token*,ProcParamList*,ProcShape*,
-                         TriggerStep*,int,int,Token*);
+                         TriggerStep*,int,int,Token*,int);
   void sqlite3DropProc(Parse*, SrcList*, int);
   void sqlite3CallProc(Parse*, SrcList*, ExprList*);
   void sqlite3DeleteProc(sqlite3*, Proc*);

@@ -450,7 +450,8 @@ void sqlite3FinishProc(
   TriggerStep *pStepList, /* Body of the procedure */
   int isTemp,             /* True if the TEMP keyword is present */
   int noErr,              /* True if IF NOT EXISTS is present */
-  Token *pAll             /* Text from procedure name through END */
+  Token *pAll,            /* Text from procedure name through END */
+  int bDefiner            /* True for SECURITY DEFINER (body unauthorized) */
 ){
   sqlite3 *db = pParse->db;
   Proc *pProc = 0;        /* The new procedure object */
@@ -558,6 +559,7 @@ void sqlite3FinishProc(
   pProc = sqlite3DbMallocZero(db, sizeof(Proc));
   if( pProc==0 ) goto proc_cleanup;
   pProc->zName = zName;
+  pProc->bDefiner = (u8)(bDefiner!=0);
   zName = 0;
   pProc->pParams = pParams;
   pParams = 0;
@@ -1325,7 +1327,24 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
       }
     }
 
-    codeProcProgram(&sSubParse, pProc->pBody, pPrg, 0);
+    /* SECURITY DEFINER: compile the body with the authorizer detached, so its
+    ** statements are not checked against the caller's policy.  That is the
+    ** whole feature -- the procedure may touch what its caller may not.
+    **
+    ** Safe because the CALL itself was already authorized (SQLITE_CALL fires
+    ** in sqlite3CallProc before the body is compiled or fetched from cache),
+    ** so an unchecked body is reachable only through a gate the application
+    ** explicitly opened.  Restored unconditionally, including on the error
+    ** paths below, because the save/restore brackets only this call.
+    **
+    ** SECURITY INVOKER -- the default, and everything written before this
+    ** feature existed -- takes the untouched path. */
+    {
+      sqlite3_xauth xAuthSave = db->xAuth;
+      if( pProc->bDefiner ) db->xAuth = 0;
+      codeProcProgram(&sSubParse, pProc->pBody, pPrg, 0);
+      db->xAuth = xAuthSave;
+    }
 
     sqlite3VdbeAddOp0(v, OP_Halt);
     VdbeComment((v, "End: proc %s", pProc->zName));

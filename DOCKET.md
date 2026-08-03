@@ -56,7 +56,28 @@ caller may touch every table the body uses; gate mutation-only procedures,
 which have no result shape to filter on; and block laundering — denying an
 inner procedure blocks an outer one that wraps it. `proc5.test`, 15 tests.
 
-### Still open — the security level (Sean's ruling, 2026-08-03)
+### ✅ Done 2026-08-03 — the security level
+
+`SECURITY INVOKER` (default, unchanged behaviour) / `SECURITY DEFINER` (body
+compiled with the authorizer detached). Reported in `PRAGMA proc_list`'s new
+`security` column; persists in the stored CREATE text; the three new keywords
+are non-reserved. `proc5.test` covers it, including the control that a plain
+`SELECT` on the same table *is* denied — without which the DEFINER result would
+prove nothing — and that `SQLITE_CALL` still gates a DEFINER procedure, which
+it must, since the body is unchecked and that becomes the only gate.
+
+Design notes for whoever revisits this:
+
+- Suppression is `db->xAuth` saved, cleared, restored around the body compile.
+  Narrow by construction: the outer CALL is already authorized by then.
+- `SECURITY DEFINER` was chosen over inventing a word because it is instantly
+  recognisable from Postgres/MySQL, even though SQLite has no user model to
+  hang a "definer" identity on — the semantics people expect (body runs with
+  authority the caller lacks) are exactly what it does.
+- `SQL SECURITY DEFINER`, the full standard spelling, was rejected: `sql` is a
+  column name in `sqlite_schema`, and making it a keyword invites collisions.
+
+### Original framing — the security level (Sean's ruling, 2026-08-03)
 
 A per-procedure level, a *"guest"/"everyone"* mode, under which a procedure may
 run its body **without** authorizing each statement — SQL's `SECURITY DEFINER`

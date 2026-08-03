@@ -276,6 +276,9 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
   IGNORE IMMEDIATE INITIALLY INSTEAD LIKE_KW MATCH NO PLAN
   QUERY KEY OF OFFSET PRAGMA RAISE RECURSIVE RELEASE REPLACE RESTRICT ROW ROWS
   ROLLBACK SAVEPOINT TEMP TRIGGER VACUUM VIEW VIRTUAL WITH WITHOUT
+%ifndef SQLITE_OMIT_PROCEDURE
+  SECURITY DEFINER INVOKER
+%endif
   NULLS FIRST LAST
   CALL PROCEDURE DECLARE ELSEIF LEAVE LOOP RETURN WHILE RETURNS
 %ifdef SQLITE_OMIT_COMPOUND_SELECT
@@ -1856,11 +1859,12 @@ cmd ::= DROP TRIGGER ifexists(NOERR) fullname(X). {
 %ifndef SQLITE_OMIT_PROCEDURE
 
 cmd ::= createkw temp(T) PROCEDURE ifnotexists(NOERR) nm(B) dbnm(Z)
-        LP procparams(P) RP procreturns(R) BEGIN proc_cmd_list(S) END(E). {
+        LP procparams(P) RP procreturns(R) procsecurity(SEC)
+        BEGIN proc_cmd_list(S) END(E). {
   Token all;
   all.z = (Z.n==0 ? B.z : Z.z);
   all.n = (int)(E.z - all.z) + E.n;
-  sqlite3FinishProc(pParse, &B, &Z, P, R, S, T, NOERR, &all);
+  sqlite3FinishProc(pParse, &B, &Z, P, R, S, T, NOERR, &all, SEC);
 #ifdef SQLITE_DEBUG
   assert( pParse->isCreate ); /* Set by createkw reduce action */
   pParse->isCreate = 0;       /* But, should not be set for CREATE PROCEDURE */
@@ -1949,6 +1953,16 @@ procparams(A) ::= procparams(A) COMMA nm(X) typetoken(Y). {
 // deliberately not a keyword).  Validation of the clause combinations
 // happens in sqlite3FinishProc.
 //
+// SECURITY INVOKER (the default) authorizes every body statement, exactly as
+// before.  SECURITY DEFINER runs the body WITHOUT consulting the authorizer,
+// so the procedure can do work its caller could not do directly -- which makes
+// SQLITE_CALL the only gate, and is why that action had to exist first.
+// Deliberately opt-in: nothing already written changes behaviour.
+%type procsecurity {int}
+procsecurity(A) ::= .                        {A = 0;}
+procsecurity(A) ::= SECURITY INVOKER.        {A = 0;}
+procsecurity(A) ::= SECURITY DEFINER.        {A = 1;}
+
 %type procreturns {ProcShape*}
 %destructor procreturns {sqlite3ProcShapeListDelete(pParse->db, $$);}
 procreturns(A) ::= . {A = 0;}
