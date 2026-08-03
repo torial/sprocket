@@ -342,7 +342,81 @@ compatibility matters most and bytes matter least. Trading a stdlib one-liner
 in every language for 5% on the path you hope nobody takes is the wrong side of
 that trade.
 
-### POC 2 — scoped, not yet built
+### POC 2 (2026-08-03) — built. Q2 came back **yes**, decisively.
+
+`tool/proc_nestpoc2.c`. 50 parents x 20 children, exact counts, no timings.
+
+**Q1 — what materialisation costs, and whether laziness recovers it**
+
+| strategy | child rows read | JSON bytes built | peak buffered |
+|---|---|---|---|
+| eager JSON column | 1000 | 46,493 | 20 |
+| lazy column (client reads 1 in 5) | 200 | 9,291 | 20 |
+| ordered merge (two sets) | 1000 | **0** | 20 |
+
+Laziness recovers exactly the proportion the client never asks for, and the
+merge materialises **nothing**. All three hold only one parent's children at a
+time, so none of them is a memory problem.
+
+**This prices R1 rather than contradicting it.** The nested-column design costs
+46 KB of JSON that the two-set design does not — *for a flat client*. With a
+lazy column an aware client reads the structured accessor and never triggers
+the JSON at all, so the materialisation cost falls entirely on the degraded
+path. That is exactly where R1 puts it, and POC 2 confirms the arithmetic
+works out.
+
+**Q2 — does declaring the correlation buy anything over the convention?**
+
+The convention is "both sets ordered by the correlation key". Break it and the
+ordered merge returns:
+
+```
+correctly ordered : 1000 pairs
+wrongly ordered   :   20 pairs
+```
+
+**It does not error. It silently returns 2% of the data and reports success.**
+
+So the convention is *not* self-enforcing, and the answer to Q2 is yes: what
+declaration buys is **detection**. This is the vacuous-instrument pattern in
+data form — a wrong answer that looks exactly like a right one.
+
+**Consequence for Tack, worth acting on independently of this docket item:**
+its S2 ordered-merge relies on this convention with only a *debug-build*
+assertion. In a release build, a procedure author who writes the wrong
+`ORDER BY` silently loses almost all of the child rows. That is a live bug
+class in the ORM design, not a hypothetical.
+
+**Q3 — does the cardinality check catch it?**
+
+```
+half of parent 7's children deleted     : 1 parent mismatched
+parent 9's children duplicated          : 2 parents mismatched
+counts restored                         : 0 parents mismatched
+```
+
+Yes, both directions, and **localised to the offending parent** rather than
+merely reporting a total that is wrong. The last line is the control: a check
+that never goes quiet is an alarm, not a check.
+
+### Where POC 2 leaves the design
+
+1. The feature earns its place on **type fidelity** (POC 1) and on **detection**
+   (POC 2 Q2). Neither is about bytes.
+2. The engine's obligation is confirmed small and matches R5: record the
+   relationship, record the cardinality, keep both introspectable. It does not
+   need to enforce ordering — the reassembler compares counts and that is
+   sufficient to catch the silent failure.
+3. The lazy nested column is the right shape for R1, and its cost lands on the
+   flat-client path by construction.
+
+**Still open, and now the only things that are:** the syntax (R4 punted it),
+and whether the cardinality is carried per-parent in the result stream or
+declared once in the shape. The second is a real design question — per-parent
+counts cost a value per row, a declared constant cannot express variable
+cardinality.
+
+### Original scope, for the record
 
 Build the **lazy nested column** and answer three things:
 
