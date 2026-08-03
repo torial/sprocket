@@ -1988,6 +1988,16 @@ procretcols(A) ::= nm(X) typetoken(Y). {
 procretcols(A) ::= procretcols(A) COMMA nm(X) typetoken(Y). {
   A = sqlite3ProcParamAppend(pParse, A, &X, &Y);
 }
+// A nested child table.  TABLE and KEY are both existing tokens, so this adds
+// no keywords and cannot affect any schema that does not use the form.
+procretcols(A) ::= nm(X) TABLE LP procretcols(C) RP
+                   KEY LP nm(K1) EQ nm(K2) RP. {
+  A = sqlite3ProcNestedAppend(pParse, 0, &X, C, &K1, &K2);
+}
+procretcols(A) ::= procretcols(A) COMMA nm(X) TABLE LP procretcols(C) RP
+                   KEY LP nm(K1) EQ nm(K2) RP. {
+  A = sqlite3ProcNestedAppend(pParse, A, &X, C, &K1, &K2);
+}
 
 //////////////////////// DROP PROCEDURE statement /////////////////////////////
 cmd ::= DROP PROCEDURE ifexists(NOERR) fullname(X). {

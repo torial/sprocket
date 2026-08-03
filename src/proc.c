@@ -27,6 +27,74 @@
 ** pList is NULL.  A copy of the name and type tokens is made.  Returns
 ** the (possibly new) list, or NULL on OOM (after freeing pList).
 */
+/*
+** Append a NESTED CHILD TABLE column to a result shape:
+**
+**     comments TABLE(cid INTEGER, body TEXT) KEY(post_id = id)
+**
+** Validated here, at CREATE time, rather than at CALL: a declaration whose KEY
+** names a column the child does not have is an error the author can see while
+** writing it.  Depth is limited to one -- a nested table inside a nested table
+** is rejected explicitly rather than accepted and mis-handled, because each
+** further level would have to be ordered by the full ancestor path and expose
+** every ancestor key (PLAN-NESTED.md, "deliberately out of scope").
+*/
+ProcParamList *sqlite3ProcNestedAppend(
+  Parse *pParse,          /* Parsing context */
+  ProcParamList *pList,   /* Shape being built, or NULL */
+  Token *pName,           /* Name of the nested column */
+  ProcParamList *pChild,  /* The child's declared columns */
+  Token *pKeyChild,       /* Child side of the correlation */
+  Token *pKeyParent       /* Parent side of the correlation */
+){
+  sqlite3 *db = pParse->db;
+  char *zChild = 0;
+  int i, bFound = 0;
+
+  if( pChild==0 ) goto nested_err;
+  zChild = sqlite3NameFromToken(db, pKeyChild);
+  if( zChild==0 ) goto nested_err;
+
+  for(i=0; i<pChild->nParam; i++){
+    if( pChild->a[i].pNested ){
+      sqlite3ErrorMsg(pParse, "nested tables may not themselves nest: %s",
+                      pChild->a[i].zName);
+      goto nested_err;
+    }
+    if( sqlite3StrICmp(pChild->a[i].zName, zChild)==0 ) bFound = 1;
+  }
+  if( !bFound ){
+    sqlite3ErrorMsg(pParse,
+        "KEY names %s, which is not a column of the nested table", zChild);
+    goto nested_err;
+  }
+
+  {
+    /* ProcParamAppend dereferences pType (it reads pType->n), so a nested
+    ** column -- which has no scalar type -- must pass an empty Token rather
+    ** than NULL.  Passing NULL segfaulted, and the crash read as success
+    ** because the shell printed nothing. */
+    Token noType;
+    noType.z = 0;
+    noType.n = 0;
+    pList = sqlite3ProcParamAppend(pParse, pList, pName, &noType);
+  }
+  if( pList==0 ) goto nested_err;
+  {
+    ProcParam *p = &pList->a[pList->nParam-1];
+    p->pNested = pChild;
+    p->zKeyChild = zChild;
+    p->zKeyParent = sqlite3NameFromToken(db, pKeyParent);
+    return pList;
+  }
+
+nested_err:
+  sqlite3DbFree(db, zChild);
+  sqlite3ProcParamListDelete(db, pChild);
+  sqlite3ProcParamListDelete(db, pList);
+  return 0;
+}
+
 ProcParamList *sqlite3ProcParamAppend(
   Parse *pParse,        /* Parsing context */
   ProcParamList *pList, /* List to append to, or NULL */
@@ -394,6 +462,9 @@ void sqlite3ProcParamListDelete(sqlite3 *db, ProcParamList *pList){
   for(i=0; i<pList->nParam; i++){
     sqlite3DbFree(db, pList->a[i].zName);
     sqlite3DbFree(db, pList->a[i].zType);
+    sqlite3DbFree(db, pList->a[i].zKeyChild);
+    sqlite3DbFree(db, pList->a[i].zKeyParent);
+    sqlite3ProcParamListDelete(db, pList->a[i].pNested);   /* recurses once */
   }
   sqlite3DbFree(db, pList->a);
   sqlite3DbFree(db, pList);
@@ -525,7 +596,10 @@ void sqlite3FinishProc(
         ProcParamList *pC = pS->pCols;
         haveTable = 1;
         for(j=0; j<pC->nParam; j++){
-          if( pC->a[j].zType==0 ){
+          /* A nested child table has no scalar type of its own -- its shape IS
+          ** its declaration -- so it is exempt from the type-name rule that
+          ** applies to ordinary result columns. */
+          if( pC->a[j].zType==0 && pC->a[j].pNested==0 ){
             sqlite3ErrorMsg(pParse,
                "RETURNS TABLE column %s of %s needs a type name",
                pC->a[j].zName, zName);

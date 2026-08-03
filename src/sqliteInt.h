@@ -4233,10 +4233,21 @@ struct TriggerStep {
 # define SQLITE_OMIT_PROCEDURE 1
 #endif
 
-/* One declared parameter of a stored procedure */
+/* One declared parameter of a stored procedure.
+**
+** A result-shape column may instead be a NESTED CHILD TABLE, declared
+**
+**     comments TABLE(cid INTEGER, body TEXT) KEY(post_id = id)
+**
+** in which case pNested holds the child's columns and zKeyChild/zKeyParent
+** name the correlation pair.  Parameters (as opposed to result columns) never
+** nest; the field is simply NULL for them.  See PLAN-NESTED.md. */
 struct ProcParam {
   char *zName;          /* Parameter name */
   char *zType;          /* Declared type, or NULL if none given */
+  ProcParamList *pNested; /* Child columns if this is a nested table, else 0 */
+  char *zKeyChild;      /* Child column of the correlation, if nested */
+  char *zKeyParent;     /* Parent column of the correlation, if nested */
 };
 
 /* The parameter list of a stored procedure */
@@ -5416,6 +5427,8 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3DeleteProc(sqlite3*, Proc*);
   void sqlite3UnlinkAndDeleteProc(sqlite3*, int, const char*);
   ProcParamList *sqlite3ProcParamAppend(Parse*,ProcParamList*,Token*,Token*);
+  ProcParamList *sqlite3ProcNestedAppend(Parse*,ProcParamList*,Token*,
+                                         ProcParamList*,Token*,Token*);
   void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
   ProcShape *sqlite3ProcShapeAppend(Parse*,ProcShape*,ProcParamList*);
   ProcShape *sqlite3ProcShapeNothing(Parse*,ProcShape*,Token*);
