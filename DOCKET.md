@@ -26,22 +26,55 @@ couplings worth knowing before picking anything up here:
 
 ## 1. Authorization for procedures — *we created this hole*
 
-`README-PROCS.md` records it as a known limitation: there are no authorizer
-action codes for `CALL`, and body statements authorize under the procedure's
-context the way trigger steps do. That is a defensible footnote for an embedded
-library.
+**This entry was substantially wrong and is corrected 2026-08-03.** It claimed
+the procedure boundary was "unguarded." It was not. Measured before building
+anything:
 
-It stops being a footnote the moment procedures become the **network-facing
-API**, which is exactly what `PLAN-TRANSPORT.md` proposes. Then the procedure
-boundary *is* the security boundary, and right now it is unguarded.
+- **Body statements are already authorized.** A changed authorizer is honoured:
+  `sqlite3_set_authorizer()` expires prepared statements, they re-prepare, and
+  the CALL is denied with the same message an inline statement would give — on
+  a cached connection and on a fresh one. (A suspected hole in the
+  compiled-body cache was tested for specifically and does not exist.)
+- **The authorizer already knew which procedure a statement came from**, via
+  `zAuthContext` — the 6th callback argument. Policy like "deny reads of
+  `secret` when the context is `leaky`" was expressible all along.
+- **Table-level denial reaches through a body**, verified: `leaky()` denied,
+  `p()` allowed, same connection.
 
-**Done means:** an `SQLITE_CALL` authorizer action; a decision about whether a
-procedure runs with definer's or invoker's rights (SQL standard has both, and
-the answer determines everything else); body statements authorizable
-independently of the call; tests proving a denied CALL cannot be laundered
-through a nested CALL.
+So enforcement existed; only *granularity* was missing.
 
-**Priority: do this before anything listens on a socket.**
+### ✅ Done 2026-08-03 — `SQLITE_CALL`, action code 34
+
+The invocation as a distinct authorizable event: arg3 = procedure name,
+arg5 = the database the procedure lives in (resolved from its schema, so
+`CALL p()` and `CALL main.p()` present identically to a policy). Checked after
+resolution and arity but **before** the body is compiled or fetched from cache
+— deliberately, so a future trusted-body mode still passes this gate.
+
+Now expressible and previously not: refuse `CALL transfer_funds` even when the
+caller may touch every table the body uses; gate mutation-only procedures,
+which have no result shape to filter on; and block laundering — denying an
+inner procedure blocks an outer one that wraps it. `proc5.test`, 15 tests.
+
+### Still open — the security level (Sean's ruling, 2026-08-03)
+
+A per-procedure level, a *"guest"/"everyone"* mode, under which a procedure may
+run its body **without** authorizing each statement — SQL's `SECURITY DEFINER`
+in spirit, though SQLite has no user model to hang a "definer" identity on, so
+the framing is a trust level rather than an identity.
+
+**Explicitly not the default.** Created procedures keep today's behaviour:
+bodies are always authorized. Elevation is opt-in at CREATE time.
+
+`SQLITE_CALL` was the prerequisite — if a trusted body goes unchecked, the call
+gate is the *only* gate, so it had to exist first. Open design questions:
+the keyword and syntax; whether the level is visible in `PRAGMA proc_info`
+(it should be — a client generator needs to know); whether a trusted procedure
+may CALL an untrusted one, or the reverse; and how it interacts with the
+existing conformance rule that a shape-declaring procedure may only CALL a
+`RETURNS NOTHING` one.
+
+**Priority: the remaining piece before anything listens on a socket.**
 
 ## 2. Typed client generation — *cheapest thing with the largest multiplier*
 

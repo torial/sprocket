@@ -3535,6 +3535,7 @@ int sqlite3_set_authorizer(
 #define SQLITE_SAVEPOINT            32   /* Operation       Savepoint Name  */
 #define SQLITE_COPY                  0   /* No longer used */
 #define SQLITE_RECURSIVE            33   /* NULL            NULL            */
+#define SQLITE_CALL                 34   /* Procedure Name  NULL            */
 
 /*
 ** CAPI3REF: Deprecated Tracing And Profiling Functions

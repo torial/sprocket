@@ -178,8 +178,25 @@ One property is intentionally **not** enforced:
   handled correctly (`EP_VarSelect` marking).
 - `sqlite3_changes()` after CALL follows trigger-like accounting; exact
   semantics not yet pinned as a contract.
-- No authorizer action codes for procedures yet; body statements authorize
-  under the procedure's auth context like trigger steps.
+- **Authorization (updated 2026-08-03).** Body statements authorize under the
+  procedure's auth context like trigger steps — and that context *is* the
+  procedure name in the authorizer's 6th argument, so policy of the form
+  "deny reads of `secret` when the context is `leaky`" was always expressible.
+  What was missing, and is now added, is **`SQLITE_CALL` (action code 34)**:
+  the invocation itself as a distinct authorizable event, with the procedure
+  name as arg3 and its database as arg5.
+
+  That is the gate a procedure needs to be a privilege *boundary* rather than
+  a macro — an application can refuse `CALL transfer_funds` even when the
+  caller may touch every table the body uses. It also gates mutation-only
+  procedures, which have no result shape to filter on. Tests: `proc5.test`.
+
+  Still open: a per-procedure **security level**, so that a procedure may
+  optionally run its body *without* authorizing each statement (Sean's
+  "guest"/"everyone" level, 2026-08-03). Default stays as today — bodies are
+  always authorized — and elevation would be explicit opt-in at CREATE time.
+  `SQLITE_CALL` is a prerequisite: if a trusted body is not checked, the call
+  gate becomes the only gate.
 - The expression form of RAISE inside a SELECT remains trigger-only; the
   statement form covers procedures.
 

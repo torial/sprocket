@@ -1535,6 +1535,35 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
     goto call_cleanup;
   }
 
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  /* Authorize the INVOCATION, distinct from anything the body touches.
+  **
+  ** Body statements are already authorized -- they are compiled through the
+  ** trigger machinery with pParse->zAuthContext set to the procedure name, so
+  ** an application can already write policy like "deny reads of `secret` when
+  ** the context is `leaky`".  What that cannot express is "you may not call
+  ** this procedure at all", independently of which tables its body happens to
+  ** use.  That is the gate a procedure needs to be a privilege boundary rather
+  ** than a macro.
+  **
+  ** Placed here deliberately: after the procedure is resolved and its arity
+  ** checked (so a denial cannot be used to probe for existence or signature
+  ** beyond what resolution already reveals), and BEFORE the body is compiled
+  ** or fetched from the cache. A future security level that runs a trusted
+  ** body without authorizing its statements must still pass through this
+  ** point, which is then the only gate.
+  **
+  ** The database name passed is the one the procedure actually lives in,
+  ** resolved from its schema rather than from the (possibly unqualified)
+  ** name the caller wrote -- otherwise `CALL p()` and `CALL main.p()` would
+  ** present differently to the same policy. */
+  if( sqlite3AuthCheck(pParse, SQLITE_CALL, pProc->zName, 0,
+                       db->aDb[sqlite3SchemaToIndex(db, pProc->pSchema)].zDbSName)
+  ){
+    goto call_cleanup;
+  }
+#endif
+
   v = sqlite3GetVdbe(pParse);
   if( v==0 ) goto call_cleanup;
 

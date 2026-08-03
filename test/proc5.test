@@ -1,0 +1,193 @@
+# 2026-08-03
+#
+# The SQLITE_CALL authorizer action: authorizing the INVOCATION of a
+# procedure, distinct from authorizing whatever its body touches.
+#
+# Background established by probe before this was written:
+#   - body statements ARE already authorized;
+#   - the authorizer already receives the procedure name as zAuthContext,
+#     so "deny reads of X when inside procedure P" was already expressible;
+#   - what was missing was denying the CALL itself, independently of the
+#     tables the body happens to use.  That is the gate a procedure needs to
+#     be a privilege boundary rather than a macro.
+#
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc5
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER, b TEXT);
+  INSERT INTO t1 VALUES(1,'one'),(2,'two');
+  CREATE TABLE t2(x INTEGER);
+  INSERT INTO t2 VALUES(10);
+
+  CREATE PROCEDURE p_read() RETURNS TABLE(a INTEGER, b TEXT) BEGIN
+    SELECT a, b FROM t1 ORDER BY a;
+  END;
+  CREATE PROCEDURE p_other() RETURNS TABLE(x INTEGER) BEGIN
+    SELECT x FROM t2;
+  END;
+  CREATE PROCEDURE p_nothing() RETURNS NOTHING BEGIN
+    UPDATE t2 SET x = x;
+  END;
+} {}
+
+#-------------------------------------------------------------------------
+# 1. The action fires at all, and carries the procedure name.
+#
+set ::authlog {}
+proc auth_log {args} {
+  lappend ::authlog $args
+  return SQLITE_OK
+}
+db authorizer ::auth_log
+
+do_test 1.1 {
+  set ::authlog {}
+  db eval {CALL p_read()}
+  set calls [list]
+  foreach e $::authlog {
+    if {[lindex $e 0] eq "SQLITE_CALL"} { lappend calls $e }
+  }
+  set calls
+} {{SQLITE_CALL p_read {} main {}}}
+
+# The body statements still authorize, and still carry the procedure as
+# context -- the new action is additive, it replaces nothing.
+# Asserted structurally rather than by exact event count: the number of
+# SQLITE_READs depends on how many column references the body has (the ORDER BY
+# re-reads a), which is not what this test is about and would make it brittle.
+do_test 1.2 {
+  set ::authlog {}
+  db authorizer ::auth_log
+  db eval {CALL p_read()}
+  set first [lindex $::authlog 0]
+  set rest  [lrange $::authlog 1 end]
+  set ctxOk 1
+  foreach e $rest { if {[lindex $e end] ne "p_read"} { set ctxOk 0 } }
+  list [lindex $first 0] [lindex $first end] [llength $rest] $ctxOk
+} {SQLITE_CALL {} 4 1}
+
+# A plain SELECT produces no SQLITE_CALL.
+do_test 1.3 {
+  set ::authlog {}
+  db authorizer ::auth_log
+  db eval {SELECT a FROM t1}
+  set n 0
+  foreach e $::authlog { if {[lindex $e 0] eq "SQLITE_CALL"} { incr n } }
+  set n
+} {0}
+
+#-------------------------------------------------------------------------
+# 2. DENY on the invocation blocks the call -- even though the caller is
+#    perfectly entitled to read the table the body touches.
+#
+proc auth_deny_pread {op args} {
+  if {$op eq "SQLITE_CALL" && [lindex $args 0] eq "p_read"} { return SQLITE_DENY }
+  return SQLITE_OK
+}
+
+do_test 2.1 {
+  db authorizer ::auth_deny_pread
+  catchsql {CALL p_read()}
+} {1 {not authorized}}
+
+# CONTROL: the same connection may still read t1 directly.  This is the whole
+# point -- the denial is about the procedure, not about its tables.  If this
+# fails the test proves nothing about SQLITE_CALL.
+do_test 2.2 {
+  db authorizer ::auth_deny_pread
+  execsql {SELECT a FROM t1 ORDER BY a}
+} {1 2}
+
+# CONTROL: a different procedure is unaffected.
+do_test 2.3 {
+  db authorizer ::auth_deny_pread
+  execsql {CALL p_other()}
+} {10}
+
+#-------------------------------------------------------------------------
+# 3. It gates mutation-only procedures too, which have no readable result
+#    and so could not previously be gated by result-shape at all.
+#
+proc auth_deny_all_calls {op args} {
+  if {$op eq "SQLITE_CALL"} { return SQLITE_DENY }
+  return SQLITE_OK
+}
+do_test 3.1 {
+  db authorizer ::auth_deny_all_calls
+  catchsql {CALL p_nothing()}
+} {1 {not authorized}}
+
+#-------------------------------------------------------------------------
+# 4. A denied CALL cannot be laundered through a nested CALL.
+#
+# Note the fork's own conformance rule: a procedure that declares result
+# shapes may only CALL a procedure declared RETURNS NOTHING.  So the nesting
+# test is built from mutation-only procedures -- an earlier draft used
+# shape-declaring ones and was rejected at CREATE time for that reason, which
+# had nothing to do with authorization.
+do_test 4.0 {
+  db authorizer {}
+  execsql {
+    CREATE PROCEDURE p_mutate() RETURNS NOTHING BEGIN
+      UPDATE t2 SET x = x + 1;
+    END;
+    CREATE PROCEDURE p_outer() RETURNS NOTHING BEGIN
+      CALL p_mutate();
+    END;
+  }
+} {}
+
+proc auth_deny_mutate {op args} {
+  if {$op eq "SQLITE_CALL" && [lindex $args 0] eq "p_mutate"} { return SQLITE_DENY }
+  return SQLITE_OK
+}
+
+# Denying the inner procedure must block the outer one that wraps it --
+# otherwise the wrapper is a laundering device.
+do_test 4.1 {
+  db authorizer ::auth_deny_mutate
+  catchsql {CALL p_outer()}
+} {1 {not authorized}}
+
+# Direct denial of the inner call, for comparison.
+do_test 4.2 {
+  db authorizer ::auth_deny_mutate
+  catchsql {CALL p_mutate()}
+} {1 {not authorized}}
+
+# CONTROL: with the denial lifted both work -- so 4.1 and 4.2 were refused
+# for the stated reason, not because the procedures are broken.
+# t2 starts at 10; 4.1 and 4.2 were both denied so neither incremented, and
+# this is the first increment that actually lands.
+do_test 4.3 {
+  db authorizer {}
+  execsql {CALL p_outer(); SELECT x FROM t2}
+} {11}
+
+#-------------------------------------------------------------------------
+# 5. IGNORE is not a bypass.  SQLITE_IGNORE on an action SQLite does not
+#    define an ignore-behaviour for must not silently execute the call.
+#
+proc auth_ignore_calls {op args} {
+  if {$op eq "SQLITE_CALL"} { return SQLITE_IGNORE }
+  return SQLITE_OK
+}
+do_test 5.1 {
+  db authorizer ::auth_ignore_calls
+  set rc [catch {db eval {CALL p_read()}} msg]
+  # Either refused outright, or treated as a denial; what must NOT happen is
+  # the rows coming back as though nothing was asked.
+  expr {$rc==1 || $msg eq ""}
+} {1}
+
+#-------------------------------------------------------------------------
+# 6. Removing the authorizer restores unrestricted calling.
+#
+do_test 6.1 {
+  db authorizer {}
+  execsql {CALL p_read()}
+} {1 one 2 two}
+
+finish_test

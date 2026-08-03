@@ -1224,6 +1224,9 @@ static int auth_callback(
     case SQLITE_FUNCTION          : zCode="SQLITE_FUNCTION"; break;
     case SQLITE_SAVEPOINT         : zCode="SQLITE_SAVEPOINT"; break;
     case SQLITE_RECURSIVE         : zCode="SQLITE_RECURSIVE"; break;
+#ifndef SQLITE_OMIT_PROCEDURE
+    case SQLITE_CALL              : zCode="SQLITE_CALL"; break;
+#endif
     default                       : zCode="????"; break;
   }
   Tcl_DStringInit(&str);
