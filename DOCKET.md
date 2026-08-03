@@ -151,7 +151,8 @@ as `.procgen` rather than a standalone tool.
 
 ## 3. Nested result shapes — *MetaKit's idea, and an open design question*
 
-**Status: not decided. This entry exists to be prototyped, not implemented.**
+**Status: designed. Three POCs and eight rulings; implementation planned in
+`PLAN-NESTED.md` (seven phases, tests written first). Not yet built.**
 
 ### The problem it solves
 
