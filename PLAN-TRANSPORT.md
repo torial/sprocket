@@ -17,7 +17,8 @@ context loss — if you are a later session picking this up, this file plus
 | Wire **transport** phase 3 (arguments) | done |
 | Wire **transport** phase 4 (shape cache) | done, 34.9% saved on the wire |
 | Wire **transport** phase 5 (group commit) | done, `tool/proc_queue.c`, 6 checks |
-| Wire **transport** phase 6 | ← this plan |
+| Wire **transport** phase 6 (shard routing) | done, `tool/proc_shard.c`, 9 checks |
+| **All six phases complete** | 2026-08-03 |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into
@@ -199,18 +200,41 @@ stale processes before diagnosing a build that stopped talking.
 
 ---
 
-## Phase 6 — shard routing
+## Phase 6 — shard routing — **DONE**
 
 **Deliverable.** Route by key to one of N database files, one writer per shard.
 
-**Test, written first.** Keys distribute across all N shards (no shard empty —
-a positive control against a hash that collapses); a read for key K only ever
-touches shard `h(K)`; writes to distinct shards proceed concurrently.
+**Test, as built.** Routing is a pure function of the key, so it is asserted
+exactly: stability (a key always lands in the same place, in range), coverage
+(200 keys over 8 shards leaves none empty — measured 26/25/25/26/24/25/25/24),
+and isolation (each key's row is in its own shard and in **no** other, checked
+by opening every shard file independently).
 
-**How this test can fail.** Replace the hash with a constant; the "no shard
-empty" assertion must go red.
+**How this test can fail — and it is run, not asserted.** `coversAllShards()`
+*returns* a verdict rather than asserting one, so the suite runs it against a
+deliberately constant router and requires the answer to be "no". Without that,
+"no empty shard" might hold because the checker cannot see an empty shard.
+
+**"Writes to distinct shards proceed concurrently" is deliberately NOT timed.**
+Phase 5 taught the sharper rule: a count is no better than a stopwatch when the
+count is timing-dependent. What is asserted instead is the property that makes
+concurrency possible and is exactly checkable — each shard commits its own
+writes in its own transactions, so a shard with no traffic must show **zero**
+commits. Measured: 50 commits on the addressed shard, 0 on every other.
 
 ---
+
+## All six phases complete — 2026-08-03
+
+codec → framing → TCP loopback → arguments → shape cache → group commit →
+shard routing. What exists is a working spine, not a product: there is no
+authentication, no TLS, no connection pooling, no backpressure policy, and the
+server handles one connection at a time. Those are the next honest steps if
+this ever becomes something to run.
+
+What the six phases do establish is that the thesis holds end to end — a CALL
+is the request, the declared shape is the contract, and a client that knows the
+contract at build time never has to be told it.
 
 ## Open questions carried forward
 

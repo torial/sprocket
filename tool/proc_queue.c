@@ -302,6 +302,7 @@ static int gatedRun(const char *zFile, int nBatchMax, int nItem,
   return nCommits;
 }
 
+#ifndef PROC_QUEUE_NO_MAIN
 int main(int argc, char **argv){
   int nRows, nDist, c;
 
@@ -332,3 +333,4 @@ int main(int argc, char **argv){
          nFail ? "PROC_QUEUE FAILED" : "PROC_QUEUE OK", nCheck, nFail);
   return nFail ? 1 : 0;
 }
+#endif /* PROC_QUEUE_NO_MAIN */
