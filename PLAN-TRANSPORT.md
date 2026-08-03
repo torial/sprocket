@@ -16,7 +16,8 @@ context loss — if you are a later session picking this up, this file plus
 | Wire **transport** phase 2 (TCP loopback) | done, `tool/proc_server.c`, 15 checks |
 | Wire **transport** phase 3 (arguments) | done |
 | Wire **transport** phase 4 (shape cache) | done, 34.9% saved on the wire |
-| Wire **transport** phases 5-6 | ← this plan |
+| Wire **transport** phase 5 (group commit) | done, `tool/proc_queue.c`, 6 checks |
+| Wire **transport** phase 6 | ← this plan |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into
@@ -150,7 +151,7 @@ would serve a client wrong column names after a migration.
 
 ---
 
-## Phase 5 — one writer thread, group commit
+## Phase 5 — one writer thread, group commit — **DONE**
 
 **Deliverable.** Per database: a queue, one writer thread, drain up to K items
 into one `BEGIN IMMEDIATE` … `COMMIT`.
@@ -167,14 +168,34 @@ into one `BEGIN IMMEDIATE` … `COMMIT`.
   behind an interface so it can become one-queue-per-shard or be bypassed
   entirely — that is the isolation tactic for this phase.
 
-**Test, written first — deterministic, not timed.** Submit N=1000 writes from
-M=8 threads. Assert (a) all 1000 rows present, exactly once; (b) the number of
-*transactions* is far below 1000, proving batching actually happened. Count
-transactions with a commit hook, not with a stopwatch.
+**Test as specified, and why it was WRONG.** The plan said: submit 1000 writes
+from 8 threads, count transactions with a commit hook, assert the count is far
+below 1000. That was built, and it passes — but the number it produces is not
+deterministic. It measures how many items happened to arrive while a commit was
+in flight, which is *scheduling*. The same workload went from 251 commits to
+868 after an unrelated change to how waiters are woken, and "batches grow with
+concurrency" held from 8→32 writers and then reversed at 64.
 
-**How this test can fail.** Set K=1 (no batching); the transaction-count
-assertion must go red. This is the check that proves the metric measures
-batching rather than merely existing.
+**Sharper rule, learned here: counting rather than timing is not sufficient if
+the COUNT is itself timing-dependent.** A commit count under free-running
+concurrency is a stopwatch wearing a different hat.
+
+**What is actually deterministic**, and what the test now asserts: *if K items
+are queued when the writer takes a batch, exactly one transaction commits them.*
+The writer is gated, a known number of items is queued, the gate opens, and the
+commit count is asserted **exactly** — 64 items at K=64 is 1 transaction, at
+K=16 is 4, at K=1 is 64. Identical across runs.
+
+**How this test can fail.** K=1 must give exactly one transaction per item; if
+it does not, the commit hook is not counting transactions and nothing else
+holds. That control runs *first*, before the interesting cases.
+
+**Two harness bugs worth remembering.** The gate must be created *before* the
+writer thread, and checked *after* the wait for work rather than at the top of
+the loop — otherwise the writer is already parked inside the loop and the first
+batch escapes the gate. And an orphaned `proc_queue.exe` from a failed run held
+the binary so the next `cl` blocked, which presented as a hang in the code; kill
+stale processes before diagnosing a build that stopped talking.
 
 ---
 
