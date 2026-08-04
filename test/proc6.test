@@ -86,9 +86,9 @@ do_test 2.1 {
   }
 } {1 0 id 1 1 title 1 2 comments}
 
-do_catchsql_test 2.1b {
-  CALL pwc(1)
-} {1 {procedure pwc declares a nested result table, which cannot yet be streamed by CALL}}
+do_execsql_test 2.1b {
+  CALL pwc(1);
+} {1 first}
 
 # Two nested tables in one shape: three SELECTs, parent first.
 do_execsql_test 2.2 {
@@ -367,18 +367,35 @@ do_execsql_test 5.1 {
 } {n}
 
 #--------------------------------------------------------------------
-# 6.x: CALL is refused until the nested column can be streamed
+# 6.x: what CALL of a nested procedure streams
 #
-# Measured before the guard existed: sqlite3_column_count reported the 3
-# DECLARED columns while the parent SELECT wrote 2 result registers, so
-# "CALL pwc(1)" returned "1 first 0.0" -- a third value read from a register
-# the body never assigned.  Reporting the scalar count instead would drop the
-# nested table with no indication it was declared, which is quieter and no
-# more honest.  Phase 5 lifts this.
+# History worth keeping, because it is why the metadata is built the way it is.
+# When the declared shape drove the result-column metadata directly,
+# sqlite3_column_count reported the 3 DECLARED columns while the parent SELECT
+# wrote 2 result registers, and "CALL pwc(1)" returned "1 first 0.0" -- a third
+# value read from a register the body never assigned.  CALL was refused
+# outright until the metadata was rebuilt per SEGMENT rather than per shape.
 #
-do_catchsql_test 6.0 {
-  CALL pwc(1)
-} {1 {procedure pwc declares a nested result table, which cannot yet be streamed by CALL}}
+# The parent segment now reports its VALUE columns, and the nested table is
+# streamed as the segment that follows.  The flat client's single wide row
+# (phase 5b) is layered on top of this and is not here yet.
+#
+do_test 6.0 {
+  set S [sqlite3_prepare_v2 db {CALL pwc(1)} -1 TAIL]
+  set n [sqlite3_column_count $S]
+  set nm {}
+  for {set i 0} {$i < $n} {incr i} { lappend nm [sqlite3_column_name $S $i] }
+  set rows {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend rows [sqlite3_column_text $S 1]
+  }
+  set adv [sqlite3_proc_next_resultset $S]
+  set n2 [sqlite3_column_count $S]
+  set nm2 {}
+  for {set i 0} {$i < $n2} {incr i} { lappend nm2 [sqlite3_column_name $S $i] }
+  sqlite3_finalize $S
+  list $n $nm $rows $adv $n2 $nm2
+} {2 {id title} first SQLITE_OK 3 {post_id cid body}}
 
 # The refusal is about nesting, not about declared shapes: a procedure that
 # declares a shape and nests nothing still calls.  Without this the guard
@@ -410,13 +427,10 @@ do_execsql_test 6.2 {
 # Moving it earlier silently discards the tally registration below, and 7.0
 # then goes red for a reason that has nothing to do with what it measures.
 #
-# Confirmed separately, with the CALL guard temporarily bypassed in a scratch
-# build, that a ONE-shape procedure holding a nested table behaves identically
-# to the two-shape "seg" below -- 1 row delivered, 0 children scanned.  The set
+# Section 8 re-pins this for an actual NESTED procedure, which was only
+# measurable in a scratch build until the CALL guard was lifted.  The set
 # boundary comes from the body's structure (each top-level SELECT ends a set),
-# not from the number of declared shapes, so this result governs the nested
-# case and not merely a similar one.  That check cannot live here while CALL is
-# refused; phase 5 must re-pin it.
+# not from the number of declared shapes.
 #
 proc tally_cb {v} { incr ::nscan ; return $v }
 db function tally tally_cb
@@ -475,5 +489,83 @@ do_test 7.4 {
   sqlite3_finalize $S
   set n
 } {1}
+
+#--------------------------------------------------------------------
+# 8.x: the imposed ordering, end to end
+#
+# Its own fixture, because the ordering can only be demonstrated when the
+# child table's SCAN order differs from its KEY order.  Comments are inserted
+# so that rowid order gives post_ids 2 1 2 1 while key order gives 1 1 2 2 --
+# two answers that cannot be confused for one another.
+#
+do_execsql_test 8.0 {
+  CREATE TABLE p2(id INTEGER PRIMARY KEY);
+  CREATE TABLE c2(cid INTEGER PRIMARY KEY, pid INTEGER);
+  INSERT INTO p2 VALUES(1),(2);
+  INSERT INTO c2 VALUES(1,2),(2,1),(3,2),(4,1);
+  SELECT pid FROM c2;
+} {2 1 2 1}
+
+proc seg2keys {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  set adv [sqlite3_proc_next_resultset $S]
+  set r {}
+  if {$adv eq "SQLITE_OK"} {
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} { lappend r [sqlite3_column_int $S 0] }
+  }
+  sqlite3_finalize $S
+  return $r
+}
+
+# CONTROL: an identical body whose second SELECT feeds a DECLARED SHAPE rather
+# than a nested table gets no ordering, so it returns scan order.  Without this
+# the grouped result below would not distinguish the engine's work from the
+# table happening to be stored that way.
+do_execsql_test 8.1 {
+  CREATE PROCEDURE ord_flat() RETURNS TABLE(id INTEGER)
+                              RETURNS TABLE(pid INTEGER, cid INTEGER)
+  BEGIN SELECT id FROM p2; SELECT pid, cid FROM c2; END;
+} {}
+do_test 8.2 { seg2keys {CALL ord_flat()} } {2 1 2 1}
+
+# THE MEASUREMENT: same body, second SELECT feeds a nested table.
+do_execsql_test 8.3 {
+  CREATE PROCEDURE ord_nest()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(pid INTEGER, cid INTEGER) KEY(pid = id))
+  BEGIN SELECT id FROM p2; SELECT pid, cid FROM c2; END;
+} {}
+do_test 8.4 { seg2keys {CALL ord_nest()} } {1 1 2 2}
+# Observed red, not merely believed capable of it: with the pOrderBy assignment
+# in procLowerChild disabled, 8.4 -- and 8.4 ALONE out of 46 -- returns
+# 2 1 2 1.  Wrong grouping, no error: POC 2's signature exactly.  Nothing else
+# in this suite detects the ordering, which is why this case matters.
+
+do_execsql_test 8.4b {
+  CREATE PROCEDURE lazy_nest()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(pid INTEGER, cid INTEGER) KEY(pid = id))
+  BEGIN SELECT id FROM p2; SELECT pid, tally(cid) FROM c2; END;
+} {}
+
+# Laziness, now against a genuinely nested procedure rather than a two-shape
+# stand-in: stopping at the parent segment scans no children.
+do_test 8.5 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL lazy_nest()} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {0}
+do_test 8.6 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL lazy_nest()} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {4}
 
 finish_test

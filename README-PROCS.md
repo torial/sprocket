@@ -220,11 +220,13 @@ One property is intentionally **not** enforced:
 
 ## Known limitations (deliberate, v1)
 
-- **`CALL` of a procedure with a nested table is refused** (branch
-  `nested-shapes`). The declaration parses, is conformance-checked and is
-  introspectable, so `procgen` can consume it; streaming it needs the
-  client-visible column, which is not built yet. The error is explicit at
-  prepare rather than a silently narrowed or fabricated column.
+- **A nested table streams as its own segment, not yet as a column** (branch
+  `nested-shapes`). `CALL` works: the parent segment reports its value columns
+  and each nested table follows as the next segment, ordered by the correlation
+  key. What is missing is the flat client's single wide row — so a stock
+  `sqlite3` CLI sees the parent columns and stops, rather than seeing the
+  nested data as JSON. Segment-aware clients are complete; the invariant is
+  not met until that column lands.
 - No `OUT`/`INOUT` parameters (result sets cover most cases; planned later).
 - Per-column types of declared shapes are advisory (see above).
 - `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is **not**

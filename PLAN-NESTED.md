@@ -427,18 +427,19 @@ Measured end to end — identical bodies, only the declaration differing:
 | two shapes, no nesting *(control)* | `2 1 2 1` — scan order |
 | one shape with a nested table | **`1 1 2 2`** — grouped by the key |
 
-**Still not permanent tests.** The phase 2 guard still refuses `CALL`, so the
-table above lives here rather than in `proc6`. Only the *rejections* are pinned.
-This is now the largest carried risk on the branch: phases 3 and 5a are verified
-by measurements recorded in prose, not by the suite.
+**Guard lifted, and every measurement above is now a test.** The guard was
+raised because a nested `CALL` fabricated a value from an unwritten register.
+That is fixed by the per-segment metadata, so what remained was only the flat
+client's missing column — incomplete rather than wrong, a materially weaker
+objection than the one it was raised against. `proc6` grew from 38 cases to 46
+and now pins the streaming contract, the ordering, and laziness against a
+genuinely nested procedure rather than a two-shape stand-in.
 
-**Decision needed before 5b:** whether to lift the guard now. It was added
-because a nested `CALL` fabricated a value from an unwritten register — that is
-fixed, and the metadata is now honest about what it describes. What remains
-missing is only the flat client's third column, so lifting would leave a stock
-CLI seeing two columns and no nested data: incomplete rather than wrong. That is
-a materially weaker objection than the one the guard was raised against, and
-lifting converts every measurement above into a permanent test.
+**Phase 3's stated way-to-fail was run.** With the `pOrderBy` assignment
+disabled, `proc6-8.4` — and 8.4 *alone* out of 46 — returns `2 1 2 1`: wrong
+grouping, no error, POC 2's signature. Nothing else in the suite detects the
+ordering, so that one case carries it. Observed red, not merely believed capable
+of it.
 
 ## Phase 5b — the flat-client column
 
