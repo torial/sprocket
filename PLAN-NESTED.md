@@ -424,6 +424,28 @@ carried. Two "everything green" reports covered three suites that never ran. The
 harness now prints `SUITE_COUNT` and the caller checks the number of result
 lines against it.
 
+## UPSTREAM SUITE, 2026-08-04 — clean
+
+`veryquick` on the release build: **393,523 tests, 7 errors, and all seven are
+`proc4c`** — this branch's own phase 4 spec, which is red by design. **No
+upstream regression.**
+
+The magnitude was stated before the run and matters as much as the result: a
+`veryquick` that finishes at a few thousand has short-circuited, and its clean
+report would mean nothing. 393k is the right size (the wal2 port measured
+393,363 on the same suite).
+
+**The question this answered.** `nHiddenCol` was added to the `Vdbe` and is
+subtracted in `sqlite3_column_count` and `sqlite3_data_count` — read by every
+client of the library. Nothing in this branch ever sets it; it relies on the
+`Vdbe` being allocated zeroed. If any allocation path did otherwise, column
+counts would be garbage for *every statement in SQLite*, and 393k tests
+exercising those two functions is where that shows. It didn't.
+
+**Note for future runs:** `veryquick` picks up this directory's test files, so
+it will report those 7 until phase 4 lands. A future run should check that the
+failure list is *exactly* `proc4c-*` rather than that the count is 7.
+
 ## NEXT ACTIONS — start here
 
 *Written so a reader with no memory of the session can continue without
