@@ -307,6 +307,18 @@ do_catchsql_test 4.8 {
 
 # LIMIT is refused because its meaning per parent row is undefined, and an
 # imposed ORDER BY silently changes which rows it keeps.
+# A compound child SELECT is refused: the imposed ORDER BY term is a copy of
+# the leftmost arm's projection, which is not legal for a compound.
+do_catchsql_test 4.8b {
+  CREATE PROCEDURE o1b(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments UNION ALL SELECT 1, 'x';
+  END;
+} {1 {the SELECT for nested table comments of procedure o1b may not be a compound SELECT}}
+
 do_catchsql_test 4.9 {
   CREATE PROCEDURE o2(pid INTEGER)
     RETURNS TABLE(id INTEGER,

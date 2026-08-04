@@ -387,7 +387,60 @@ and passes.
 
 ---
 
-## Phase 5 — the flat-client column
+## Phase 5a — segment reachability — **DONE**; 5b (the folded column) pending
+
+`sqlite3VdbeSetProcShapes` built one descriptor per **declared shape**, so a
+shape holding a nested table left its child segment with no metadata and
+`next_resultset()` returned `SQLITE_DONE` at the parent's end — the child rows
+were *unreachable*, not merely unvisited. It now builds one descriptor per
+**segment**: the parent carrying only its value columns, then one per nested
+table in declaration order. This is the **unfolded** view, the one `procgen`'s
+reassembler consumes; 5b layers the flat client's wide row on top.
+
+That made phase 3 testable end to end, which immediately found phase 3 wrong.
+
+### The phase 3 bug this exposed
+
+The imposed `ORDER BY` was built as a constructed `TK_INTEGER` — the ordinal
+form, `ORDER BY 1`. **A constructed integer is not resolved as an ordinal the
+way a parsed one is.** It sorted by a *constant*: a no-op that still emits
+sorter opcodes. Every static check agreed the body was ordered while rows came
+back in scan order.
+
+This is worth remembering as a class. The `bytecode()` instrument was *correct*
+— five sorter opcodes really were present — and I read "sorter present" as
+"ordering imposed", which is a different claim. The filtered opcode dump that
+seemed to confirm the sort key made it worse: I selected eight opcode names,
+saw `Column 1 1` reading `post_id` near the sorter, and read a partial listing
+as though it were the program. The `Column` I was looking at was the projection,
+not the key.
+
+Fixed by sorting on a **copy of the projected expression** rather than an
+ordinal, which cannot drift from what the column actually yields. A compound
+child `SELECT` is now refused, since that term belongs to the leftmost arm and
+is not legal for a compound.
+
+Measured end to end — identical bodies, only the declaration differing:
+
+| | child rows returned |
+|---|---|
+| two shapes, no nesting *(control)* | `2 1 2 1` — scan order |
+| one shape with a nested table | **`1 1 2 2`** — grouped by the key |
+
+**Still not permanent tests.** The phase 2 guard still refuses `CALL`, so the
+table above lives here rather than in `proc6`. Only the *rejections* are pinned.
+This is now the largest carried risk on the branch: phases 3 and 5a are verified
+by measurements recorded in prose, not by the suite.
+
+**Decision needed before 5b:** whether to lift the guard now. It was added
+because a nested `CALL` fabricated a value from an unwritten register — that is
+fixed, and the metadata is now honest about what it describes. What remains
+missing is only the flat client's third column, so lifting would leave a stock
+CLI seeing two columns and no nested data: incomplete rather than wrong. That is
+a materially weaker objection than the one the guard was raised against, and
+lifting converts every measurement above into a permanent test.
+
+## Phase 5b — the flat-client column
 
 **Deliverable.** The third column, lazy: materialised as JSON only when a
 client actually reads it. BLOB children base64-encoded (R6); `ext/misc/base64.c`

@@ -2960,9 +2960,29 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
   ProcShape *pS;
   int nSet = 0, maxCol = 0, i;
 
+  /* One descriptor per SEGMENT, not per declared shape.  A shape holding k
+  ** nested tables is streamed as 1+k segments -- the parent carrying only its
+  ** value columns, then one per nested table in declaration order -- so a
+  ** descriptor per shape left the child segments with no metadata and
+  ** sqlite3_proc_next_resultset() reporting SQLITE_DONE at the parent's end.
+  ** The child rows were unreachable, not merely unvisited.
+  **
+  ** This is the UNFOLDED view: the one a segment-aware client (procgen's
+  ** reassembler) consumes.  The flat client's single wide row is layered on
+  ** top of it. */
   for(pS=pShapes; pS; pS=pS->pNext){
-    if( pS->pCols==0 ) return;               /* RETURNS NOTHING */
-    if( pS->pCols->nParam>maxCol ) maxCol = pS->pCols->nParam;
+    ProcParamList *pC = pS->pCols;
+    int nVal = 0;
+    if( pC==0 ) return;                      /* RETURNS NOTHING */
+    for(i=0; i<pC->nParam; i++){
+      if( pC->a[i].pNested ){
+        nSet++;
+        if( pC->a[i].pNested->nParam>maxCol ) maxCol = pC->a[i].pNested->nParam;
+      }else{
+        nVal++;
+      }
+    }
+    if( nVal>maxCol ) maxCol = nVal;
     nSet++;
   }
   if( nSet==0 || maxCol==0 ) return;
@@ -2971,19 +2991,44 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
   p->aProcSet = sqlite3DbMallocZero(db, nSet*sizeof(VdbeProcSet));
   if( p->aProcSet==0 ) return;
   p->nProcSet = (u8)nSet;
-  for(i=0, pS=pShapes; pS; pS=pS->pNext, i++){
+  i = 0;
+  for(pS=pShapes; pS; pS=pS->pNext){
     ProcParamList *pC = pS->pCols;
-    VdbeProcSet *pDest = &p->aProcSet[i];
-    int j;
-    pDest->nCol = (u16)pC->nParam;
-    pDest->azName = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
-    pDest->azType = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
-    if( pDest->azName==0 || pDest->azType==0 ) return;
+    VdbeProcSet *pDest = &p->aProcSet[i++];
+    int j, nVal = 0;
     for(j=0; j<pC->nParam; j++){
-      pDest->azName[j] = sqlite3DbStrDup(db, pC->a[j].zName);
-      pDest->azType[j] = sqlite3DbStrDup(db, pC->a[j].zType);
+      if( pC->a[j].pNested==0 ) nVal++;
+    }
+    pDest->nCol = (u16)nVal;
+    pDest->azName = sqlite3DbMallocZero(db, nVal*sizeof(char*));
+    pDest->azType = sqlite3DbMallocZero(db, nVal*sizeof(char*));
+    if( pDest->azName==0 || pDest->azType==0 ) return;
+    nVal = 0;
+    for(j=0; j<pC->nParam; j++){
+      if( pC->a[j].pNested ) continue;
+      pDest->azName[nVal] = sqlite3DbStrDup(db, pC->a[j].zName);
+      pDest->azType[nVal] = sqlite3DbStrDup(db, pC->a[j].zType);
+      nVal++;
+    }
+    /* Then one segment per nested table, in declaration order -- the order
+    ** the body's SELECTs must follow, which conformance already enforced. */
+    for(j=0; j<pC->nParam; j++){
+      ProcParamList *pN = pC->a[j].pNested;
+      VdbeProcSet *pKid;
+      int m;
+      if( pN==0 ) continue;
+      pKid = &p->aProcSet[i++];
+      pKid->nCol = (u16)pN->nParam;
+      pKid->azName = sqlite3DbMallocZero(db, pN->nParam*sizeof(char*));
+      pKid->azType = sqlite3DbMallocZero(db, pN->nParam*sizeof(char*));
+      if( pKid->azName==0 || pKid->azType==0 ) return;
+      for(m=0; m<pN->nParam; m++){
+        pKid->azName[m] = sqlite3DbStrDup(db, pN->a[m].zName);
+        pKid->azType[m] = sqlite3DbStrDup(db, pN->a[m].zType);
+      }
     }
   }
+  assert( i==nSet );
   sqlite3VdbeSetNumCols(p, maxCol);
   if( db->mallocFailed ) return;
   sqlite3VdbeApplyProcSet(p, 0);

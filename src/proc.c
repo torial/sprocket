@@ -342,7 +342,6 @@ static void procCheckLoopBody(ProcConf *p, TriggerStep *pList){
 static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
   Select *pSel = pStep->pSelect;
   sqlite3 *db = p->pParse->db;
-  char zNum[30];
 
   /* An ORDER BY the author wrote is refused rather than overridden or merged.
   ** Overriding would discard something they wrote, silently, which is the
@@ -371,9 +370,27 @@ static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
     return 1;
   }
 
-  sqlite3_snprintf(sizeof(zNum), zNum, "%d", pE->iKeyCol);
+  /* A compound child SELECT is refused rather than half-handled: the term
+  ** built below belongs to the leftmost arm's projection, which is not a legal
+  ** ORDER BY for a compound. */
+  if( pSel->pPrior ){
+    sqlite3ErrorMsg(p->pParse,
+      "the SELECT for nested table %s of procedure %s%s may not be a compound "
+      "SELECT", pE->zNested, p->zName, p->zWhere);
+    p->nErr = 1;
+    return 1;
+  }
+  if( pSel->pEList==0 || pE->iKeyCol>pSel->pEList->nExpr ) return 0;
+
+  /* Sort by a COPY OF THE PROJECTED EXPRESSION rather than by the ordinal
+  ** "ORDER BY <n>".  A constructed TK_INTEGER is not resolved as an ordinal
+  ** the way a parsed one is: it sorts by a constant, which is a no-op that
+  ** still emits sorter opcodes -- so the body looked ordered to every static
+  ** check while returning rows in scan order.  Measured: rows came back in
+  ** rowid order with five Sorter opcodes present.  Duplicating the projection
+  ** cannot drift from what the column actually yields. */
   pSel->pOrderBy = sqlite3ExprListAppend(p->pParse, 0,
-                                         sqlite3Expr(db, TK_INTEGER, zNum));
+      sqlite3ExprDup(db, pSel->pEList->a[pE->iKeyCol-1].pExpr, 0));
   return 0;
 }
 
