@@ -2955,7 +2955,7 @@ void sqlite3VdbeApplyProcSet(Vdbe *p, int iSet){
 ** A no-op (leaving legacy behavior in place) if the procedure declares
 ** no shapes.
 */
-void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
+void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes, IdList *pProj){
   sqlite3 *db = p->db;
   ProcShape *pS;
   int nSet = 0, maxCol = 0, i;
@@ -2985,7 +2985,12 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
     /* The parent descriptor reports ALL declared columns, including the nested
     ** ones: phase 5b puts a generated correlated subquery in the parent SELECT
     ** at each nested position, so the row genuinely has that many registers. */
-    if( pC->nParam>maxCol ) maxCol = pC->nParam;
+    { int nKeep = 0;
+      for(i=0; i<pC->nParam; i++){
+        if( sqlite3ProcProjKeeps(pProj, pC->a[i].zName) ) nKeep++;
+      }
+      if( nKeep>maxCol ) maxCol = nKeep;
+    }
     nSet++;
   }
   if( nSet==0 || maxCol==0 ) return;
@@ -2999,13 +3004,20 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
     ProcParamList *pC = pS->pCols;
     VdbeProcSet *pDest = &p->aProcSet[i++];
     int j;
-    pDest->nCol = (u16)pC->nParam;
-    pDest->azName = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
-    pDest->azType = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
-    if( pDest->azName==0 || pDest->azType==0 ) return;
-    for(j=0; j<pC->nParam; j++){
-      pDest->azName[j] = sqlite3DbStrDup(db, pC->a[j].zName);
-      pDest->azType[j] = sqlite3DbStrDup(db, pC->a[j].zType);
+    { int nKeep = 0, k = 0;
+      for(j=0; j<pC->nParam; j++){
+        if( sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) nKeep++;
+      }
+      pDest->nCol = (u16)nKeep;
+      pDest->azName = sqlite3DbMallocZero(db, (nKeep+1)*sizeof(char*));
+      pDest->azType = sqlite3DbMallocZero(db, (nKeep+1)*sizeof(char*));
+      if( pDest->azName==0 || pDest->azType==0 ) return;
+      for(j=0; j<pC->nParam; j++){
+        if( !sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) continue;
+        pDest->azName[k] = sqlite3DbStrDup(db, pC->a[j].zName);
+        pDest->azType[k] = sqlite3DbStrDup(db, pC->a[j].zType);
+        k++;
+      }
     }
     /* Then one segment per nested table, in declaration order -- the order
     ** the body's SELECTs must follow, which conformance already enforced. */

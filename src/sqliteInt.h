@@ -3835,6 +3835,7 @@ typedef struct ProcPrg ProcPrg;
 struct ProcPrg {
   int nProcSet;             /* Declared result sets coded so far */
   Proc *pProc;            /* Procedure this program was coded from */
+  IdList *pProj;          /* RETURNING projection, or 0 for all columns */
   ProcPrg *pNext;         /* Next entry in Parse.pProcPrg list */
   SubProgram *pProgram;   /* Program implementing the procedure body */
   int nResCol;            /* Result columns, or -1 if no result rows */
@@ -5446,7 +5447,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3FinishProc(Parse*,Token*,Token*,ProcParamList*,ProcShape*,
                          TriggerStep*,int,int,Token*,int);
   void sqlite3DropProc(Parse*, SrcList*, int);
-  void sqlite3CallProc(Parse*, SrcList*, ExprList*);
+  void sqlite3CallProc(Parse*, SrcList*, ExprList*, IdList*);
   void sqlite3DeleteProc(sqlite3*, Proc*);
   void sqlite3UnlinkAndDeleteProc(sqlite3*, int, const char*);
   ProcParamList *sqlite3ProcParamAppend(Parse*,ProcParamList*,Token*,Token*);
@@ -5462,7 +5463,8 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   TriggerStep *sqlite3ProcCallStep(Parse*, SrcList*, ExprList*);
   void sqlite3ProcCacheFlush(sqlite3*);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
-  void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*);
+  void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*);
+  int sqlite3ProcProjKeeps(IdList*,const char*);
   void sqlite3VdbeApplyProcSet(Vdbe*, int);
   char **sqlite3VdbeCaptureColumnNames(Vdbe*, int);
   TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);

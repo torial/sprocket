@@ -2006,10 +2006,10 @@ cmd ::= DROP PROCEDURE ifexists(NOERR) fullname(X). {
 
 ///////////////////////////// The CALL statement //////////////////////////////
 cmd ::= CALL fullname(X) LP exprlist(Y) RP. {
-  sqlite3CallProc(pParse, X, Y);
+  sqlite3CallProc(pParse, X, Y, 0);
 }
 cmd ::= CALL fullname(X). {
-  sqlite3CallProc(pParse, X, 0);
+  sqlite3CallProc(pParse, X, 0, 0);
 }
 // DOCKET 3c, projection.  RETURNING is an existing token, so this is a
 // grammar-only probe: does it attach after CALL without conflicts?

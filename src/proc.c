@@ -382,7 +382,8 @@ static void procTokenSet(Token *pTok, const char *z){
 ** Operates on a Select* rather than on the body statement, because this now
 ** runs at CALL-compile time against a COPY.  The stored body stays canonical.
 */
-static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols){
+static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
+                          IdList *pProj){
   sqlite3 *db = pParse->db;
   Select *pInner = *ppSel;
   Select *pWrap;
@@ -399,13 +400,14 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols){
     sqlite3DbFree(db, pInner->pEList->a[iVal].zEName);
     pInner->pEList->a[iVal].zEName = sqlite3DbStrDup(db, pCols->a[j].zName);
     pInner->pEList->a[iVal].fg.eEName = ENAME_NAME;
+    iVal++;
+    if( !sqlite3ProcProjKeeps(pProj, pCols->a[j].zName) ) continue;
     procTokenSet(&tTab, PROC_PARENT_ALIAS);
     procTokenSet(&tCol, pCols->a[j].zName);
     pDot = sqlite3PExpr(pParse, TK_DOT,
              sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
              sqlite3ExprAlloc(db, TK_ID, &tCol, 0));
     pOuter = sqlite3ExprListAppend(pParse, pOuter, pDot);
-    iVal++;
   }
   if( pOuter==0 ) return 1;
 
@@ -436,7 +438,8 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols){
 ** references: the declaration is the interface, so a body's SELECT need not
 ** spell its columns the way the shape does.
 */
-static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
+static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
+                              IdList *pProj){
   sqlite3 *db = pParse->db;
   ExprList *pArgs = 0, *pOld, *pPE;
   Expr *pObj, *pAgg, *pSel, *pEq;
@@ -500,11 +503,19 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
   pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
   if( pPE==0 ) return;
   pWrap->pEList = pPE;
-  if( pF->iDeclPos < pPE->nExpr-1 ){
-    struct ExprList_item tmp = pPE->a[pPE->nExpr-1];
-    memmove(&pPE->a[pF->iDeclPos+1], &pPE->a[pF->iDeclPos],
-            (pPE->nExpr-1-pF->iDeclPos)*sizeof(pPE->a[0]));
-    pPE->a[pF->iDeclPos] = tmp;
+  {
+    /* Position is counted over the columns that SURVIVED the projection, not
+    ** over the declaration: dropping an earlier column shifts this one left. */
+    int iPos = 0, k;
+    for(k=0; k<pF->iDeclPos && k<pF->pShapeCols->nParam; k++){
+      if( sqlite3ProcProjKeeps(pProj, pF->pShapeCols->a[k].zName) ) iPos++;
+    }
+    if( iPos < pPE->nExpr-1 ){
+      struct ExprList_item tmp = pPE->a[pPE->nExpr-1];
+      memmove(&pPE->a[iPos+1], &pPE->a[iPos],
+              (pPE->nExpr-1-iPos)*sizeof(pPE->a[0]));
+      pPE->a[iPos] = tmp;
+    }
   }
 }
 
@@ -514,18 +525,35 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
 ** nested tables the shape holds.  A no-op for a procedure that nests nothing,
 ** which is why this can sit unconditionally on the codegen path.
 */
+/*
+** True if a RETURNING projection keeps the named declared column.  A NULL
+** projection keeps everything, which is what an unmodified client sends and
+** is why the invariant survives this feature.
+*/
+int sqlite3ProcProjKeeps(IdList *pProj, const char *zName){
+  int i;
+  if( pProj==0 ) return 1;
+  for(i=0; i<pProj->nId; i++){
+    if( sqlite3StrICmp(pProj->a[i].zName, zName)==0 ) return 1;
+  }
+  return 0;
+}
+
 static void procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
-                           TriggerStep *pStep){
+                           TriggerStep *pStep, IdList *pProj){
   ProcFold *pF;
   int bWrapped = 0;
   if( pProc==0 || pProc->pFolds==0 || *ppSel==0 ) return;
   for(pF=pProc->pFolds; pF; pF=pF->pNext){
     if( pF->pParent!=pStep ) continue;
+    /* Projected away: generate nothing.  The child segment still streams --
+    ** the clause selects generated COLUMNS, not segments. */
+    if( !sqlite3ProcProjKeeps(pProj, pF->zName) ) continue;
     if( !bWrapped ){
-      if( procWrapParent(pParse, ppSel, pF->pShapeCols) ) return;
+      if( procWrapParent(pParse, ppSel, pF->pShapeCols, pProj) ) return;
       bWrapped = 1;
     }
-    procAddFoldColumn(pParse, *ppSel, pF);
+    procAddFoldColumn(pParse, *ppSel, pF, pProj);
   }
 }
 
@@ -1614,9 +1642,13 @@ static void codeProcProgram(
         break;
       }
       case TK_CALL: {
+        /* A CALL inside a procedure body never projects: RETURNING is a
+        ** client-facing clause, and R4 restricts an inner CALL to a
+        ** RETURNS NOTHING procedure, which has no columns to project. */
         sqlite3CallProc(pParse,
           sqlite3SrcListDup(db, pStep->pSrc, 0),
-          sqlite3ExprListDup(db, pStep->pExprList, 0)
+          sqlite3ExprListDup(db, pStep->pExprList, 0),
+          0
         );
         break;
       }
@@ -1758,7 +1790,7 @@ static void codeProcProgram(
           /* The flat-client column is generated HERE, onto the copy, rather
           ** than baked into the stored body -- so that it can be declined.
           ** A no-op for a procedure that nests nothing. */
-          procApplyFolds(pParse, &pSelect, pPrg->pProc, pStep);
+          procApplyFolds(pParse, &pSelect, pPrg->pProc, pStep, pPrg->pProj);
           if( lblLeave ){
             /* Inside a loop: subqueries must re-evaluate every iteration */
             procMarkVarSelect(pParse, 0, pSelect);
@@ -1802,7 +1834,7 @@ static void codeProcProgram(
 ** SubProgram.aOp is populated at the end of this function) instead of
 ** recursing forever.
 */
-static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
+static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc, IdList *pProj){
   Parse *pTop = sqlite3ParseToplevel(pParse);
   sqlite3 *db = pParse->db;
   ProcPrg *pPrg;
@@ -1832,6 +1864,7 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc){
   pProgram->nRef = 1;   /* owned by pTop->pVdbe's pProgram list */
   sqlite3VdbeLinkSubProgram(pTop->pVdbe, pProgram);
   pPrg->pProc = pProc;
+  pPrg->pProj = pProj;
   pPrg->nResCol = -1;
 
   /* Allocate and populate a new Parse context for coding the body */
@@ -2159,8 +2192,9 @@ void sqlite3CallProcProject(
     goto proj_cleanup;
   }
   if( procCheckProjection(pParse, pProc, pProj) ) goto proj_cleanup;
-
-  sqlite3ErrorMsg(pParse, "CALL ... RETURNING is not implemented yet");
+  sqlite3CallProc(pParse, pName, pArgs, pProj);
+  sqlite3IdListDelete(db, pProj);
+  return;
 
 proj_cleanup:
   sqlite3IdListDelete(db, pProj);
@@ -2168,7 +2202,8 @@ proj_cleanup:
   sqlite3ExprListDelete(db, pArgs);
 }
 
-void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
+void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
+                     IdList *pProj){
   sqlite3 *db = pParse->db;
   Proc *pProc = 0;
   ProcPrg *pPrg;
@@ -2259,7 +2294,10 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
   pTop = sqlite3ParseToplevel(pParse);
   for(pPrg=pTop->pProcPrg; pPrg && pPrg->pProc!=pProc; pPrg=pPrg->pNext){}
   if( pPrg==0 ){
-    ProcCacheEntry *pE = procCacheFind(pParse, pProc);
+    /* The cache is keyed by procedure, so a projected body must not enter it
+    ** or two projections would share one compiled program.  Bypassing is
+    ** correct today; keying by (procedure, projection) is the optimisation. */
+    ProcCacheEntry *pE = pProj ? 0 : procCacheFind(pParse, pProc);
     if( pE ){
       /* Cache hit: reuse the compiled body, replaying the toplevel
       ** bookkeeping that compiling it would have performed. */
@@ -2296,9 +2334,9 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
       }
     }else{
       void *pAincBefore = (void*)pTop->pAinc;
-      pPrg = codeProcBody(pParse, pProc);
+      pPrg = codeProcBody(pParse, pProc, pProj);
       if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
-      if( pParse->pToplevel==0 ){
+      if( pParse->pToplevel==0 && pProj==0 ){
         procCachePopulate(pParse, pProc, pPrg, pAincBefore);
       }
     }
@@ -2320,7 +2358,7 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
       /* Copies every declared shape onto the statement, sizes the column
       ** name array for the widest one, and applies set 1.  Advancing
       ** between sets at run time then swaps metadata without allocating. */
-      sqlite3VdbeSetProcShapes(vTop, pProc->pShapes);
+      sqlite3VdbeSetProcShapes(vTop, pProc->pShapes, pProj);
     }
   }
 
