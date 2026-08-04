@@ -2092,6 +2092,28 @@ static void procCachePopulate(
 ** ordinary sqlite3_step() interface.
 */
 /*
+** The word after WITH in "CALL ... WITH COUNTS".  COUNTS is deliberately an
+** ordinary identifier rather than a keyword -- the fork's other surfaces carry
+** the guarantee that they do not steal names, and this one must too.
+**
+** Phase 4 is not implemented; this refuses rather than accepting and ignoring,
+** because accepting the clause and returning no counts would make proc4c-2.0
+** pass (it expects -1) while 1.0 failed, which reads as a partial feature
+** rather than an absent one.
+*/
+int sqlite3ProcWithCounts(Parse *pParse, Token *pWord){
+  char *z = sqlite3NameFromToken(pParse->db, pWord);
+  if( z==0 ) return 0;
+  if( sqlite3StrICmp(z, "counts")!=0 ){
+    sqlite3ErrorMsg(pParse, "expected COUNTS after WITH, got %s", z);
+  }else{
+    sqlite3ErrorMsg(pParse, "WITH COUNTS is not implemented yet");
+  }
+  sqlite3DbFree(pParse->db, z);
+  return 0;
+}
+
+/*
 ** Validate a RETURNING projection against a procedure's declared shapes --
 ** DOCKET 3c, step 3a.  Returns non-zero if an error was reported.
 **

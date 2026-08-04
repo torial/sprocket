@@ -5465,6 +5465,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
   void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*);
   int sqlite3ProcProjKeeps(IdList*,const char*);
+  int sqlite3ProcWithCounts(Parse*,Token*);
   void sqlite3VdbeApplyProcSet(Vdbe*, int);
   char **sqlite3VdbeCaptureColumnNames(Vdbe*, int);
   TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);
