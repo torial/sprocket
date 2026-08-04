@@ -1378,6 +1378,7 @@ typedef struct sqlite3_str StrAccum; /* Internal alias for sqlite3_str */
 typedef struct Proc Proc;
 typedef struct ProcCacheEntry ProcCacheEntry;
 typedef struct ProcParam ProcParam;
+typedef struct ProcFold ProcFold;
 typedef struct ProcParamList ProcParamList;
 typedef struct ProcShape ProcShape;
 typedef struct Table Table;
@@ -4279,9 +4280,31 @@ struct ProcShape {
 ** sqlite_schema table.  The compiled-SubProgram cache (Proc.pCompiled) is
 ** added in a later phase.
 */
+/*
+** One nested table's FOLD RECIPE: everything codegen needs to build the
+** flat-client column for it, recorded at CREATE and applied at CALL.
+**
+** The recipe is recorded rather than applied at CREATE because the fold has to
+** become conditional -- a client may project it away (DOCKET 3c) -- and a fold
+** baked into the stored body cannot be declined.  The body stays canonical;
+** the generated column is built onto a COPY at compile time.
+*/
+struct ProcFold {
+  ProcFold *pNext;          /* Next recipe for this procedure */
+  TriggerStep *pParent;     /* Body statement producing the parent segment */
+  TriggerStep *pChild;      /* Body statement producing this nested table */
+  ProcParamList *pShapeCols;/* The whole shape, for wrapping the parent */
+  ProcParamList *pNested;   /* The nested table's declared columns */
+  const char *zName;        /* Nested table's declared name */
+  const char *zKeyParent;   /* Declared name of the parent-side key column */
+  int iDeclPos;             /* 0-based position within the shape */
+  int iKeyCol;              /* 1-based key position among the child's columns */
+};
+
 struct Proc {
   char *zName;              /* Name of the procedure */
   ProcParamList *pParams;   /* Declared parameters, or NULL if none */
+  ProcFold *pFolds;         /* Fold recipes, in declaration order */
   TriggerStep *pBody;       /* Linked list of body statements */
   Schema *pSchema;          /* Schema containing the procedure */
   ProcShape *pShapes;       /* Declared result shapes (PROC_RET_TABLES) */

@@ -379,12 +379,12 @@ static void procTokenSet(Token *pTok, const char *z){
 ** what makes them referenceable by name at all -- a projected expression need
 ** not have one.
 **
-** Called once per parent, however many nested tables it holds.
+** Operates on a Select* rather than on the body statement, because this now
+** runs at CALL-compile time against a COPY.  The stored body stays canonical.
 */
-static int procWrapParent(ProcConf *p, TriggerStep *pParent, ProcParamList *pCols){
-  Parse *pParse = p->pParse;
+static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols){
   sqlite3 *db = pParse->db;
-  Select *pInner = pParent->pSelect;
+  Select *pInner = *ppSel;
   Select *pWrap;
   ExprList *pOuter = 0;
   SrcList *pSrc;
@@ -395,8 +395,7 @@ static int procWrapParent(ProcConf *p, TriggerStep *pParent, ProcParamList *pCol
     Expr *pDot;
     Token tTab, tCol;
     if( pCols->a[j].pNested ) continue;
-    if( iVal>=pInner->pEList->nExpr ) return 1;
-    /* Alias the inner output to its declared name. */
+    if( pInner->pEList==0 || iVal>=pInner->pEList->nExpr ) return 1;
     sqlite3DbFree(db, pInner->pEList->a[iVal].zEName);
     pInner->pEList->a[iVal].zEName = sqlite3DbStrDup(db, pCols->a[j].zName);
     pInner->pEList->a[iVal].fg.eEName = ENAME_NAME;
@@ -421,46 +420,46 @@ static int procWrapParent(ProcConf *p, TriggerStep *pParent, ProcParamList *pCol
     return 1;
   }
   pWrap->pSrc = pSrc;
-  pParent->pSelect = pWrap;
+  *ppSel = pWrap;
   return 0;
 }
 
-static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
-  Parse *pParse = p->pParse;
+/*
+** Build one nested table's flat-client column onto an already-wrapped parent
+** SELECT -- PLAN-NESTED phase 5b, now applied at CALL-compile time.
+**
+**   (SELECT json_group_array(json_object('c1', jsonval(<c1 expr>), ...))
+**      FROM <the child's FROM>
+**     WHERE <the child's WHERE> AND <child key> = <alias>.<parent key>)
+**
+** Values are copies of the child's PROJECTED EXPRESSIONS, not column
+** references: the declaration is the interface, so a body's SELECT need not
+** spell its columns the way the shape does.
+*/
+static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
   sqlite3 *db = pParse->db;
-  TriggerStep *pParent = p->pParentStep;
   ExprList *pArgs = 0, *pOld, *pPE;
   Expr *pObj, *pAgg, *pSel, *pEq;
   Select *pSub;
   Token tk;
   int i;
 
-  if( pParent==0 || pParent->pSelect==0 ) return;
-  if( pParent->pSelect->pEList==0 ) return;
-  if( pE->pNested==0 || pE->iParentKeyCol<=0 ) return;
-  if( pE->pShapeCols==0 ) return;
-  if( p->bWrapped==0 ){
-    if( procWrapParent(p, pParent, pE->pShapeCols) ) return;
-    p->bWrapped = 1;
-  }
-  if( pE->iParentKeyCol>pParent->pSelect->pEList->nExpr ) return;
-
-  pSub = sqlite3SelectDup(db, pChild->pSelect, 0);
+  if( pF->pChild==0 || pF->pChild->pSelect==0 ) return;
+  pSub = sqlite3SelectDup(db, pF->pChild->pSelect, 0);
   if( pSub==0 ) return;
-  /* The imposed ordering is for the segment, not for this aggregate. */
-  sqlite3ExprListDelete(db, pSub->pOrderBy);
+  sqlite3ExprListDelete(db, pSub->pOrderBy);   /* the segment's, not ours */
   pSub->pOrderBy = 0;
   pOld = pSub->pEList;
-  if( pOld==0 || pOld->nExpr<pE->pNested->nParam || pE->iKeyCol>pOld->nExpr ){
+  if( pOld==0 || pOld->nExpr<pF->pNested->nParam || pF->iKeyCol>pOld->nExpr ){
     pSub->pEList = 0;
     sqlite3SelectDelete(db, pSub);
     sqlite3ExprListDelete(db, pOld);
     return;
   }
 
-  for(i=0; i<pE->pNested->nParam; i++){
+  for(i=0; i<pF->pNested->nParam; i++){
     Expr *pVal;
-    procTokenSet(&tk, pE->pNested->a[i].zName);
+    procTokenSet(&tk, pF->pNested->a[i].zName);
     pArgs = sqlite3ExprListAppend(pParse, pArgs,
               sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
     pVal = sqlite3ExprDup(db, pOld->a[i].pExpr, 0);
@@ -478,9 +477,9 @@ static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   {
     Token tTab, tCol;
     procTokenSet(&tTab, PROC_PARENT_ALIAS);
-    procTokenSet(&tCol, pE->zKeyParent);
+    procTokenSet(&tCol, pF->zKeyParent);
     pEq = sqlite3PExpr(pParse, TK_EQ,
-            sqlite3ExprDup(db, pOld->a[pE->iKeyCol-1].pExpr, 0),
+            sqlite3ExprDup(db, pOld->a[pF->iKeyCol-1].pExpr, 0),
             sqlite3PExpr(pParse, TK_DOT,
               sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
               sqlite3ExprAlloc(db, TK_ID, &tCol, 0)));
@@ -498,17 +497,59 @@ static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   }
   sqlite3PExprAddSelect(pParse, pSel, pSub);
 
-  /* Placed at the DECLARED position, which is not necessarily the end: a shape
-  ** may declare its nested table before the column it correlates on. */
-  pPE = sqlite3ExprListAppend(pParse, pParent->pSelect->pEList, pSel);
+  pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
   if( pPE==0 ) return;
-  pParent->pSelect->pEList = pPE;
-  if( pE->iDeclPos < pPE->nExpr-1 ){
+  pWrap->pEList = pPE;
+  if( pF->iDeclPos < pPE->nExpr-1 ){
     struct ExprList_item tmp = pPE->a[pPE->nExpr-1];
-    memmove(&pPE->a[pE->iDeclPos+1], &pPE->a[pE->iDeclPos],
-            (pPE->nExpr-1-pE->iDeclPos)*sizeof(pPE->a[0]));
-    pPE->a[pE->iDeclPos] = tmp;
+    memmove(&pPE->a[pF->iDeclPos+1], &pPE->a[pF->iDeclPos],
+            (pPE->nExpr-1-pF->iDeclPos)*sizeof(pPE->a[0]));
+    pPE->a[pF->iDeclPos] = tmp;
   }
+}
+
+/*
+** Apply every fold recipe belonging to body statement pStep onto *ppSel, which
+** is the CALL-time copy of that statement's SELECT.  Wraps once, however many
+** nested tables the shape holds.  A no-op for a procedure that nests nothing,
+** which is why this can sit unconditionally on the codegen path.
+*/
+static void procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
+                           TriggerStep *pStep){
+  ProcFold *pF;
+  int bWrapped = 0;
+  if( pProc==0 || pProc->pFolds==0 || *ppSel==0 ) return;
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    if( pF->pParent!=pStep ) continue;
+    if( !bWrapped ){
+      if( procWrapParent(pParse, ppSel, pF->pShapeCols) ) return;
+      bWrapped = 1;
+    }
+    procAddFoldColumn(pParse, *ppSel, pF);
+  }
+}
+
+/*
+** Record -- rather than apply -- one nested table's fold recipe.  See the
+** ProcFold comment in sqliteInt.h for why this is deferred to CALL.
+*/
+static void procRecordFold(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
+  sqlite3 *db = p->pParse->db;
+  ProcFold *pF, **pp;
+
+  if( p->pParentStep==0 || pE->pNested==0 || pE->pShapeCols==0 ) return;
+  pF = sqlite3DbMallocZero(db, sizeof(ProcFold));
+  if( pF==0 ) return;
+  pF->pParent = p->pParentStep;
+  pF->pChild = pChild;
+  pF->pShapeCols = pE->pShapeCols;
+  pF->pNested = pE->pNested;
+  pF->zName = pE->zNested;
+  pF->zKeyParent = pE->zKeyParent;
+  pF->iDeclPos = pE->iDeclPos;
+  pF->iKeyCol = pE->iKeyCol;
+  for(pp=&p->pProc->pFolds; *pp; pp=&(*pp)->pNext){}
+  *pp = pF;
 }
 
 /*
@@ -577,7 +618,7 @@ static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
   ** cannot drift from what the column actually yields. */
   pSel->pOrderBy = sqlite3ExprListAppend(p->pParse, 0,
       sqlite3ExprDup(db, pSel->pEList->a[pE->iKeyCol-1].pExpr, 0));
-  procFoldParent(p, pStep, pE);
+  procRecordFold(p, pStep, pE);
   return 0;
 }
 
@@ -895,6 +936,11 @@ void sqlite3ProcParamListDelete(sqlite3 *db, ProcParamList *pList){
 */
 void sqlite3DeleteProc(sqlite3 *db, Proc *pProc){
   if( pProc==0 ) return;
+  while( pProc->pFolds ){
+    ProcFold *pF = pProc->pFolds;
+    pProc->pFolds = pF->pNext;
+    sqlite3DbFree(db, pF);   /* borrows its pointers; owns none of them */
+  }
   sqlite3DeleteTriggerStep(db, pProc->pBody);
   sqlite3ProcParamListDelete(db, pProc->pParams);
   sqlite3ProcShapeListDelete(db, pProc->pShapes);
@@ -1709,6 +1755,10 @@ static void codeProcProgram(
         }else{
           SelectDest sDest;
           Select *pSelect = sqlite3SelectDup(db, pStep->pSelect, 0);
+          /* The flat-client column is generated HERE, onto the copy, rather
+          ** than baked into the stored body -- so that it can be declined.
+          ** A no-op for a procedure that nests nothing. */
+          procApplyFolds(pParse, &pSelect, pPrg->pProc, pStep);
           if( lblLeave ){
             /* Inside a loop: subqueries must re-evaluate every iteration */
             procMarkVarSelect(pParse, 0, pSelect);
