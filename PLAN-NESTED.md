@@ -454,6 +454,43 @@ sqlite3_proc_child_count(stmt, iNested)   -- current parent row
 Opt-in because counting costs the same scan the fold costs, and 3c exists to
 let a client decline it. `test/proc4c.test` is the spec, written red.
 
+### Step 3 design — where the counts ride *(found 2026-08-04, before coding)*
+
+The counts must not be columns, so the obvious move is to generate them as
+extra result registers past the visible end and read them internally.
+**That is ruled out by the engine**, not by taste:
+
+```c
+case OP_ResultRow: {
+  assert( p->nResColumn==pOp->p2 );
+```
+
+`OP_ResultRow` requires the emitted register count to equal the statement's
+declared column count. Emitting more registers than `nResColumn` trips a debug
+assert, and quietly relying on it in release builds is the same class of
+mismatch that produced the fabricated `0.0` this feature opened with — the
+inverse direction, but the same disagreement between metadata and registers.
+
+**The design that survives:** let `nResColumn` include the count columns, so the
+assert holds, and separate *emitted* from *visible*:
+
+- add `nHiddenCol` to the `Vdbe`; the parent `SELECT` gains one correlated
+  `COUNT` per counted nested table, appended after every visible column;
+- `sqlite3_column_count()` returns `nResColumn - nHiddenCol`, so the invariant
+  is untouched and `proc4c-3.0` still sees 3;
+- `sqlite3_proc_child_count(N)` reads `pResultRow[nVisible + N]`;
+- **`sqlite3_data_count()` has to be adjusted too**, or it leaks the hidden
+  columns to any client that asks — that is the one that will be forgotten,
+  so it is written down here.
+
+Hidden columns are a wider change than the rest of phase 4 and touch APIs this
+branch has not otherwise gone near, so step 3 wants its own careful pass rather
+than being finished in the tail of a long session.
+
+**Guard already in place:** `proc4c-2.2` passes today and must keep passing. If
+a count is ever computed for a statement that did not ask, it goes red and says
+the opt-in has become decorative.
+
 ## Phase 4 — per-parent cardinality *(as originally planned)*
 
 **Deliverable.** Each parent carries the number of children belonging to it.
