@@ -420,11 +420,21 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
   procTokenSet(&tAlias, PROC_PARENT_ALIAS);
   pSrc = sqlite3SrcListAppendFromTerm(pParse, 0, 0, 0, &tAlias, pInner, 0);
   if( pSrc==0 ){
+    /* CRITICAL: on failure sqlite3SrcListAppendFromTerm has ALREADY DELETED
+    ** pInner (build.c, append_from_error).  Leaving *ppSel pointing at it
+    ** hands the caller a freed Select to delete a second time -- observed as
+    ** STATUS_HEAP_CORRUPTION under OOM injection, not as a leak. */
+    *ppSel = 0;
     sqlite3ExprListDelete(db, pOuter);
     return 1;
   }
   pWrap = sqlite3SelectNew(pParse, pOuter, pSrc, 0, 0, 0, 0, 0, 0);
-  if( pWrap==0 ) return 1;   /* SelectNew took pOuter and pSrc either way */
+  if( pWrap==0 ){
+    /* Same hazard: SelectNew takes pOuter and pSrc on the failure path too,
+    ** and pSrc owns pInner. */
+    *ppSel = 0;
+    return 1;
+  }
   *ppSel = pWrap;
   return 0;
 }
@@ -504,8 +514,11 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
   sqlite3PExprAddSelect(pParse, pSel, pSub);
 
   pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
-  if( pPE==0 ) return;
+  /* Assigned unconditionally: on failure ExprListAppend deletes BOTH the
+  ** appended expression and the list it was given, so leaving pWrap->pEList
+  ** pointing at the old list is a second double-free. */
   pWrap->pEList = pPE;
+  if( pPE==0 ) return;
   {
     /* Position is counted over the columns that SURVIVED the projection, not
     ** over the declaration: dropping an earlier column shifts this one left. */
@@ -1799,7 +1812,10 @@ static void codeProcProgram(
             procMarkVarSelect(pParse, 0, pSelect);
           }
           sqlite3SelectDestInit(&sDest, SRT_Output, 0);
-          sqlite3Select(pParse, pSelect, &sDest);
+          /* pSelect can be 0 here after an OOM in the dup or in the fold
+          ** generation above; mallocFailed is already set, so skipping the
+          ** codegen simply lets the error propagate. */
+          if( pSelect ) sqlite3Select(pParse, pSelect, &sDest);
           if( pParse->nErr==0 && pSelect ){
             int nCol = pSelect->pEList->nExpr;
             Proc *pProcC = pPrg->pProc;

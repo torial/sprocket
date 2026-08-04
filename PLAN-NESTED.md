@@ -446,6 +446,35 @@ exercising those two functions is where that shows. It didn't.
 it will report those 7 until phase 4 lands. A future run should check that the
 failure list is *exactly* `proc4c-*` rather than that the count is 7.
 
+## OOM INJECTION, 2026-08-04 — found a heap corruption, now fixed
+
+`test/procfault.test` injects allocation failures through CREATE of a nested
+procedure, CALL with the fold generated, and CALL with it projected away.
+
+**It crashed on the second scenario**: exit `0xC0000374`,
+`STATUS_HEAP_CORRUPTION`, at iteration 24 — and the run simply *stopped*,
+printing no summary line. The absence of `errors out of` was the only signal
+that 500 clean iterations were not a pass.
+
+**Three ownership bugs, all the same mistake in different clothes.** SQLite's
+constructors take ownership of their arguments *on the failure path too*, and
+my code kept a pointer to something that had already been freed:
+
+| | |
+|---|---|
+| `sqlite3SrcListAppendFromTerm` fails | it has already deleted the subquery (`build.c: append_from_error`), but `*ppSel` still pointed at it — caller deletes it again |
+| `sqlite3SelectNew` fails | takes `pOuter` and `pSrc` regardless; `pSrc` owns the inner `Select`, same dangling `*ppSel` |
+| `sqlite3ExprListAppend` fails | deletes **both** the appended expression *and* the list it was given, so leaving `pWrap->pEList` on the old list is a third double-free |
+
+Fixed by clearing `*ppSel` on failure, assigning the append result
+unconditionally, and guarding the `sqlite3Select()` call against a null
+`pSelect`. **1,063 iterations, 0 errors, exit 0** — and the summary line
+present, which is what proves it reached the end rather than stopping quietly.
+
+**Why release testing could never find this.** Every one of these paths requires
+an allocation to fail. Thirteen suites and 393k upstream tests all take the
+success path through this code.
+
 ## NEXT ACTIONS — start here
 
 *Written so a reader with no memory of the session can continue without

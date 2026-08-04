@@ -1,0 +1,96 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Out-of-memory fault injection for nested result shapes.
+#
+# This targets the least-exercised code on the branch.  Every other test takes
+# the success path; procWrapParent() and procAddFoldColumn() build Expr trees,
+# ExprLists, SrcLists and Selects with several early-return cleanup paths that
+# nothing has ever executed.  A leak or double-free there is invisible until an
+# allocation fails.
+#
+# Each case must end in SQLITE_OK or SQLITE_NOMEM -- never a crash, never a
+# wrong answer, and never a leak (the harness checks allocation balance).
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procfault
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 1 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body BLOB);
+  INSERT INTO posts VALUES(1,'a'),(2,'b'),(3,'lonely');
+  INSERT INTO comments VALUES(1,1,x'00ff'),(2,1,'p'),(3,2,NULL);
+}
+faultsim_save_and_close
+
+# CREATE of a nested procedure: the declaration, the conformance walk, the
+# imposed ORDER BY, and the fold recipe are all allocated here.
+do_faultsim_test 1 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql { SELECT * FROM sqlite_schema }
+} -body {
+  execsql {
+    CREATE PROCEDURE pwc()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER, body BLOB)
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid, body FROM comments;
+    END;
+  }
+} -test {
+  faultsim_test_result {0 {}}
+}
+
+# CALL with the fold GENERATED -- procWrapParent and procAddFoldColumn, which
+# is where the one leak found so far actually lived.
+do_faultsim_test 2 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql {
+    CREATE PROCEDURE pwc()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER, body BLOB)
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid, body FROM comments;
+    END;
+  }
+} -body {
+  execsql { CALL pwc() }
+} -test {
+  faultsim_test_result {0 {1 a {[{"post_id":1,"cid":1,"body":"AP8="},{"post_id":1,"cid":2,"body":"p"}]} 2 b {[{"post_id":2,"cid":3,"body":null}]} 3 lonely {[]}}}
+}
+
+# CALL with the fold PROJECTED AWAY -- the DOCKET 3c path, which allocates the
+# projection IdList and skips the fold entirely.
+do_faultsim_test 3 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql {
+    CREATE PROCEDURE pwc()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid FROM comments;
+    END;
+  }
+} -body {
+  execsql { CALL pwc() RETURNING id, title }
+} -test {
+  faultsim_test_result {0 {1 a 2 b 3 lonely}}
+}
+
+finish_test
