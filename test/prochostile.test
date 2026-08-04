@@ -1,0 +1,196 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Adversarial cases for nested result shapes.  CREATE PROCEDURE now GENERATES
+# SQL from a user-supplied declaration -- column names become json_object()
+# labels and the correlation is synthesised into a WHERE clause -- so the
+# question this file exists to answer is whether a hostile or merely careless
+# declaration can do damage rather than simply fail.
+#
+# Every case here must end in a clean error or a correct answer.  None may
+# corrupt data, crash, or execute anything the author did not write.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix prochostile
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body TEXT);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,1,'a'),(2,1,'b'),(3,2,'c');
+} {}
+
+#--------------------------------------------------------------------
+# 1.x: a column name is a LABEL, not a fragment
+#
+# The generated json_object() label comes from the declaration.  If it were
+# ever built by string concatenation, this name would close the string and
+# append a statement.  It is built as a bound TK_STRING expression instead, so
+# the name should survive verbatim as a JSON key and posts must still exist.
+#
+do_execsql_test 1.0 {
+  CREATE PROCEDURE inj(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE("a'); DROP TABLE posts; --" INTEGER, post_id INTEGER)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT cid, post_id FROM comments WHERE post_id = pid;
+  END;
+  CALL inj(1);
+} {1 {[{"a'); DROP TABLE posts; --":1,"post_id":1},{"a'); DROP TABLE posts; --":2,"post_id":1}]}}
+
+do_execsql_test 1.1 {
+  SELECT count(*) FROM posts;
+} {2}
+
+# A name containing a double quote, a backslash and a newline must round-trip
+# as valid JSON rather than producing something a parser will choke on.
+do_test 1.2 {
+  execsql {
+    CREATE PROCEDURE inj2(pid INTEGER)
+      RETURNS TABLE(id INTEGER,
+                    kids TABLE("we""ird" INTEGER, post_id INTEGER)
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id FROM posts WHERE id = pid;
+      SELECT cid, post_id FROM comments WHERE post_id = pid;
+    END;
+  }
+  set j [lindex [execsql {CALL inj2(1)}] 1]
+  execsql {SELECT json_valid($j)}
+} {1}
+
+#--------------------------------------------------------------------
+# 2.x: names that collide
+#
+# A nested table named the same as a value column of its own shape.  Both end
+# up as columns of the same result set, which is the author's problem, but it
+# must not confuse the correlation or the generated labels.
+#
+do_execsql_test 2.0 {
+  CREATE PROCEDURE dup(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  id2 TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, cid FROM comments WHERE post_id = pid;
+  END;
+  SELECT nresultsets FROM pragma_proc_list WHERE name='dup';
+} {2}
+
+#--------------------------------------------------------------------
+# 3.x: the child reads the same table as the parent
+#
+# *** KNOWN FAILING -- THIS FILE FOUND A REAL BUG.  DO NOT "FIX" THE
+# *** EXPECTATION; FIX THE ENGINE. ***
+#
+# The generated correlation is <child key expr> = <parent key expr>, both being
+# copies of projected expressions.  When the child's FROM contains a source
+# that can supply the parent expression's name, the parent side resolves
+# INWARD: "id = id" over the same table is a tautology, every child row matches
+# every parent, and the answer is silently wrong with no error.
+#
+# It is not limited to self-reference.  Any child whose FROM exposes a column
+# of the same name as the parent's key -- a comments table with its own "id"
+# would do it -- has the same collapse.  The normal case works only because
+# the names happen not to collide.
+#
+# Expected below is the CORRECT answer: post 1 correlates to itself alone.
+#
+do_execsql_test 3.0 {
+  CREATE PROCEDURE selfref(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  siblings TABLE(id2 INTEGER, t TEXT) KEY(id2 = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT id, title FROM posts;
+  END;
+  CALL selfref(1);
+} {1 {[{"id2":1,"t":"first"}]}}
+
+#--------------------------------------------------------------------
+# 4.x: the schema moves under a prepared statement
+#
+# Dropping the child table must produce a clean error at the next prepare, not
+# a stale compiled body returning nonsense.
+#
+do_test 4.0 {
+  execsql {
+    CREATE TABLE tmpc(k INTEGER, v TEXT);
+    INSERT INTO tmpc VALUES(1,'x');
+    CREATE PROCEDURE dropme(pid INTEGER)
+      RETURNS TABLE(id INTEGER, kids TABLE(k INTEGER, v TEXT) KEY(k = id))
+    BEGIN
+      SELECT id FROM posts WHERE id = pid;
+      SELECT k, v FROM tmpc;
+    END;
+  }
+  execsql {CALL dropme(1)}
+} {1 {[{"k":1,"v":"x"}]}}
+
+do_catchsql_test 4.1 {
+  DROP TABLE tmpc;
+  CALL dropme(1);
+} {1 {no such table: main.tmpc}}
+
+#--------------------------------------------------------------------
+# 5.x: shape and volume
+#
+do_execsql_test 5.0 {
+  CREATE PROCEDURE empty_parent(pid INTEGER)
+    RETURNS TABLE(id INTEGER, kids TABLE(post_id INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = 9999;
+    SELECT post_id FROM comments;
+  END;
+  CALL empty_parent(1);
+} {}
+
+# Affinity mismatch on the correlation: a TEXT key against an INTEGER one must
+# simply match nothing rather than misbehave.
+do_execsql_test 5.1 {
+  CREATE PROCEDURE affin(pid INTEGER)
+    RETURNS TABLE(t TEXT, kids TABLE(post_id INTEGER) KEY(post_id = t))
+  BEGIN
+    SELECT title FROM posts WHERE id = pid;
+    SELECT post_id FROM comments;
+  END;
+  CALL affin(1);
+} {first []}
+
+# Reset and re-step a folded statement: the second pass must equal the first.
+do_test 5.2 {
+  set S [sqlite3_prepare_v2 db {CALL inj(1)} -1 TAIL]
+  set a {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { lappend a [sqlite3_column_text $S 1] }
+  sqlite3_reset $S
+  set b {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { lappend b [sqlite3_column_text $S 1] }
+  sqlite3_finalize $S
+  expr {$a eq $b && [llength $a]==1}
+} {1}
+
+#--------------------------------------------------------------------
+# 6.x: nothing here wrote to the database
+#
+# The closing control.  Everything above either read or was rejected; if any
+# of it mutated user data, this is where it shows.
+#
+do_execsql_test 6.0 {
+  SELECT (SELECT count(*) FROM posts), (SELECT count(*) FROM comments),
+         (SELECT group_concat(title, ',') FROM posts ORDER BY id);
+} {2 3 first,second}
+
+finish_test

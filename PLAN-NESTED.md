@@ -441,6 +441,51 @@ grouping, no error, POC 2's signature. Nothing else in the suite detects the
 ordering, so that one case carries it. Observed red, not merely believed capable
 of it.
 
+## OPEN BUG — the generated correlation can resolve inward
+
+*Found 2026-08-04 by `test/prochostile.test`, which is red on case 3.0 and must
+stay red until this is fixed. **Fix the engine, not the expectation.***
+
+Phase 5b generates `<child key expr> = <parent key expr>`, both copies of
+projected expressions. **If the child's `FROM` can supply a name matching the
+parent expression, the parent side resolves inward**, and the correlation
+becomes a tautology: every child row matches every parent, silently, with no
+error.
+
+```sql
+-- child and parent both read posts; "id = id" is trivially true
+SELECT id FROM posts WHERE id = pid;
+SELECT id, title FROM posts;          -- nested, KEY(id2 = id)
+```
+returns *every* post as a sibling of post 1.
+
+**It is not limited to self-reference.** Any child whose `FROM` exposes a column
+of the parent key's name collapses the same way — a `comments` table with its
+own `id` would do it. The working cases work because the names happen not to
+collide, which is not a property anyone chose.
+
+**Why the technique bit here.** "Copy the projected expression" was the right
+fix for phase 3's `ORDER BY`, where the copy stays in its own query. Copying an
+expression *into a different scope* is a different operation: a duplicated
+expression re-resolves, and re-resolution is exactly what must not happen to the
+outer half of a correlation.
+
+**Fix directions, none yet chosen:**
+- Put the child in an aliased derived table and qualify the parent side so the
+  inner scope cannot provide it. Needs the parent's source name or alias, which
+  is not known without resolution.
+- Require the parent key to be a simple column reference and reject anything
+  else at CREATE — narrower, checkable, and probably right for v1.
+- Resolve the parent expression in the parent's context first and duplicate the
+  *resolved* `TK_COLUMN`, so it carries a cursor rather than a name. Correct in
+  principle; needs the rewrite to move from CREATE to codegen — which is where
+  DOCKET 3c is moving it anyway.
+
+**That last point matters for sequencing:** 3c already requires the fold to move
+to CALL-compile time. If it moves there, the parent expression can be resolved
+before duplication, and this bug may be fixed by the same change rather than
+separately.
+
 ## Phase 5b — the flat-client column — *design settled, implementation next*
 
 **The column is generated as SQL, not assembled in C.** At CALL-compile time the
