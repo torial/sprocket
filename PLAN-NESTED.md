@@ -369,6 +369,61 @@ test must go red with the POC 2 signature — far fewer pairs than expected,
 
 ---
 
+## DEBUG-BUILD FINDINGS, 2026-08-04 — read before step 3b
+
+Everything in this session had been built `-O2` with `NDEBUG`, so **every
+`assert()` in SQLite was a no-op**. A `DEBUG=3` build turns them on. It found
+two, and only one of them is ours.
+
+### 1. `mayAbort` — PRE-EXISTING, and not a nesting bug
+
+```
+proc1-2.3 ... Assertion failed:
+  !pParse->isMultiWrite || sqlite3VdbeAssertMayAbort(v, pParse->mayAbort)
+```
+
+Fires in `proc1`, `proc4`, `proc5`, `psm1` — suites that predate nesting
+entirely. **Confirmed pre-existing by building `stored-procs` at `a0dabed7` in
+debug and reproducing it at the same test**, rather than by reasoning that it
+looked old.
+
+So the stored-procedure feature has carried a latent invariant violation since
+before this branch: a procedure body marks the statement multi-write without the
+matching abort flag. Release builds never showed it. **This needs its own docket
+item and a fix on `stored-procs`, not here** — it is out of scope for nested
+shapes and would be the wrong thing to bury in this plan.
+
+### 2. Lookaside — ours, and unresolved
+
+```
+Assertion failed: sqlite3LookasideUsed(db,0)==0
+```
+
+Fires only in suites that create nested procedures. Schema teardown frees `Proc`
+objects through a **zeroed stand-in handle** (`callback.c`, `&xdb`) that cannot
+return lookaside memory, so anything schema-resident must not come from
+lookaside. `src/proc.c` contains no `DisableLookaside` pairing anywhere, unlike
+`build.c` which brackets its schema-object allocation.
+
+`ProcFold` is the obvious suspect since it was added this session and is
+schema-resident, but **that is a hypothesis, not a finding** — the leak has not
+been localised, and the Expr trees built in `procAddFoldColumn` have error paths
+that are equally untested. Localise it before fixing it.
+
+### 3. Two process-level traps, now handled in the harness
+
+`LNK1168: cannot open testfixture.exe for writing` means a **leftover
+testfixture process** is holding the binary — an assert-abort leaves one behind.
+The message names neither a process nor a lock. The harness now kills stragglers
+before building.
+
+And the harness had been silently running **nine suites while claiming twelve**:
+an edit script printed "harness updated" and changed nothing, because it used a
+bare `.replace()` without the count assertion every other edit this session
+carried. Two "everything green" reports covered three suites that never ran. The
+harness now prints `SUITE_COUNT` and the caller checks the number of result
+lines against it.
+
 ## NEXT ACTIONS — start here
 
 *Written so a reader with no memory of the session can continue without
@@ -397,9 +452,15 @@ the opt-in has become decorative.
 in the column accessors' bounds check (its permissiveness is what step 3 relies
 on). `test/hiddencol.test` case 4.0 fails if the first mistake is made.
 
-**Build and test:** every suite is listed in the session's `n2t.bat`; the build
-gates on `nmake`'s exit code and deletes the binary first, because testing for
-the file's existence let a stale binary report a previous build's results.
+**Build and test:** every suite is listed in the session's `n2t.bat`, which
+prints `SUITE_COUNT` so the caller can check that as many suites reported as
+were supposed to run. The build gates on `nmake`'s exit code, kills leftover
+`testfixture` processes, and deletes the binary first. Each of those three
+guards exists because its absence produced a false green.
+
+**Run `DEBUG=3` before believing a clean release run.** See the findings above:
+release builds cannot see any `assert()`, and one of the two failures they hid
+predates this branch entirely.
 
 **After phase 4:** phase 6 (index advisory) is small and self-contained. Phase 7
 (the reassembler) is blocked on a gap recorded in the DOCKET — `PRAGMA
