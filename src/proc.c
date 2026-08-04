@@ -2009,11 +2009,82 @@ static void procCachePopulate(
 ** ordinary sqlite3_step() interface.
 */
 /*
-** CALL ... RETURNING <names> -- DOCKET 3c, projection.  Not implemented yet;
-** the grammar exists so that test/proc3c.test can be written red against the
-** intended surface.  Refusing loudly is the only honest stub: silently
-** ignoring the clause would make every projection test pass by returning the
-** unprojected shape.
+** Validate a RETURNING projection against a procedure's declared shapes --
+** DOCKET 3c, step 3a.  Returns non-zero if an error was reported.
+**
+** Three rules, all checkable here at prepare, which is the point of putting
+** the clause in the statement text rather than in a setter:
+**
+**   - every name must be a declared result column of some shape;
+**   - no name twice;
+**   - a nested table that is KEPT drags in the value column it correlates on,
+**     because a folded column with no key beside it cannot be reassembled.
+*/
+static int procCheckProjection(Parse *pParse, Proc *pProc, IdList *pProj){
+  ProcShape *pS;
+  int i, j;
+
+  if( pProc->eRet!=PROC_RET_TABLES ){
+    sqlite3ErrorMsg(pParse,
+      "procedure %s declares no result columns to project", pProc->zName);
+    return 1;
+  }
+  for(i=0; i<pProj->nId; i++){
+    int bFound = 0;
+    for(j=0; j<i; j++){
+      if( sqlite3StrICmp(pProj->a[j].zName, pProj->a[i].zName)==0 ){
+        sqlite3ErrorMsg(pParse,
+          "result column %s named more than once in RETURNING",
+          pProj->a[i].zName);
+        return 1;
+      }
+    }
+    for(pS=pProc->pShapes; pS && !bFound; pS=pS->pNext){
+      if( pS->pCols==0 ) continue;
+      for(j=0; j<pS->pCols->nParam; j++){
+        if( sqlite3StrICmp(pS->pCols->a[j].zName, pProj->a[i].zName)==0 ){
+          bFound = 1;
+          break;
+        }
+      }
+    }
+    if( !bFound ){
+      sqlite3ErrorMsg(pParse, "procedure %s has no result column named %s",
+                      pProc->zName, pProj->a[i].zName);
+      return 1;
+    }
+  }
+
+  /* A kept nested table needs its correlation column kept too. */
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    for(i=0; i<pS->pCols->nParam; i++){
+      ProcParam *pCol = &pS->pCols->a[i];
+      int bKept = 0, bKey = 0;
+      if( pCol->pNested==0 ) continue;
+      for(j=0; j<pProj->nId; j++){
+        if( sqlite3StrICmp(pProj->a[j].zName, pCol->zName)==0 ) bKept = 1;
+        if( sqlite3StrICmp(pProj->a[j].zName, pCol->zKeyParent)==0 ) bKey = 1;
+      }
+      if( bKept && !bKey ){
+        sqlite3ErrorMsg(pParse,
+          "RETURNING must keep the column nested table %s correlates on: %s",
+          pCol->zName, pCol->zKeyParent);
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** CALL ... RETURNING <names> -- DOCKET 3c, projection.
+**
+** Step 3a validates the clause and then STILL REFUSES to honour it.  That
+** combination is deliberate: accepting a projection and quietly returning the
+** unprojected shape is the silent-ignore failure this branch keeps producing,
+** and it would turn proc3c's 2.x cases green for a feature that does not
+** exist.  Step 3b moves the fold to CALL-compile time and removes the refusal.
 */
 void sqlite3CallProcProject(
   Parse *pParse,
@@ -2021,10 +2092,30 @@ void sqlite3CallProcProject(
   ExprList *pArgs,
   IdList *pProj
 ){
+  sqlite3 *db = pParse->db;
+  Proc *pProc;
+  const char *zDb;
+
+  if( db->mallocFailed || pProj==0 ) goto proj_cleanup;
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ) goto proj_cleanup;
+  assert( pName->nSrc==1 );
+  zDb = pName->a[0].fg.fixedSchema
+          ? db->aDb[sqlite3SchemaToIndex(db, pName->a[0].u4.pSchema)].zDbSName
+          : pName->a[0].u4.zDatabase;
+  pProc = sqlite3FindProc(pParse, pName->a[0].zName, zDb);
+  if( pProc==0 ){
+    sqlite3ErrorMsg(pParse, "no such procedure: %S", pName->a);
+    pParse->checkSchema = 1;
+    goto proj_cleanup;
+  }
+  if( procCheckProjection(pParse, pProc, pProj) ) goto proj_cleanup;
+
   sqlite3ErrorMsg(pParse, "CALL ... RETURNING is not implemented yet");
-  sqlite3IdListDelete(pParse->db, pProj);
-  sqlite3SrcListDelete(pParse->db, pName);
-  sqlite3ExprListDelete(pParse->db, pArgs);
+
+proj_cleanup:
+  sqlite3IdListDelete(db, pProj);
+  sqlite3SrcListDelete(db, pName);
+  sqlite3ExprListDelete(db, pArgs);
 }
 
 void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
