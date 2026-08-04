@@ -435,7 +435,8 @@ typedef struct VdbeProcSet VdbeProcSet;
 ** memory that a schema reload could free underneath it.
 */
 struct VdbeProcSet {
-  u16 nCol;               /* Number of columns in this set */
+  u16 nCol;               /* Columns EMITTED for this set, hidden ones included */
+  u16 nHidden;            /* Trailing columns that are engine bookkeeping */
   char **azName;          /* Column names */
   char **azType;          /* Declared types; entries may be NULL */
 };
@@ -516,8 +517,6 @@ struct Vdbe {
   u8 nProcSet;            /* Number of entries in aProcSet[] */
   u8 iProcSet;            /* Set currently being delivered */
   u16 nHiddenCol;         /* Trailing result columns not shown to clients */
-  u8 nChildCnt;           /* Nested tables counted for the current row */
-  int *aChildCnt;         /* Their per-parent counts, or NULL if not asked */
   u8 bAtSetEnd;           /* True when paused at a result-set boundary */
 #endif
   u8 errorAction;         /* Recovery action to do in case of an error */

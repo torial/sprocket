@@ -2005,11 +2005,11 @@ cmd ::= DROP PROCEDURE ifexists(NOERR) fullname(X). {
 }
 
 ///////////////////////////// The CALL statement //////////////////////////////
-cmd ::= CALL fullname(X) LP exprlist(Y) RP wcounts. {
-  sqlite3CallProc(pParse, X, Y, 0);
+cmd ::= CALL fullname(X) LP exprlist(Y) RP wcounts(C). {
+  sqlite3CallProc(pParse, X, Y, 0, C);
 }
-cmd ::= CALL fullname(X) wcounts. {
-  sqlite3CallProc(pParse, X, 0, 0);
+cmd ::= CALL fullname(X) wcounts(C). {
+  sqlite3CallProc(pParse, X, 0, 0, C);
 }
 // PLAN-NESTED phase 4: the optional "WITH COUNTS" suffix.  An optional
 // nonterminal rather than doubling the CALL rules, so it composes with
@@ -2030,11 +2030,11 @@ projlist(A) ::= nm(X). {
 projlist(A) ::= projlist(A) COMMA nm(X). {
   A = sqlite3IdListAppend(pParse, A, &X);
 }
-cmd ::= CALL fullname(X) LP exprlist(Y) RP RETURNING projlist(P) wcounts. {
-  sqlite3CallProcProject(pParse, X, Y, P);
+cmd ::= CALL fullname(X) LP exprlist(Y) RP RETURNING projlist(P) wcounts(C). {
+  sqlite3CallProcProject(pParse, X, Y, P, C);
 }
-cmd ::= CALL fullname(X) RETURNING projlist(P) wcounts. {
-  sqlite3CallProcProject(pParse, X, 0, P);
+cmd ::= CALL fullname(X) RETURNING projlist(P) wcounts(C). {
+  sqlite3CallProcProject(pParse, X, 0, P, C);
 }
 %endif  !SQLITE_OMIT_PROCEDURE
 

@@ -475,6 +475,36 @@ present, which is what proves it reached the end rather than stopping quietly.
 an allocation to fail. Thirteen suites and 393k upstream tests all take the
 success path through this code.
 
+## Phase 4 — **DONE** (`nested-shapes`)
+
+`CALL p(args) [RETURNING ...] WITH COUNTS`, and
+`sqlite3_proc_child_count(stmt, N)` returns the children of the current parent
+row for its N-th nested table. `proc4c` 13/13.
+
+The counts are generated as trailing correlated `count(*)` columns appended
+after every visible column, and hidden from clients by `nHiddenCol`. They ride
+the result row because `OP_ResultRow` asserts the emitted register count equals
+`nResColumn` — there is no sidecar to put them in.
+
+**Two bugs worth remembering, both about *what owns a number*:**
+
+- `nHidden` was recorded on the `ProcPrg` by codegen, which runs **per body
+  statement** — so the child `SELECT`'s zero overwrote the parent's count and
+  every call reported `-1`. Fixed by deriving it in `sqlite3VdbeSetProcShapes`
+  **per shape**, which is where it belongs: the count is one per nested table a
+  *shape* declares, not a property of the statement. A procedure whose shapes
+  nest differently would have been wrong under the old scheme even without the
+  clobber.
+- `WITH COUNTS` on a procedure with nothing to count silently succeeded.
+  Refused now, using `pProc->pFolds==0` as the test — empty exactly when no
+  shape nests.
+
+**Still true and still guarded:** `proc4c-2.2` passes, so a statement that does
+not ask still causes no child scan. `proc4c-3.0/3.1` pass, so `column_count` is
+still 3 and the folded JSON is byte-identical with and without the request —
+if either moved, the counts would have become visible columns and option F
+would have collapsed into option A.
+
 ## NEXT ACTIONS — start here
 
 *Written so a reader with no memory of the session can continue without
@@ -528,7 +558,7 @@ see what to generate. That is phase 7's first task, not a surprise to discover.
 | 5a segment reachability | **done** |
 | 5b flat-client column | **done** |
 | DOCKET 3c projection | **done** |
-| **4 per-parent cardinality** | **not started** |
+| 4 per-parent cardinality | **done** |
 | **6 index advisory (R7)** | **not started** |
 | **7 generated reassembler** | **not started** |
 

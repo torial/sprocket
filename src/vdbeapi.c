@@ -941,9 +941,14 @@ int sqlite3_proc_child_count(sqlite3_stmt *pStmt, int N){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( p==0 ) return -1;
 #endif
-  if( p==0 || p->aChildCnt==0 ) return -1;
-  if( N<0 || N>=p->nChildCnt ) return -1;
-  return p->aChildCnt[N];
+  /* The counts are trailing result-row columns the client is not shown -- see
+  ** nHiddenCol in sqlite3_column_count() above.  This is the only reader past
+  ** the visible end, which is why the accessors' bounds check stays
+  ** permissive. */
+  if( p==0 || p->pResultRow==0 || p->nHiddenCol==0 ) return -1;
+  if( N<0 || N>=p->nHiddenCol ) return -1;
+  return sqlite3_value_int(
+      (sqlite3_value*)&p->pResultRow[p->nResColumn - p->nHiddenCol + N]);
 }
 
 int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){

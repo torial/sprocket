@@ -536,6 +536,65 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
 }
 
 /*
+** Append one nested table's per-parent CHILD COUNT to an already-wrapped
+** parent SELECT -- PLAN-NESTED phase 4.  Appended AFTER every visible column
+** and counted in Vdbe.nHiddenCol, so sqlite3_column_count() does not report it
+** while sqlite3_proc_child_count() can read past the visible end.
+**
+**   (SELECT count(*) FROM <child FROM>
+**     WHERE <child WHERE> AND <child key> = <alias>.<parent key>)
+**
+** Generated only on request: this costs the same scan the fold costs, and
+** DOCKET 3c exists so a client can decline that scan.
+*/
+static void procAddCountColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
+  sqlite3 *db = pParse->db;
+  Expr *pAgg, *pSel, *pEq;
+  ExprList *pOld, *pPE;
+  Select *pSub;
+  Token tk;
+
+  if( pF->pChild==0 || pF->pChild->pSelect==0 ) return;
+  pSub = sqlite3SelectDup(db, pF->pChild->pSelect, 0);
+  if( pSub==0 ) return;
+  sqlite3ExprListDelete(db, pSub->pOrderBy);
+  pSub->pOrderBy = 0;
+  pOld = pSub->pEList;
+  if( pOld==0 || pF->iKeyCol>pOld->nExpr ){
+    pSub->pEList = 0;
+    sqlite3SelectDelete(db, pSub);
+    sqlite3ExprListDelete(db, pOld);
+    return;
+  }
+  {
+    Token tTab, tCol;
+    procTokenSet(&tTab, PROC_PARENT_ALIAS);
+    procTokenSet(&tCol, pF->zKeyParent);
+    pEq = sqlite3PExpr(pParse, TK_EQ,
+            sqlite3ExprDup(db, pOld->a[pF->iKeyCol-1].pExpr, 0),
+            sqlite3PExpr(pParse, TK_DOT,
+              sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
+              sqlite3ExprAlloc(db, TK_ID, &tCol, 0)));
+  }
+  pSub->pWhere = pSub->pWhere
+                   ? sqlite3PExpr(pParse, TK_AND, pSub->pWhere, pEq)
+                   : pEq;
+  sqlite3ExprListDelete(db, pOld);
+  procTokenSet(&tk, "count");
+  pAgg = sqlite3ExprFunction(pParse, 0, &tk, 0);
+  pSub->pEList = sqlite3ExprListAppend(pParse, 0, pAgg);
+
+  pSel = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+  if( pSel==0 ){
+    sqlite3SelectDelete(db, pSub);
+    return;
+  }
+  sqlite3PExprAddSelect(pParse, pSel, pSub);
+  pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
+  pWrap->pEList = pPE;   /* assign even on failure -- Append freed the old */
+}
+
+/*
 ** Apply every fold recipe belonging to body statement pStep onto *ppSel, which
 ** is the CALL-time copy of that statement's SELECT.  Wraps once, however many
 ** nested tables the shape holds.  A no-op for a procedure that nests nothing,
@@ -555,22 +614,40 @@ int sqlite3ProcProjKeeps(IdList *pProj, const char *zName){
   return 0;
 }
 
-static void procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
-                           TriggerStep *pStep, IdList *pProj){
+static int procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
+                          TriggerStep *pStep, IdList *pProj, int bCounts){
   ProcFold *pF;
-  int bWrapped = 0;
-  if( pProc==0 || pProc->pFolds==0 || *ppSel==0 ) return;
+  int bWrapped = 0, nHidden = 0;
+  if( pProc==0 || pProc->pFolds==0 || *ppSel==0 ) return 0;
+
+  /* Pass 1: visible fold columns, each at its declared position.  A projected
+  ** away nested table generates nothing -- the clause selects generated
+  ** COLUMNS, not segments, so its child segment still streams.  Counts still
+  ** need the wrapper, because the correlation is what they count. */
   for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    int bKeep;
     if( pF->pParent!=pStep ) continue;
-    /* Projected away: generate nothing.  The child segment still streams --
-    ** the clause selects generated COLUMNS, not segments. */
-    if( !sqlite3ProcProjKeeps(pProj, pF->zName) ) continue;
+    bKeep = sqlite3ProcProjKeeps(pProj, pF->zName);
+    if( !bKeep && !bCounts ) continue;
     if( !bWrapped ){
-      if( procWrapParent(pParse, ppSel, pF->pShapeCols, pProj) ) return;
+      if( procWrapParent(pParse, ppSel, pF->pShapeCols, pProj) ) return 0;
       bWrapped = 1;
     }
-    procAddFoldColumn(pParse, *ppSel, pF, pProj);
+    if( bKeep ) procAddFoldColumn(pParse, *ppSel, pF, pProj);
   }
+
+  /* Pass 2, kept separate so the counts land AFTER every visible column
+  ** whatever the declared positions were.  Their offsets are what
+  ** sqlite3_proc_child_count() indexes, so they must be contiguous at the end
+  ** and in declaration order. */
+  if( bCounts && bWrapped ){
+    for(pF=pProc->pFolds; pF; pF=pF->pNext){
+      if( pF->pParent!=pStep ) continue;
+      procAddCountColumn(pParse, *ppSel, pF);
+      nHidden++;
+    }
+  }
+  return nHidden;
 }
 
 /*
@@ -1664,7 +1741,7 @@ static void codeProcProgram(
         sqlite3CallProc(pParse,
           sqlite3SrcListDup(db, pStep->pSrc, 0),
           sqlite3ExprListDup(db, pStep->pExprList, 0),
-          0
+          0, 0
         );
         break;
       }
@@ -1806,7 +1883,8 @@ static void codeProcProgram(
           /* The flat-client column is generated HERE, onto the copy, rather
           ** than baked into the stored body -- so that it can be declined.
           ** A no-op for a procedure that nests nothing. */
-          procApplyFolds(pParse, &pSelect, pPrg->pProc, pStep, pPrg->pProj);
+          procApplyFolds(pParse, &pSelect, pPrg->pProc, pStep,
+                         pPrg->pProj, pPrg->bCounts);
           if( lblLeave ){
             /* Inside a loop: subqueries must re-evaluate every iteration */
             procMarkVarSelect(pParse, 0, pSelect);
@@ -1853,7 +1931,8 @@ static void codeProcProgram(
 ** SubProgram.aOp is populated at the end of this function) instead of
 ** recursing forever.
 */
-static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc, IdList *pProj){
+static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc, IdList *pProj,
+                             int bCounts){
   Parse *pTop = sqlite3ParseToplevel(pParse);
   sqlite3 *db = pParse->db;
   ProcPrg *pPrg;
@@ -1884,6 +1963,7 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc, IdList *pProj){
   sqlite3VdbeLinkSubProgram(pTop->pVdbe, pProgram);
   pPrg->pProc = pProc;
   pPrg->pProj = pProj;
+  pPrg->bCounts = bCounts;
   pPrg->nResCol = -1;
 
   /* Allocate and populate a new Parse context for coding the body */
@@ -2125,11 +2205,11 @@ int sqlite3ProcWithCounts(Parse *pParse, Token *pWord){
   if( z==0 ) return 0;
   if( sqlite3StrICmp(z, "counts")!=0 ){
     sqlite3ErrorMsg(pParse, "expected COUNTS after WITH, got %s", z);
-  }else{
-    sqlite3ErrorMsg(pParse, "WITH COUNTS is not implemented yet");
+    sqlite3DbFree(pParse->db, z);
+    return 0;
   }
   sqlite3DbFree(pParse->db, z);
-  return 0;
+  return 1;
 }
 
 /*
@@ -2214,7 +2294,8 @@ void sqlite3CallProcProject(
   Parse *pParse,
   SrcList *pName,
   ExprList *pArgs,
-  IdList *pProj
+  IdList *pProj,
+  int bCounts
 ){
   sqlite3 *db = pParse->db;
   Proc *pProc;
@@ -2233,7 +2314,7 @@ void sqlite3CallProcProject(
     goto proj_cleanup;
   }
   if( procCheckProjection(pParse, pProc, pProj) ) goto proj_cleanup;
-  sqlite3CallProc(pParse, pName, pArgs, pProj);
+  sqlite3CallProc(pParse, pName, pArgs, pProj, bCounts);
   sqlite3IdListDelete(db, pProj);
   return;
 
@@ -2244,7 +2325,7 @@ proj_cleanup:
 }
 
 void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
-                     IdList *pProj){
+                     IdList *pProj, int bCounts){
   sqlite3 *db = pParse->db;
   Proc *pProc = 0;
   ProcPrg *pPrg;
@@ -2322,6 +2403,12 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
   }
 #endif
 
+  if( bCounts && pProc->pFolds==0 ){
+    sqlite3ErrorMsg(pParse,
+      "procedure %s declares no nested table to count", pProc->zName);
+    goto call_cleanup;
+  }
+
   v = sqlite3GetVdbe(pParse);
   if( v==0 ) goto call_cleanup;
 
@@ -2338,7 +2425,7 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
     /* The cache is keyed by procedure, so a projected body must not enter it
     ** or two projections would share one compiled program.  Bypassing is
     ** correct today; keying by (procedure, projection) is the optimisation. */
-    ProcCacheEntry *pE = pProj ? 0 : procCacheFind(pParse, pProc);
+    ProcCacheEntry *pE = (pProj || bCounts) ? 0 : procCacheFind(pParse, pProc);
     if( pE ){
       /* Cache hit: reuse the compiled body, replaying the toplevel
       ** bookkeeping that compiling it would have performed. */
@@ -2375,9 +2462,9 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       }
     }else{
       void *pAincBefore = (void*)pTop->pAinc;
-      pPrg = codeProcBody(pParse, pProc, pProj);
+      pPrg = codeProcBody(pParse, pProc, pProj, bCounts);
       if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
-      if( pParse->pToplevel==0 && pProj==0 ){
+      if( pParse->pToplevel==0 && pProj==0 && bCounts==0 ){
         procCachePopulate(pParse, pProc, pPrg, pAincBefore);
       }
     }
@@ -2399,7 +2486,7 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       /* Copies every declared shape onto the statement, sizes the column
       ** name array for the widest one, and applies set 1.  Advancing
       ** between sets at run time then swaps metadata without allocating. */
-      sqlite3VdbeSetProcShapes(vTop, pProc->pShapes, pProj);
+      sqlite3VdbeSetProcShapes(vTop, pProc->pShapes, pProj, bCounts);
     }
   }
 
