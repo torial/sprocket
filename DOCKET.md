@@ -575,6 +575,77 @@ here is **to push SQLite as far as it will go**, not to reimplement MetaKit —
 its other features are likely not part of this journey. Nesting earns its place
 on merit, not lineage.
 
+## 3b. The rowid spine — *late materialisation, and MetaKit's trick returning*
+
+**Sean's, 2026-08-03, while reviewing the phase 5 blocker.** Let the parent
+segment carry only the row id; do not load the parent's other fields, or any
+children, until asked. The id keys into both.
+
+This is **late materialisation** — fetch the qualifying identifiers first, then
+fetch only what is actually projected. It is what column stores do, and it is
+recognisably MetaKit's own move, which is a pleasing place for it to reappear
+given #3 started from MetaKit.
+
+**Where it genuinely helps.** Option 1 of the phase 3+5 unit buffers the parent
+segment, and its memory argument rests on "parents are the small side" — an
+assumption about `posts` vs `comments`, not a guarantee. A spine of ids makes
+that **true by construction** rather than by luck. That is a real improvement to
+the design being built, not an alternative to it, and it is the cheapest way to
+remove the one soft spot in option 1.
+
+**Where it breaks, precisely.** Deferring the parent's *other columns* requires
+re-addressing a row by id, and a stored procedure's parent `SELECT` is arbitrary
+SQL, not a table scan — `SELECT id, count(*) ... GROUP BY` has no row to go back
+to. Column stores can do this because a row is a physical address; here it is a
+computed result.
+
+So it splits cleanly:
+
+- **Spine + buffered parent columns + lazy children** — this *is* option 1,
+  strengthened. Adopt.
+- **Spine + lazy everything** — sound only when the parent `SELECT` is a
+  projection of a single table with a rowid and no aggregation. That is a
+  planner-detectable precondition and a legitimate *optimisation* to apply when
+  it holds, not a v1 mechanism.
+
+**Bonus worth noting:** the spine gives phase 4 its cardinality for free. The id
+list is the exact parent count, and per-parent child counts hang off it without
+a second pass.
+
+---
+
+## 3c. Level-of-detail projection — *bigger than nesting, and it subsumes laziness*
+
+**Sean's, 2026-08-03.** A mechanism saying what level of information is wanted:
+top level only, or posts + comments, or posts + authors.
+
+This is **projection over the declared shape** — a column list generalised to
+nested tables. It is worth separating from #3 because it is the larger idea.
+
+**Why it beats laziness rather than duplicating it.** The boundary fold's
+laziness is *discovered*: the engine finds out nobody read column 3 after the
+parent row was delivered. Projection is *declared up front*, so the engine can
+decline to run — or even to compile — the child `SELECT` at all. It also fixes
+the case laziness handles worst: with two nested tables, skipping `comments` to
+reach `authors` still costs a scan of `comments` under streaming, and costs
+nothing under projection.
+
+**The fork worth deciding before building.** Projection can be *runtime*
+(the call names what it wants; `sqlite3_column_count` then varies per statement,
+which is legal but multiplies the metadata cases) or *compile-time* (procgen
+emits `pwc_flat()` and `pwc_with_comments()` variants, which costs nothing at
+run time but multiplies procedures). R5 already puts the client in charge of
+reassembly and the client knows its needs at generation time, which argues for
+compile-time — but runtime is what makes an *unmodified* client able to ask,
+and the invariant is about unmodified clients.
+
+**What it unlocks.** Depth ≥ 2 is currently out of scope partly because a deep
+tree is an unbounded fetch. With projection you never fetch a whole tree, only
+selected edges — which makes the ancestor-path problem worth revisiting rather
+than permanently closed.
+
+---
+
 ## 4. Incremental view maintenance — *the big one, and the one I most want*
 
 Materialized views that update as writes land rather than being recomputed.
