@@ -369,6 +369,43 @@ test must go red with the POC 2 signature — far fewer pairs than expected,
 
 ---
 
+## NEXT ACTIONS — start here
+
+*Written so a reader with no memory of the session can continue without
+reconstructing anything. If this section is stale, fix it before working.*
+
+**Phase 4, step 3b — the only thing in flight.** Everything else is green.
+Three edits, all in `src/proc.c` except the first:
+
+1. Thread the `WITH COUNTS` flag from the grammar through `sqlite3CallProc()`
+   to codegen, the way `IdList *pProj` was threaded for DOCKET 3c. `wcounts`
+   already parses and currently calls `sqlite3ProcWithCounts()`, which refuses;
+   that refusal is what to replace.
+2. In `procApplyFolds()`, when counts are asked for, append one correlated
+   `COUNT(*)` per nested table **after every visible column** — same subquery
+   shape as `procAddFoldColumn()` but aggregating instead of building JSON, and
+   generated even when the fold itself was projected away (`proc4c-1.2`).
+3. Set `Vdbe.nHiddenCol` to the number appended, and point
+   `sqlite3_proc_child_count()` at `pResultRow[nVisible + N]`. `nResColumn` must
+   include them or `OP_ResultRow`'s assert fires.
+
+**Signal:** `test/proc4c.test` goes 13/13. **Guard:** `proc4c-2.2` passes today
+and must keep passing — if a count is computed for a statement that did not ask,
+the opt-in has become decorative.
+
+**Do not** apply `nHiddenCol` in `columnName()` (it is a stride, not a bound) or
+in the column accessors' bounds check (its permissiveness is what step 3 relies
+on). `test/hiddencol.test` case 4.0 fails if the first mistake is made.
+
+**Build and test:** every suite is listed in the session's `n2t.bat`; the build
+gates on `nmake`'s exit code and deletes the binary first, because testing for
+the file's existence let a stale binary report a previous build's results.
+
+**After phase 4:** phase 6 (index advisory) is small and self-contained. Phase 7
+(the reassembler) is blocked on a gap recorded in the DOCKET — `PRAGMA
+proc_info` does not expose a nested table's columns at all, so `procgen` cannot
+see what to generate. That is phase 7's first task, not a surprise to discover.
+
 ## Status, 2026-08-04
 
 | | |
