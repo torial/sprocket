@@ -387,7 +387,45 @@ Branch `nested-shapes`, unmerged. Merging before 7 would ship a feature whose
 typed client does not exist yet, which is the half-present state this plan
 exists to avoid — so the merge waits on 7, and 4 and 6 are independent of it.
 
-## Phase 4 — per-parent cardinality
+## Phase 4 — design fork found before writing code, 2026-08-04
+
+The plan says "each parent carries the number of children belonging to it" and
+does not say *where*. Every answer costs something, and one of them is ruled out
+by a finding we already have.
+
+**The tension 3c created, and the plan predates it:** counting a parent's
+children costs the same scan the fold costs. Projection exists precisely to let
+a client decline that scan. So an always-on cardinality would hand back the cost
+3c just removed — cardinality has to be **opt-in for the same reason the fold
+is**.
+
+| | cost |
+|---|---|
+| **A.** extra column in the parent segment, always present | breaks the invariant — `column_count` becomes 4. Rejected. |
+| **B.** inside the folded JSON, `{"n":2,"rows":[…]}` | the flat client pays a shape change for a number it can get with `json_array_length`. Cost falls on the client that does not need it. Rejected. |
+| **C.** column present only for *projected-away* nested tables | projecting a table away and receiving something about it is a surprising contract, and it still costs the scan. |
+| **D.** explicit request in the statement — `RETURNING id, title, COUNT(comments)` or similar | honest and opt-in; costs grammar, and the count then *is* a user-visible column. |
+| **E.** reassembler counts the child segment itself | **already ruled out by POC 3** — a check drawn from the same source as the data cannot validate it. |
+| **F.** transport metadata: `sqlite3_proc_child_count()` plus a wire frame field | invisible to flat clients, no grammar, no column-count change; costs a new API and a wire change, and still needs an opt-in so it does not reintroduce the scan. |
+
+**Recommendation: F, with an explicit opt-in.** Cardinality is *integrity
+metadata about the transfer*, not data about the posts — it belongs on the
+statement rather than in the row, and the wire codec already has frame types to
+carry it. D is the honest runner-up and is easier to test, but it makes an
+integrity check into a user-visible column, and a client can then read it,
+believe it, and never check it.
+
+**What it can and cannot catch, to be recorded in the docs and not only the
+code:** transport integrity, not query correctness. A logic error inside the
+body produces consistent counts and passes. And POC 3's balanced misattribution
+— two equal-sized parents whose children are exchanged — is invisible to any
+count-based check at any cost; catching that needs a checksum over correlation
+keys, which is a different feature.
+
+**Not started.** The fork above wants a decision before the red-first spec can
+be written, because the spec's surface *is* the decision.
+
+## Phase 4 — per-parent cardinality *(as originally planned)*
 
 **Deliverable.** Each parent carries the number of children belonging to it.
 
