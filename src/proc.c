@@ -220,6 +220,9 @@ struct ProcEmit {
   int nNested;            /* Nested tables in this shape (parent rows only) */
   const char *zNested;    /* Nested table name, or NULL if this is the parent */
   int iKeyCol;            /* 1-based position of the correlation column */
+  int iDeclPos;           /* 0-based position of this nested table in the shape */
+  int iParentKeyCol;      /* 1-based position of the key among value columns */
+  ProcParamList *pNested; /* The nested table's declared columns */
 };
 
 typedef struct ProcConf ProcConf;
@@ -231,6 +234,7 @@ struct ProcConf {
   ProcEmit *aEmit;        /* Those result sets, in wire order */
   const char *zWhere;     /* " in the THEN branch" etc, or "" at top level */
   int nErr;               /* Nonzero once an error has been reported */
+  TriggerStep *pParentStep;  /* Statement of the parent segment being walked */
 };
 
 /* How a walked statement list ended */
@@ -325,6 +329,111 @@ static void procCheckLoopBody(ProcConf *p, TriggerStep *pList){
   }
 }
 
+static void procTokenSet(Token *pTok, const char *z){
+  pTok->z = z;
+  pTok->n = (unsigned)sqlite3Strlen30(z);
+}
+
+/*
+** Add the flat-client column to the parent SELECT -- PLAN-NESTED phase 5b.
+**
+** The parent gains a result column at the nested table's DECLARED position:
+**
+**   (SELECT json_group_array(json_object('c1', jsonval(<c1 expr>), ...))
+**      FROM <the child's FROM>
+**     WHERE <the child's WHERE> AND <child key expr> = <parent key expr>)
+**
+** Built from COPIES OF THE PROJECTED EXPRESSIONS on both sides rather than
+** from column names.  The declaration is the interface, so a body's SELECT
+** need not spell its columns the way the shape does; a name-based correlation
+** would depend on a coincidence.  This is the same reason phase 3's ORDER BY
+** is a copy of the projection, and the reason it had to become one.
+**
+** The result is that sqlite3_column_count() is 3 STRUCTURALLY -- the parent row
+** genuinely has three registers -- rather than by a layer reporting a width the
+** row does not have.  That mismatch is what produced the fabricated value this
+** feature was first caught on.
+**
+** Cost, recorded where it happens: the subquery is evaluated for every parent
+** row whether or not the client reads the column.  Segment-aware clients are
+** unaffected; they ignore this column and read the child segment, which is
+** still lazy and still ordered.
+*/
+static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
+  Parse *pParse = p->pParse;
+  sqlite3 *db = pParse->db;
+  TriggerStep *pParent = p->pParentStep;
+  ExprList *pArgs = 0, *pOld, *pPE;
+  Expr *pObj, *pAgg, *pSel, *pEq;
+  Select *pSub;
+  Token tk;
+  int i;
+
+  if( pParent==0 || pParent->pSelect==0 ) return;
+  if( pParent->pSelect->pEList==0 ) return;
+  if( pE->pNested==0 || pE->iParentKeyCol<=0 ) return;
+  if( pE->iParentKeyCol>pParent->pSelect->pEList->nExpr ) return;
+
+  pSub = sqlite3SelectDup(db, pChild->pSelect, 0);
+  if( pSub==0 ) return;
+  /* The imposed ordering is for the segment, not for this aggregate. */
+  sqlite3ExprListDelete(db, pSub->pOrderBy);
+  pSub->pOrderBy = 0;
+  pOld = pSub->pEList;
+  if( pOld==0 || pOld->nExpr<pE->pNested->nParam || pE->iKeyCol>pOld->nExpr ){
+    pSub->pEList = 0;
+    sqlite3SelectDelete(db, pSub);
+    sqlite3ExprListDelete(db, pOld);
+    return;
+  }
+
+  for(i=0; i<pE->pNested->nParam; i++){
+    Expr *pVal;
+    procTokenSet(&tk, pE->pNested->a[i].zName);
+    pArgs = sqlite3ExprListAppend(pParse, pArgs,
+              sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
+    pVal = sqlite3ExprDup(db, pOld->a[i].pExpr, 0);
+    procTokenSet(&tk, "sqlite_proc_jsonval");
+    pVal = sqlite3ExprFunction(pParse,
+             sqlite3ExprListAppend(pParse, 0, pVal), &tk, 0);
+    pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
+  }
+  procTokenSet(&tk, "json_object");
+  pObj = sqlite3ExprFunction(pParse, pArgs, &tk, 0);
+  procTokenSet(&tk, "json_group_array");
+  pAgg = sqlite3ExprFunction(pParse,
+           sqlite3ExprListAppend(pParse, 0, pObj), &tk, 0);
+
+  pEq = sqlite3PExpr(pParse, TK_EQ,
+          sqlite3ExprDup(db, pOld->a[pE->iKeyCol-1].pExpr, 0),
+          sqlite3ExprDup(db,
+            pParent->pSelect->pEList->a[pE->iParentKeyCol-1].pExpr, 0));
+  pSub->pWhere = pSub->pWhere
+                   ? sqlite3PExpr(pParse, TK_AND, pSub->pWhere, pEq)
+                   : pEq;
+  sqlite3ExprListDelete(db, pOld);
+  pSub->pEList = sqlite3ExprListAppend(pParse, 0, pAgg);
+
+  pSel = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+  if( pSel==0 ){
+    sqlite3SelectDelete(db, pSub);
+    return;
+  }
+  sqlite3PExprAddSelect(pParse, pSel, pSub);
+
+  /* Placed at the DECLARED position, which is not necessarily the end: a shape
+  ** may declare its nested table before the column it correlates on. */
+  pPE = sqlite3ExprListAppend(pParse, pParent->pSelect->pEList, pSel);
+  if( pPE==0 ) return;
+  pParent->pSelect->pEList = pPE;
+  if( pE->iDeclPos < pPE->nExpr-1 ){
+    struct ExprList_item tmp = pPE->a[pPE->nExpr-1];
+    memmove(&pPE->a[pE->iDeclPos+1], &pPE->a[pE->iDeclPos],
+            (pPE->nExpr-1-pE->iDeclPos)*sizeof(pPE->a[0]));
+    pPE->a[pE->iDeclPos] = tmp;
+  }
+}
+
 /*
 ** Impose the child ordering on one nested table's SELECT -- PLAN-NESTED phase
 ** 3, "the lowering".  The author never writes this ORDER BY, which is the
@@ -391,6 +500,7 @@ static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
   ** cannot drift from what the column actually yields. */
   pSel->pOrderBy = sqlite3ExprListAppend(p->pParse, 0,
       sqlite3ExprDup(db, pSel->pEList->a[pE->iKeyCol-1].pExpr, 0));
+  procFoldParent(p, pStep, pE);
   return 0;
 }
 
@@ -466,6 +576,9 @@ static int procCheckList(
           }
           p->nErr = 1;
           break;
+        }
+        if( p->aEmit[i].zNested==0 && p->aEmit[i].nNested>0 ){
+          p->pParentStep = pStep;
         }
         if( p->aEmit[i].zNested && procLowerChild(p, pStep, &p->aEmit[i]) ){
           break;
@@ -608,11 +721,18 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
       /* The parent side of the correlation must name a scalar column of this
       ** same shape -- it is the value the child rows are matched against, and
       ** a name that resolves to nothing would only surface at CALL. */
-      for(j=0; j<pCols->nParam; j++){
-        if( pCols->a[j].pNested==0
-         && sqlite3StrICmp(pCols->a[j].zName, pCol->zKeyParent)==0 ) break;
+      {
+        int nSeen = 0;
+        for(j=0; j<pCols->nParam; j++){
+          if( pCols->a[j].pNested ) continue;
+          nSeen++;
+          if( sqlite3StrICmp(pCols->a[j].zName, pCol->zKeyParent)==0 ){
+            pConf->aEmit[n].iParentKeyCol = nSeen;
+            break;
+          }
+        }
       }
-      if( j>=pCols->nParam ){
+      if( pConf->aEmit[n].iParentKeyCol==0 ){
         sqlite3ErrorMsg(pParse,
           "nested table %s of procedure %s correlates on %s, which is not a "
           "column of the result set that contains it",
@@ -621,6 +741,8 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
       }
       pConf->aEmit[n].nCol = pCol->pNested->nParam;
       pConf->aEmit[n].zNested = pCol->zName;
+      pConf->aEmit[n].iDeclPos = i;
+      pConf->aEmit[n].pNested = pCol->pNested;
       /* Recorded as an ordinal rather than a name because the declaration is
       ** the interface: a body's SELECT need not spell its columns the way the
       ** shape does, so "ORDER BY 2" is right where "ORDER BY post_id" would

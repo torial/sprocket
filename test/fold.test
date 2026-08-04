@@ -1,0 +1,76 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-NESTED phase 5b: the flat-client column.  THIS FILE IS THE INVARIANT
+# the whole design was built around:
+#
+#   An unmodified client still works.  sqlite3_column_count() reports 3; the
+#   third column is readable as text (JSON, with BLOBs base64-encoded).
+#
+# Nothing here uses the boundary API.  If any of it needs a segment-aware
+# client to pass, the design is wrong.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix fold
+
+ifcapable {!trigger} { finish_test ; return }
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body BLOB);
+  INSERT INTO posts VALUES(1,'first'),(2,'second'),(3,'lonely');
+  INSERT INTO comments VALUES(1,1,x'00ff10'),(2,1,'plain'),(3,2,NULL);
+  CREATE PROCEDURE pwc()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER, body BLOB)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid, body FROM comments;
+  END;
+} {}
+do_test 1.0 {
+  set S [sqlite3_prepare_v2 db {CALL pwc()} -1 TAIL]
+  set nm {}
+  for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+    lappend nm [sqlite3_column_name $S $i]
+  }
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_column_text $S 2]
+  }
+  sqlite3_finalize $S
+  list [llength $nm] $nm $r
+} {3 {id title comments} {{[{"post_id":1,"cid":1,"body":"AP8Q"},{"post_id":1,"cid":2,"body":"plain"}]} {[{"post_id":2,"cid":3,"body":null}]} {[]}}}
+
+# The same call through plain execsql -- no prepare, no column indexing, no
+# boundary API: the way the stock shell sees it.  Three values per row.
+do_execsql_test 1.1 {
+  CALL pwc();
+} {1 first {[{"post_id":1,"cid":1,"body":"AP8Q"},{"post_id":1,"cid":2,"body":"plain"}]} 2 second {[{"post_id":2,"cid":3,"body":null}]} 3 lonely {[]}}
+
+# BLOB fidelity is the reason the feature exists (POC 1): the child blob
+# survives as base64 and decodes back to the original bytes.
+do_execsql_test 2.0 {
+  SELECT unhex(hex(x'00ff10')) = x'00ff10';
+} {1}
+
+# A childless parent yields [], not NULL, so a reassembler needs no special
+# case -- pinned here against the generated form, not just the hand-written
+# one in foldshape.test.
+do_test 2.1 {
+  set S [sqlite3_prepare_v2 db {CALL pwc()} -1 TAIL]
+  set last {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { set last [sqlite3_column_text $S 2] }
+  sqlite3_finalize $S
+  set last
+} {[]}
+finish_test

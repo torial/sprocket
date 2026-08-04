@@ -2982,7 +2982,10 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
         nVal++;
       }
     }
-    if( nVal>maxCol ) maxCol = nVal;
+    /* The parent descriptor reports ALL declared columns, including the nested
+    ** ones: phase 5b puts a generated correlated subquery in the parent SELECT
+    ** at each nested position, so the row genuinely has that many registers. */
+    if( pC->nParam>maxCol ) maxCol = pC->nParam;
     nSet++;
   }
   if( nSet==0 || maxCol==0 ) return;
@@ -2995,20 +2998,14 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes){
   for(pS=pShapes; pS; pS=pS->pNext){
     ProcParamList *pC = pS->pCols;
     VdbeProcSet *pDest = &p->aProcSet[i++];
-    int j, nVal = 0;
-    for(j=0; j<pC->nParam; j++){
-      if( pC->a[j].pNested==0 ) nVal++;
-    }
-    pDest->nCol = (u16)nVal;
-    pDest->azName = sqlite3DbMallocZero(db, nVal*sizeof(char*));
-    pDest->azType = sqlite3DbMallocZero(db, nVal*sizeof(char*));
+    int j;
+    pDest->nCol = (u16)pC->nParam;
+    pDest->azName = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
+    pDest->azType = sqlite3DbMallocZero(db, pC->nParam*sizeof(char*));
     if( pDest->azName==0 || pDest->azType==0 ) return;
-    nVal = 0;
     for(j=0; j<pC->nParam; j++){
-      if( pC->a[j].pNested ) continue;
-      pDest->azName[nVal] = sqlite3DbStrDup(db, pC->a[j].zName);
-      pDest->azType[nVal] = sqlite3DbStrDup(db, pC->a[j].zType);
-      nVal++;
+      pDest->azName[j] = sqlite3DbStrDup(db, pC->a[j].zName);
+      pDest->azType[j] = sqlite3DbStrDup(db, pC->a[j].zType);
     }
     /* Then one segment per nested table, in declaration order -- the order
     ** the body's SELECTs must follow, which conformance already enforced. */
