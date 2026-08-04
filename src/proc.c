@@ -2008,6 +2008,25 @@ static void procCachePopulate(
 ** SELECT statements in the body stream out of the sub-frame through the
 ** ordinary sqlite3_step() interface.
 */
+/*
+** CALL ... RETURNING <names> -- DOCKET 3c, projection.  Not implemented yet;
+** the grammar exists so that test/proc3c.test can be written red against the
+** intended surface.  Refusing loudly is the only honest stub: silently
+** ignoring the clause would make every projection test pass by returning the
+** unprojected shape.
+*/
+void sqlite3CallProcProject(
+  Parse *pParse,
+  SrcList *pName,
+  ExprList *pArgs,
+  IdList *pProj
+){
+  sqlite3ErrorMsg(pParse, "CALL ... RETURNING is not implemented yet");
+  sqlite3IdListDelete(pParse->db, pProj);
+  sqlite3SrcListDelete(pParse->db, pName);
+  sqlite3ExprListDelete(pParse->db, pArgs);
+}
+
 void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs){
   sqlite3 *db = pParse->db;
   Proc *pProc = 0;

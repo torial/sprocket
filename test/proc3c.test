@@ -1,0 +1,146 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# DOCKET 3c -- projection.  THIS FILE IS WRITTEN RED, ON PURPOSE, BEFORE THE
+# FEATURE EXISTS.  It is the specification: each case states what the engine
+# must do, and the file going green is the definition of 3c being done.
+#
+# Do not adjust an expectation here to make the suite pass.  If an expectation
+# is wrong, the DESIGN is wrong and the docket entry needs changing first.
+#
+# Why this exists: phase 5b put the flat-client fold in the parent SELECT, so
+# every client pays for it.  Stepping the parent scans children nothing read,
+# and a segment-aware client that then reads the child segment scans them
+# twice.  proc6-8.5/8.6 pin that at 4 and 8.  This feature returns them to 0
+# and 4, which is the headline measurement of the whole exercise.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc3c
+
+ifcapable {!trigger} { finish_test ; return }
+
+set ::nscan 0
+proc tally_cb {v} { incr ::nscan ; return $v }
+db function tally tally_cb
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER);
+  CREATE TABLE tags(tid INTEGER PRIMARY KEY, post_id INTEGER, tag TEXT);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,1),(2,1),(3,2),(4,2);
+  INSERT INTO tags VALUES(1,1,'x'),(2,2,'y');
+  CREATE PROCEDURE pwc()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, tally(cid) FROM comments;
+  END;
+} {}
+
+proc shapeof {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  set nm {}
+  for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+    lappend nm [sqlite3_column_name $S $i]
+  }
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  return $nm
+}
+
+#--------------------------------------------------------------------
+# 1.x: the default is unchanged -- THIS IS THE CONTROL AND MUST PASS TODAY
+#
+# If this ever fails, projection has broken the invariant, which is the one
+# thing it may not do.
+#
+do_test 1.0 { shapeof {CALL pwc()} } {id title comments}
+
+#--------------------------------------------------------------------
+# 2.x: projecting away the nested table
+#
+do_test 2.0 { shapeof {CALL pwc() RETURNING id, title} } {id title}
+
+# Naming the nested table explicitly keeps it.
+do_test 2.1 { shapeof {CALL pwc() RETURNING id, comments} } {id comments}
+
+# Order follows the DECLARATION, not the RETURNING list: the clause selects
+# columns, it does not reorder them.
+do_test 2.2 { shapeof {CALL pwc() RETURNING title, id} } {id title}
+
+#--------------------------------------------------------------------
+# 3.x: THE HEADLINE -- the double scan disappears
+#
+do_test 3.0 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL pwc() RETURNING id, title} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {0}
+
+do_test 3.1 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL pwc() RETURNING id, title} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {4}
+
+#--------------------------------------------------------------------
+# 4.x: THE CACHE-KEY BUG, predicted before it was written
+#
+# The proc cache is keyed by procedure.  Two projections of the SAME procedure
+# on the SAME connection must not share a compiled body.  Prepared together and
+# alive at once, so a cache that ignores the projection cannot hide behind
+# statement lifetime.
+#
+do_test 4.0 {
+  set A [sqlite3_prepare_v2 db {CALL pwc()} -1 T1]
+  set B [sqlite3_prepare_v2 db {CALL pwc() RETURNING id, title} -1 T2]
+  set r [list [sqlite3_column_count $A] [sqlite3_column_count $B]]
+  sqlite3_finalize $A
+  sqlite3_finalize $B
+  set r
+} {3 2}
+
+# And in the other order, in case the first one compiled wins.
+do_test 4.1 {
+  set B [sqlite3_prepare_v2 db {CALL pwc() RETURNING id, title} -1 T2]
+  set A [sqlite3_prepare_v2 db {CALL pwc()} -1 T1]
+  set r [list [sqlite3_column_count $A] [sqlite3_column_count $B]]
+  sqlite3_finalize $A
+  sqlite3_finalize $B
+  set r
+} {3 2}
+
+#--------------------------------------------------------------------
+# 5.x: misuse is refused, not silently ignored
+#
+do_catchsql_test 5.0 {
+  CALL pwc() RETURNING id, nosuchcolumn;
+} {1 {procedure pwc has no result column named nosuchcolumn}}
+
+do_catchsql_test 5.1 {
+  CALL pwc() RETURNING id, id;
+} {1 {result column id named more than once in RETURNING}}
+
+# Projecting nothing but a nested table leaves no column to correlate on.
+do_catchsql_test 5.2 {
+  CALL pwc() RETURNING comments;
+} {1 {RETURNING must keep the column nested table comments correlates on: id}}
+
+finish_test

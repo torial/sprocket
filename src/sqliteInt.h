@@ -5430,6 +5430,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   ProcParamList *sqlite3ProcNestedAppend(Parse*,ProcParamList*,Token*,
                                          ProcParamList*,Token*,Token*);
   int sqlite3ProcSegmentCount(Proc*);
+  void sqlite3CallProcProject(Parse*,SrcList*,ExprList*,IdList*);
   void sqlite3ProcParamListDelete(sqlite3*, ProcParamList*);
   ProcShape *sqlite3ProcShapeAppend(Parse*,ProcShape*,ProcParamList*);
   ProcShape *sqlite3ProcShapeNothing(Parse*,ProcShape*,Token*);

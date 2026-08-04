@@ -2011,6 +2011,22 @@ cmd ::= CALL fullname(X) LP exprlist(Y) RP. {
 cmd ::= CALL fullname(X). {
   sqlite3CallProc(pParse, X, 0);
 }
+// DOCKET 3c, projection.  RETURNING is an existing token, so this is a
+// grammar-only probe: does it attach after CALL without conflicts?
+%type projlist {IdList*}
+%destructor projlist {sqlite3IdListDelete(pParse->db, $$);}
+projlist(A) ::= nm(X). {
+  A = sqlite3IdListAppend(pParse, 0, &X);
+}
+projlist(A) ::= projlist(A) COMMA nm(X). {
+  A = sqlite3IdListAppend(pParse, A, &X);
+}
+cmd ::= CALL fullname(X) LP exprlist(Y) RP RETURNING projlist(P). {
+  sqlite3CallProcProject(pParse, X, Y, P);
+}
+cmd ::= CALL fullname(X) RETURNING projlist(P). {
+  sqlite3CallProcProject(pParse, X, 0, P);
+}
 %endif  !SQLITE_OMIT_PROCEDURE
 
 //////////////////////// ATTACH DATABASE file AS name /////////////////////////
