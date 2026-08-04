@@ -483,9 +483,33 @@ assert holds, and separate *emitted* from *visible*:
   columns to any client that asks — that is the one that will be forgotten,
   so it is written down here.
 
-Hidden columns are a wider change than the rest of phase 4 and touch APIs this
-branch has not otherwise gone near, so step 3 wants its own careful pass rather
-than being finished in the tail of a long session.
+**Sweep of every `nResColumn` reader, done 2026-08-04 before writing any of
+it**, because "it's only two functions" was an assumption and the whole question
+was whether it stays two. Sixteen references across four files:
+
+| | verdict |
+|---|---|
+| `sqlite3_column_count` | **subtract `nHiddenCol`** |
+| `sqlite3_data_count` | **subtract `nHiddenCol`** |
+| `columnName()` — `n = p->nResColumn; N += useType*n` | **MUST NOT CHANGE.** Here `nResColumn` is the *stride* into `aColName`, not a visibility bound. Subtracting would mis-index every name, decltype and database lookup. |
+| `sqlite3_column_*` bounds check `i<p->nResColumn` | leave permissive — this is what lets `sqlite3_proc_child_count()` read past the visible end without a second access path |
+| `OP_ResultRow` assert, explain-mode setup, `aColName` allocation, proc-set application | structural; all take the emitted width |
+
+**So the answer to "will this stay contained?" is yes, and narrower than
+expected: two functions.** The shell and the wire codec never read `nResColumn`
+directly — they go through `sqlite3_column_count`, so fixing that one covers
+them transitively.
+
+The parallel-flow safety comes from `nHiddenCol` being **zero for every
+statement that is not a `WITH COUNTS` CALL** — every existing path takes a
+subtract-zero — rather than from duplicating the API into `sqlite3_proc_*`
+variants. Variants were considered and rejected: they would leave the counts in
+the result row as trailing columns for anyone using the standard API, which is
+option D's semantics wearing F's surface, and they would fork "how many columns
+does this statement have" into two functions that must agree forever.
+
+`columnName()` is the finding that justified doing the sweep. It reads exactly
+like the other two and means something entirely different.
 
 **Guard already in place:** `proc4c-2.2` passes today and must keep passing. If
 a count is ever computed for a statement that did not ask, it goes red and says
