@@ -1340,6 +1340,69 @@ static void charFunc(
 ** The hex() function.  Interpret the argument as a blob.  Return
 ** a hexadecimal rendering as text.
 */
+/*
+** sqlite_proc_jsonval(V) -- internal.  Emitted only by the SQL that
+** CREATE PROCEDURE generates for a nested result table's flat-client column;
+** it is not part of the documented function set.
+**
+** Returns V unchanged unless V is a BLOB, in which case it returns V
+** base64-encoded as text.  json_object() refuses a BLOB outright (POC 1), so
+** without this the whole feature would be unable to carry the one data type
+** that motivated it.
+**
+** One pass-through function rather than a generated
+** "CASE WHEN typeof(x)='blob' THEN ... ELSE x END" per column: that form would
+** duplicate every child expression three times in the generated tree, and a
+** duplicated expression is a place for two copies to disagree.
+*/
+static void procJsonValFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  static const char zB64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const unsigned char *a;
+  unsigned char *zOut;
+  int n, i, j;
+  assert( argc==1 );
+  UNUSED_PARAMETER(argc);
+  if( sqlite3_value_type(argv[0])!=SQLITE_BLOB ){
+    sqlite3_result_value(context, argv[0]);
+    return;
+  }
+  a = sqlite3_value_blob(argv[0]);
+  n = sqlite3_value_bytes(argv[0]);
+  if( a==0 || n<=0 ){
+    sqlite3_result_text(context, "", 0, SQLITE_STATIC);
+    return;
+  }
+  if( n > (SQLITE_MAX_LENGTH-4)/4*3 ){
+    sqlite3_result_error_toobig(context);
+    return;
+  }
+  zOut = sqlite3_malloc64(((sqlite3_int64)n+2)/3*4 + 1);
+  if( zOut==0 ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+  for(i=0, j=0; i+2<n; i+=3){
+    zOut[j++] = zB64[ a[i]>>2 ];
+    zOut[j++] = zB64[ ((a[i]&0x03)<<4) | (a[i+1]>>4) ];
+    zOut[j++] = zB64[ ((a[i+1]&0x0f)<<2) | (a[i+2]>>6) ];
+    zOut[j++] = zB64[ a[i+2]&0x3f ];
+  }
+  if( i<n ){
+    unsigned char c1 = a[i];
+    unsigned char c2 = (i+1<n) ? a[i+1] : 0;
+    zOut[j++] = zB64[ c1>>2 ];
+    zOut[j++] = zB64[ ((c1&0x03)<<4) | (c2>>4) ];
+    zOut[j++] = (i+1<n) ? zB64[ (c2&0x0f)<<2 ] : '=';
+    zOut[j++] = '=';
+  }
+  sqlite3_result_text(context, (char*)zOut, j, sqlite3_free);
+}
+
 static void hexFunc(
   sqlite3_context *context,
   int argc,
@@ -3337,6 +3400,9 @@ void sqlite3RegisterBuiltinFunctions(void){
     FUNCTION(upper,              1, 0, 0, upperFunc        ),
     FUNCTION(lower,              1, 0, 0, lowerFunc        ),
     FUNCTION(hex,                1, 0, 0, hexFunc          ),
+#ifndef SQLITE_OMIT_PROCEDURE
+    FUNCTION(sqlite_proc_jsonval,1, 0, 0, procJsonValFunc  ),
+#endif
     FUNCTION(unhex,              1, 0, 0, unhexFunc        ),
     FUNCTION(unhex,              2, 0, 0, unhexFunc        ),
     FUNCTION(concat,            -3, 0, 0, concatFunc       ),

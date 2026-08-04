@@ -1,0 +1,23 @@
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix b64
+# Pass-through for every non-BLOB type.
+do_execsql_test 1.0 {
+  SELECT sqlite_proc_jsonval(7), sqlite_proc_jsonval(2.5),
+         sqlite_proc_jsonval('t'), typeof(sqlite_proc_jsonval(NULL));
+} {7 2.5 t null}
+# All three padding cases, against known vectors.
+do_execsql_test 2.0 {
+  SELECT sqlite_proc_jsonval(x'4d616e'), sqlite_proc_jsonval(x'4d61'),
+         sqlite_proc_jsonval(x'4d'), sqlite_proc_jsonval(x'00ff10'),
+         sqlite_proc_jsonval(x'');
+} {TWFu TWE= TQ== AP8Q {}}
+# A BLOB becomes TEXT, which is the point -- json_object refuses BLOBs.
+do_execsql_test 2.1 { SELECT typeof(sqlite_proc_jsonval(x'00ff10')) } {text}
+do_execsql_test 2.2 { SELECT json_object('b', sqlite_proc_jsonval(x'00ff10')) } {{{"b":"AP8Q"}}}
+# Longer input: length must be ceil(n/3)*4 and decode back to the original.
+do_execsql_test 3.0 {
+  SELECT length(sqlite_proc_jsonval(randomblob(300))) ,
+         length(sqlite_proc_jsonval(randomblob(301)));
+} {400 404}
+finish_test
