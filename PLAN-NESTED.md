@@ -422,8 +422,37 @@ body produces consistent counts and passes. And POC 3's balanced misattribution
 count-based check at any cost; catching that needs a checksum over correlation
 keys, which is a different feature.
 
-**Not started.** The fork above wants a decision before the red-first spec can
-be written, because the spec's surface *is* the decision.
+**DECIDED 2026-08-04: option F**, transport metadata, opt-in.
+
+The argument that settled it is that **the second payload is already named**.
+POC 3 recorded that balanced misattribution needs a checksum over correlation
+keys — per-parent, per-nested-table integrity metadata, the same shape as the
+count. A known second user is the usual threshold for building a mechanism
+rather than a column, and this one was recorded before the question came up
+rather than invented to justify the answer. Truncation flags, partial-failure
+state and per-segment scan counts fit the same channel.
+
+Under D each of those is a new column, a new grammar form, and a client that has
+to be taught about it. Under F they are fields in a frame the client already
+parses. **The channel is the expensive part; payloads after the first are
+cheap** — and `proc_wire.c` already exists with a measured integrity story
+(301 mutations probed, 131 rejected, 170 visible, **0 silent**), so this adds a
+field to a tested codec rather than inventing a channel.
+
+Recorded against it, honestly: it is a mechanism for one integer today; channels
+attract metadata nobody validates; and a new `sqlite3_proc_*` entry point is
+fork surface upstream does not have, forever. The thing that would have changed
+the answer is deciding never to pursue the checksum.
+
+**Surface:**
+
+```
+CALL p(args) [RETURNING <names>] WITH COUNTS
+sqlite3_proc_child_count(stmt, iNested)   -- current parent row
+```
+
+Opt-in because counting costs the same scan the fold costs, and 3c exists to
+let a client decline it. `test/proc4c.test` is the spec, written red.
 
 ## Phase 4 — per-parent cardinality *(as originally planned)*
 

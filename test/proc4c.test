@@ -1,0 +1,149 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-NESTED phase 4 -- per-parent cardinality, delivered as TRANSPORT
+# METADATA (option F).  WRITTEN RED, BEFORE THE FEATURE.  This file is the
+# specification; it going green is the definition of phase 4 being done.
+#
+# Do not adjust an expectation to make the suite pass.  If one is wrong, the
+# design is wrong and PLAN-NESTED changes first.
+#
+# Surface:
+#     CALL p(args) [RETURNING <names>] WITH COUNTS
+#     sqlite3_proc_child_count(stmt, iNested)  -- current parent row,
+#                                                 iNested-th nested table
+#
+# Opt-in, because counting a parent's children costs the same scan the fold
+# costs and DOCKET 3c exists to let a client decline that scan.  Metadata
+# rather than a column, because an integrity check that arrives as a column can
+# be read, believed, and never checked -- and because the next payload for this
+# channel is already named (POC 3's checksum over correlation keys).
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proc4c
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER);
+  INSERT INTO posts VALUES(1,'a'),(2,'b'),(3,'lonely');
+  INSERT INTO comments VALUES(1,1),(2,1),(3,1),(4,2);
+  CREATE PROCEDURE pwc()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid FROM comments;
+  END;
+} {}
+
+# Expected magnitudes stated before anything is compared: post 1 has three
+# children, post 2 has one, post 3 has none.
+do_execsql_test 0.1 {
+  SELECT (SELECT count(*) FROM comments WHERE post_id=1),
+         (SELECT count(*) FROM comments WHERE post_id=2),
+         (SELECT count(*) FROM comments WHERE post_id=3);
+} {3 1 0}
+
+proc counts {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_proc_child_count $S 0]
+  }
+  sqlite3_finalize $S
+  return $r
+}
+
+#--------------------------------------------------------------------
+# 1.x: the counts themselves
+#
+do_test 1.0 { counts {CALL pwc() WITH COUNTS} } {3 1 0}
+
+# A CHILDLESS PARENT REPORTS 0, NOT -1.  "No children" and "not asked" must be
+# distinguishable, or a reassembler cannot tell an empty set from a missing
+# answer -- which is the whole point of an integrity channel.
+do_test 1.1 { lindex [counts {CALL pwc() WITH COUNTS}] 2 } {0}
+
+# Counts survive projecting the fold away -- that combination IS the typed
+# client, and it is the one the feature exists for.
+do_test 1.2 { counts {CALL pwc() RETURNING id, title WITH COUNTS} } {3 1 0}
+
+#--------------------------------------------------------------------
+# 2.x: NOT asking is distinguishable from asking, and costs nothing
+#
+do_test 2.0 { counts {CALL pwc()} } {-1 -1 -1}
+
+# THE OPT-IN CONTROL: without WITH COUNTS there is no extra scan.  If this ever
+# reads more than 0, cardinality has silently reintroduced the cost DOCKET 3c
+# removed, and the opt-in is decorative.
+set ::nscan 0
+proc tally_cb {v} { incr ::nscan ; return $v }
+db function tally tally_cb
+do_execsql_test 2.1 {
+  CREATE PROCEDURE lazy()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT post_id, tally(cid) FROM comments;
+  END;
+} {}
+do_test 2.2 {
+  set ::nscan 0
+  set S [sqlite3_prepare_v2 db {CALL lazy() RETURNING id} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+  set ::nscan
+} {0}
+
+#--------------------------------------------------------------------
+# 3.x: the invariant is untouched
+#
+# WITH COUNTS must not change what any client SEES -- it is metadata, not data.
+# If column_count moves, F has become A and the invariant is broken.
+#
+do_test 3.0 {
+  set S [sqlite3_prepare_v2 db {CALL pwc() WITH COUNTS} -1 TAIL]
+  set n [sqlite3_column_count $S]
+  set nm {}
+  for {set i 0} {$i < $n} {incr i} { lappend nm [sqlite3_column_name $S $i] }
+  sqlite3_finalize $S
+  list $n $nm
+} {3 {id title comments}}
+
+# And the folded JSON is byte-identical with and without the request.
+do_test 3.1 {
+  set a [execsql {CALL pwc()}]
+  set b [execsql {CALL pwc() WITH COUNTS}]
+  expr {$a eq $b}
+} {1}
+
+#--------------------------------------------------------------------
+# 4.x: misuse
+#
+do_catchsql_test 4.0 {
+  CREATE PROCEDURE flat() RETURNS TABLE(id INTEGER) BEGIN SELECT id FROM posts; END;
+  CALL flat() WITH COUNTS;
+} {1 {procedure flat declares no nested table to count}}
+
+# An out-of-range nested index is a clean -1, not a crash or a stale number.
+do_test 4.1 {
+  set S [sqlite3_prepare_v2 db {CALL pwc() WITH COUNTS} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_proc_child_count $S 5] [sqlite3_proc_child_count $S -1]]
+  sqlite3_finalize $S
+  set r
+} {-1 -1}
+
+finish_test
