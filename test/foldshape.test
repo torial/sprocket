@@ -1,0 +1,74 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# The SQL shape PLAN-NESTED phase 5b generates for the flat-client column,
+# pinned by hand before the engine generates it.  These are the properties the
+# generated form has to preserve; if one changes, the generator is wrong or the
+# design needs revisiting.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix foldshape
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body BLOB);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,1,x'00ff10'),(2,1,'plain'),(3,2,NULL);
+} {}
+
+# POC 1's finding, re-confirmed on THIS build rather than trusted from notes:
+# json_group_array refuses a BLOB.  That refusal is why the feature earns its
+# place on type fidelity, and why encoding BLOB children is load-bearing rather
+# than decorative.  If this stops erroring, revisit the design.
+do_catchsql_test 1.0 {
+  SELECT json_group_array(body) FROM comments
+} {1 {JSON cannot hold BLOB values}}
+
+# The target shape: a correlated subquery producing the nested table as JSON.
+# hex() stands in for the BLOB encoder here -- see 3.0.
+do_execsql_test 2.0 {
+  SELECT id, title,
+    (SELECT json_group_array(json_object(
+              'post_id', post_id, 'cid', cid,
+              'body', CASE WHEN typeof(body)='blob' THEN hex(body) ELSE body END))
+       FROM (SELECT post_id, cid, body FROM comments)
+      WHERE post_id = posts.id)
+  FROM posts;
+} {1 first {[{"post_id":1,"cid":1,"body":"00FF10"},{"post_id":1,"cid":2,"body":"plain"}]} 2 second {[{"post_id":2,"cid":3,"body":null}]}}
+
+# A childless parent yields an EMPTY ARRAY, not NULL.  Worth pinning because a
+# reassembler should not have to special-case childlessness, and because it
+# falls out of json_group_array rather than needing code.
+do_execsql_test 2.1 {
+  INSERT INTO posts VALUES(3,'lonely');
+  SELECT (SELECT json_group_array(json_object('cid', cid))
+            FROM (SELECT cid, post_id FROM comments) WHERE post_id = posts.id)
+    FROM posts WHERE id = 3;
+} {[]}
+
+# R6 assumed ext/misc's base64() was available.  It is COMPILED IN but not
+# REGISTERED: basexx.c exposes sqlite3_basexx_init() as a loadable extension,
+# so a default build has no base64() function at all.  Pinned so that the day
+# this changes is noticed rather than assumed.
+do_catchsql_test 3.0 {
+  SELECT base64(x'00ff10')
+} {1 {no such function: base64}}
+
+# hex() is always available and round-trips, so it is the fallback if the fork
+# decides not to expose an encoder of its own.  Twice the size of base64.
+do_execsql_test 3.1 {
+  SELECT unhex(hex(x'00ff10')) = x'00ff10';
+} {1}
+
+finish_test

@@ -441,7 +441,63 @@ grouping, no error, POC 2's signature. Nothing else in the suite detects the
 ordering, so that one case carries it. Observed red, not merely believed capable
 of it.
 
-## Phase 5b — the flat-client column
+## Phase 5b — the flat-client column — *design settled, implementation next*
+
+**The column is generated as SQL, not assembled in C.** At CALL-compile time the
+parent `SELECT` gains a result column at the nested position:
+
+```sql
+(SELECT json_group_array(json_object('post_id', post_id, 'cid', cid, 'body', body))
+   FROM (<the child SELECT, verbatim>)
+  WHERE post_id = <copy of the parent's projected key expression>)
+```
+
+The correlation reference is a **copy of the parent's projected key expression**
+— the same technique that fixed phase 3's ordering, and for the same reason: it
+cannot drift from what the column actually yields.
+
+**Why this rather than the parent-buffer layer.** The buffering design meant new
+state on the statement and new behaviour in `sqlite3_step`, `sqlite3_column_*`,
+`reset` and `finalize` — a large surface with lifetime bugs that tests pass
+over. The rewrite reuses machinery that is already correct and already tested,
+and `sqlite3_column_count` becomes 3 *structurally*, because the parent row
+genuinely has three registers. That was the strongest argument for the engine
+fold all along; it turns out to be available without giving up the segments.
+
+**What it costs, stated plainly: the flat path is EAGER.** The subquery is
+evaluated for every parent row whether or not the client reads the column, so
+phase 5's laziness test does not hold for flat clients — and laziness was the
+argument that chose the boundary fold over the engine fold. Two things make this
+acceptable rather than a quiet reversal. Segment-aware clients are unaffected:
+the child segment is still lazy, still ordered, still what `procgen` consumes,
+and `proc6` section 8 pins it. And the property is recoverable later behind the
+same surface — DOCKET 3c's projection lets a client say up front that it does
+not want the column, which is *better* than discovering it afterwards.
+
+**Both views coexist.** A flat client sees three columns and stops at segment 1;
+a segment-aware client ignores the column and advances. A client doing both
+scans the children twice — documented, not prevented.
+
+### Verified by hand before generating any of it (`test/foldshape.test`)
+
+- **POC 1's refusal still holds on this build** — `json_group_array` rejects a
+  BLOB (`"JSON cannot hold BLOB values"`). Encoding BLOB children is load-bearing,
+  not decorative.
+- **A childless parent yields `[]`, not NULL** — falls out of
+  `json_group_array`, so a reassembler needs no special case.
+- **R6 was wrong about base64.** `ext/misc/basexx.c` is compiled in but exposes
+  `sqlite3_basexx_init()` as a *loadable extension*, so a default build has **no
+  `base64()` function**. The plan assumed it "already ships" and it does not, in
+  the sense that matters.
+
+**Decision that follows, and it wants a name rather than a borrowed one:** the
+fold needs an SQL-callable encoder. `hex()` always exists but doubles the payload
+where base64 costs 1.33×. Registering `base64()` globally changes the function
+namespace for every database in the fork. The narrower move is an *internal*
+built-in used only by generated fold SQL — separation, in the sense of keeping
+the fold's machinery out of the user's namespace where it could be relied on or
+collided with.
+
 
 **Deliverable.** The third column, lazy: materialised as JSON only when a
 client actually reads it. BLOB children base64-encoded (R6); `ext/misc/base64.c`
