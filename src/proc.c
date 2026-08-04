@@ -411,17 +411,20 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
   }
   if( pOuter==0 ) return 1;
 
-  pWrap = sqlite3SelectNew(pParse, pOuter, 0, 0, 0, 0, 0, 0, 0);
-  if( pWrap==0 ) return 1;
+  /* Build the FROM clause BEFORE the Select, and hand it in.  Passing 0 for
+  ** pSrc makes sqlite3SelectNew() allocate an empty SrcList of its own
+  ** (select.c: "if( pSrc==0 ) pSrc = sqlite3DbMallocZero(...)"), and assigning
+  ** over pWrap->pSrc afterwards orphans it -- one leaked lookaside allocation
+  ** per generated fold, invisible in a release build because the assert that
+  ** catches it is compiled out. */
   procTokenSet(&tAlias, PROC_PARENT_ALIAS);
   pSrc = sqlite3SrcListAppendFromTerm(pParse, 0, 0, 0, &tAlias, pInner, 0);
   if( pSrc==0 ){
-    pWrap->pEList = 0;
-    sqlite3SelectDelete(db, pWrap);
     sqlite3ExprListDelete(db, pOuter);
     return 1;
   }
-  pWrap->pSrc = pSrc;
+  pWrap = sqlite3SelectNew(pParse, pOuter, pSrc, 0, 0, 0, 0, 0, 0);
+  if( pWrap==0 ) return 1;   /* SelectNew took pOuter and pSrc either way */
   *ppSel = pWrap;
   return 0;
 }

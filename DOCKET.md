@@ -701,6 +701,38 @@ output model and should be settled before the emitter is written.
 
 ---
 
+## 3d. `mayAbort` assertion in stored procedures — *a real bug, inherited*
+
+**Found 2026-08-04 by building `DEBUG=3`.** Every build of this fork's
+procedure work had been `-O2` with `NDEBUG`, so no `assert()` had ever run.
+
+```
+proc1-2.3 ... Assertion failed:
+  !pParse->isMultiWrite || sqlite3VdbeAssertMayAbort(v, pParse->mayAbort)
+```
+
+Reproduces in `proc1`, `proc4`, `proc5` and `psm1` — the suites that predate
+nested shapes. **Confirmed pre-existing** by checking out `stored-procs` at
+`a0dabed7`, building it in debug, and reproducing at the same test. It is not a
+nested-shapes regression.
+
+The statement is marked multi-write without the matching abort flag. The
+suspect region is the proc cache's replay of toplevel bookkeeping — it sets
+`sqlite3MultiWrite()` and `sqlite3MayAbort()` from separate cached flags
+(`PROCCACHE_WRITES`, `PROCCACHE_MAYABORT`), so a body that reaches one without
+the other would produce exactly this. **That is a hypothesis; localise before
+fixing**, the way the lookaside leak was localised rather than guessed.
+
+**Belongs on `stored-procs`, not `nested-shapes`.** It affects the shipped
+procedure feature regardless of nesting, and fixing it on a feature branch would
+bury a general fix inside an unrelated merge.
+
+**Standing lesson:** a release-only test regime cannot see any `assert()`, and
+SQLite is unusually assert-dense. `DEBUG=3` belongs in the routine, not in the
+occasional deep check.
+
+---
+
 ## 4. Incremental view maintenance — *the big one, and the one I most want*
 
 Materialized views that update as writes land rather than being recomputed.
