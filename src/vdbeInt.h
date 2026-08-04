@@ -515,6 +515,7 @@ struct Vdbe {
   VdbeProcSet *aProcSet;  /* Declared result sets of a CALL, or NULL */
   u8 nProcSet;            /* Number of entries in aProcSet[] */
   u8 iProcSet;            /* Set currently being delivered */
+  u16 nHiddenCol;         /* Trailing result columns not shown to clients */
   u8 nChildCnt;           /* Nested tables counted for the current row */
   int *aChildCnt;         /* Their per-parent counts, or NULL if not asked */
   u8 bAtSetEnd;           /* True when paused at a result-set boundary */

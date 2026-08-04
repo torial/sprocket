@@ -1338,10 +1338,26 @@ int sqlite3_aggregate_count(sqlite3_context *p){
 /*
 ** Return the number of columns in the result set for the statement pStmt.
 */
+/*
+** nResColumn counts the columns the statement EMITS; nHiddenCol counts how many
+** of those trailing columns are engine bookkeeping rather than results.  The
+** two client-facing counts below are the only places the difference is applied.
+**
+** Deliberately NOT applied in columnName(), where nResColumn is the STRIDE into
+** aColName rather than a visibility bound -- subtracting there mis-indexes
+** every name, decltype and database lookup.  Nor in the column accessors'
+** bounds check, whose permissiveness is what lets sqlite3_proc_child_count()
+** read past the visible end without a second access path.
+**
+** nHiddenCol is zero for every statement except a CALL that asked for
+** per-parent counts, so every other path takes a subtract-zero.  That, rather
+** than a parallel set of sqlite3_proc_* accessors, is what keeps this
+** contained: there is one route and it is unchanged unless someone asked.
+*/
 int sqlite3_column_count(sqlite3_stmt *pStmt){
   Vdbe *pVm = (Vdbe *)pStmt;
   if( pVm==0 ) return 0;
-  return pVm->nResColumn;
+  return pVm->nResColumn - pVm->nHiddenCol;
 }
 
 /*
@@ -1351,7 +1367,7 @@ int sqlite3_column_count(sqlite3_stmt *pStmt){
 int sqlite3_data_count(sqlite3_stmt *pStmt){
   Vdbe *pVm = (Vdbe *)pStmt;
   if( pVm==0 || pVm->pResultRow==0 ) return 0;
-  return pVm->nResColumn;
+  return pVm->nResColumn - pVm->nHiddenCol;
 }
 
 /*

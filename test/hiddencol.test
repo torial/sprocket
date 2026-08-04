@@ -1,0 +1,94 @@
+# 2026-08-04
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Vdbe.nHiddenCol -- the field that lets a CALL emit engine bookkeeping columns
+# without showing them to clients (PLAN-NESTED phase 4).
+#
+# This file exists to pin that the field is INERT for everything that does not
+# ask for it.  sqlite3_column_count and sqlite3_data_count now subtract it, and
+# those are read by every client of the library, so the blast radius of a
+# mistake here is the whole API rather than one feature.
+#
+# Nothing sets nHiddenCol nonzero yet.  These cases must keep passing when
+# something does.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix hiddencol
+
+do_execsql_test 0.0 {
+  CREATE TABLE t1(a INTEGER, b TEXT, c BLOB);
+  INSERT INTO t1 VALUES(1,'x',NULL),(2,'y',x'00');
+} {}
+
+proc counts {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  set pre [sqlite3_column_count $S]
+  sqlite3_step $S
+  set r [list $pre [sqlite3_column_count $S] [sqlite3_data_count $S]]
+  sqlite3_finalize $S
+  return $r
+}
+
+# A plain SELECT: column_count before stepping, after stepping, and data_count
+# must all agree at 3.
+do_test 1.0 { counts {SELECT a, b, c FROM t1} } {3 3 3}
+
+# Aggregates, expressions and a bare literal.
+do_test 1.1 { counts {SELECT count(*), max(a)+1 FROM t1} } {2 2 2}
+do_test 1.2 { counts {SELECT 1} } {1 1 1}
+
+# A compound and a subquery-bearing statement.
+do_test 1.3 { counts {SELECT a FROM t1 UNION ALL SELECT 9} } {1 1 1}
+
+# PRAGMA and EXPLAIN take their column counts from a different path; both must
+# be untouched.
+do_test 2.0 { expr {[lindex [counts {PRAGMA table_info(t1)}] 1] > 0} } {1}
+do_test 2.1 { expr {[lindex [counts {EXPLAIN SELECT 1}] 1] == 8} } {1}
+do_test 2.2 { expr {[lindex [counts {EXPLAIN QUERY PLAN SELECT a FROM t1}] 1] == 4} } {1}
+
+# A statement that returns no rows: data_count is 0 because there is no row,
+# while column_count still reports the shape.
+do_test 3.0 {
+  set S [sqlite3_prepare_v2 db {SELECT a, b FROM t1 WHERE a = 999} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_column_count $S] [sqlite3_data_count $S]]
+  sqlite3_finalize $S
+  set r
+} {2 0}
+
+# An INSERT: no result columns at all, so the subtraction must not make it
+# negative or nonzero.
+do_test 3.1 {
+  set S [sqlite3_prepare_v2 db {INSERT INTO t1 VALUES(3,'z',NULL)} -1 TAIL]
+  set a [sqlite3_column_count $S]
+  sqlite3_step $S
+  set b [sqlite3_data_count $S]
+  sqlite3_finalize $S
+  list $a $b
+} {0 0}
+
+# Column NAMES must still line up with their columns -- columnName() uses
+# nResColumn as a STRIDE into the name array, not as a visibility bound, so a
+# careless subtraction there would mis-index every name and decltype.
+do_test 4.0 {
+  set S [sqlite3_prepare_v2 db {SELECT a, b, c FROM t1} -1 TAIL]
+  set nm {}
+  set ty {}
+  for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+    lappend nm [sqlite3_column_name $S $i]
+    lappend ty [sqlite3_column_decltype $S $i]
+  }
+  sqlite3_finalize $S
+  list $nm $ty
+} {{a b c} {INTEGER TEXT BLOB}}
+
+finish_test
