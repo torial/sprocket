@@ -93,8 +93,9 @@ do_execsql_test 2.0 {
 #--------------------------------------------------------------------
 # 3.x: the child reads the same table as the parent
 #
-# *** KNOWN FAILING -- THIS FILE FOUND A REAL BUG.  DO NOT "FIX" THE
-# *** EXPECTATION; FIX THE ENGINE. ***
+# This case found a real bug and was red before the fix below; it is the
+# regression test for it.  If it goes red again, the parent is not being
+# wrapped.
 #
 # The generated correlation is <child key expr> = <parent key expr>, both being
 # copies of projected expressions.  When the child's FROM contains a source
@@ -107,7 +108,10 @@ do_execsql_test 2.0 {
 # would do it -- has the same collapse.  The normal case works only because
 # the names happen not to collide.
 #
-# Expected below is the CORRECT answer: post 1 correlates to itself alone.
+# Fixed by wrapping the parent as "FROM (<parent>) AS sqlite_proc_parent" and
+# correlating against sqlite_proc_parent.<key>, a name no child FROM can
+# legally supply -- so the outer reference resolves outward by construction
+# rather than by luck.
 #
 do_execsql_test 3.0 {
   CREATE PROCEDURE selfref(pid INTEGER)

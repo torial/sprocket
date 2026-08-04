@@ -223,6 +223,8 @@ struct ProcEmit {
   int iDeclPos;           /* 0-based position of this nested table in the shape */
   int iParentKeyCol;      /* 1-based position of the key among value columns */
   ProcParamList *pNested; /* The nested table's declared columns */
+  ProcParamList *pShapeCols; /* The whole shape, for wrapping the parent */
+  const char *zKeyParent; /* Declared name of the parent-side key column */
 };
 
 typedef struct ProcConf ProcConf;
@@ -235,6 +237,7 @@ struct ProcConf {
   const char *zWhere;     /* " in the THEN branch" etc, or "" at top level */
   int nErr;               /* Nonzero once an error has been reported */
   TriggerStep *pParentStep;  /* Statement of the parent segment being walked */
+  int bWrapped;              /* True once pParentStep's SELECT has been wrapped */
 };
 
 /* How a walked statement list ended */
@@ -359,6 +362,69 @@ static void procTokenSet(Token *pTok, const char *z){
 ** unaffected; they ignore this column and read the child segment, which is
 ** still lazy and still ordered.
 */
+/* The alias the parent is wrapped under.  Chosen so that no child FROM can
+** legally contain a source of the same name, which is what makes the outer
+** half of the correlation resolve outward by construction rather than by the
+** names happening not to collide. */
+#define PROC_PARENT_ALIAS "sqlite_proc_parent"
+
+/*
+** Wrap a parent SELECT so its columns can be referenced under an alias the
+** inner scope cannot supply:
+**
+**   SELECT <alias>.v1, <alias>.v2 FROM ( <original parent> ) AS <alias>
+**
+** The inner SELECT's outputs are aliased to the DECLARED value-column names,
+** which is legitimate because the declaration is the interface, and which is
+** what makes them referenceable by name at all -- a projected expression need
+** not have one.
+**
+** Called once per parent, however many nested tables it holds.
+*/
+static int procWrapParent(ProcConf *p, TriggerStep *pParent, ProcParamList *pCols){
+  Parse *pParse = p->pParse;
+  sqlite3 *db = pParse->db;
+  Select *pInner = pParent->pSelect;
+  Select *pWrap;
+  ExprList *pOuter = 0;
+  SrcList *pSrc;
+  Token tAlias;
+  int j, iVal = 0;
+
+  for(j=0; j<pCols->nParam; j++){
+    Expr *pDot;
+    Token tTab, tCol;
+    if( pCols->a[j].pNested ) continue;
+    if( iVal>=pInner->pEList->nExpr ) return 1;
+    /* Alias the inner output to its declared name. */
+    sqlite3DbFree(db, pInner->pEList->a[iVal].zEName);
+    pInner->pEList->a[iVal].zEName = sqlite3DbStrDup(db, pCols->a[j].zName);
+    pInner->pEList->a[iVal].fg.eEName = ENAME_NAME;
+    procTokenSet(&tTab, PROC_PARENT_ALIAS);
+    procTokenSet(&tCol, pCols->a[j].zName);
+    pDot = sqlite3PExpr(pParse, TK_DOT,
+             sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
+             sqlite3ExprAlloc(db, TK_ID, &tCol, 0));
+    pOuter = sqlite3ExprListAppend(pParse, pOuter, pDot);
+    iVal++;
+  }
+  if( pOuter==0 ) return 1;
+
+  pWrap = sqlite3SelectNew(pParse, pOuter, 0, 0, 0, 0, 0, 0, 0);
+  if( pWrap==0 ) return 1;
+  procTokenSet(&tAlias, PROC_PARENT_ALIAS);
+  pSrc = sqlite3SrcListAppendFromTerm(pParse, 0, 0, 0, &tAlias, pInner, 0);
+  if( pSrc==0 ){
+    pWrap->pEList = 0;
+    sqlite3SelectDelete(db, pWrap);
+    sqlite3ExprListDelete(db, pOuter);
+    return 1;
+  }
+  pWrap->pSrc = pSrc;
+  pParent->pSelect = pWrap;
+  return 0;
+}
+
 static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   Parse *pParse = p->pParse;
   sqlite3 *db = pParse->db;
@@ -372,6 +438,11 @@ static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   if( pParent==0 || pParent->pSelect==0 ) return;
   if( pParent->pSelect->pEList==0 ) return;
   if( pE->pNested==0 || pE->iParentKeyCol<=0 ) return;
+  if( pE->pShapeCols==0 ) return;
+  if( p->bWrapped==0 ){
+    if( procWrapParent(p, pParent, pE->pShapeCols) ) return;
+    p->bWrapped = 1;
+  }
   if( pE->iParentKeyCol>pParent->pSelect->pEList->nExpr ) return;
 
   pSub = sqlite3SelectDup(db, pChild->pSelect, 0);
@@ -404,10 +475,16 @@ static void procFoldParent(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   pAgg = sqlite3ExprFunction(pParse,
            sqlite3ExprListAppend(pParse, 0, pObj), &tk, 0);
 
-  pEq = sqlite3PExpr(pParse, TK_EQ,
-          sqlite3ExprDup(db, pOld->a[pE->iKeyCol-1].pExpr, 0),
-          sqlite3ExprDup(db,
-            pParent->pSelect->pEList->a[pE->iParentKeyCol-1].pExpr, 0));
+  {
+    Token tTab, tCol;
+    procTokenSet(&tTab, PROC_PARENT_ALIAS);
+    procTokenSet(&tCol, pE->zKeyParent);
+    pEq = sqlite3PExpr(pParse, TK_EQ,
+            sqlite3ExprDup(db, pOld->a[pE->iKeyCol-1].pExpr, 0),
+            sqlite3PExpr(pParse, TK_DOT,
+              sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
+              sqlite3ExprAlloc(db, TK_ID, &tCol, 0)));
+  }
   pSub->pWhere = pSub->pWhere
                    ? sqlite3PExpr(pParse, TK_AND, pSub->pWhere, pEq)
                    : pEq;
@@ -579,6 +656,7 @@ static int procCheckList(
         }
         if( p->aEmit[i].zNested==0 && p->aEmit[i].nNested>0 ){
           p->pParentStep = pStep;
+          p->bWrapped = 0;
         }
         if( p->aEmit[i].zNested && procLowerChild(p, pStep, &p->aEmit[i]) ){
           break;
@@ -743,6 +821,8 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
       pConf->aEmit[n].zNested = pCol->zName;
       pConf->aEmit[n].iDeclPos = i;
       pConf->aEmit[n].pNested = pCol->pNested;
+      pConf->aEmit[n].pShapeCols = pCols;
+      pConf->aEmit[n].zKeyParent = pCol->zKeyParent;
       /* Recorded as an ordinal rather than a name because the declaration is
       ** the interface: a body's SELECT need not spell its columns the way the
       ** shape does, so "ORDER BY 2" is right where "ORDER BY post_id" would

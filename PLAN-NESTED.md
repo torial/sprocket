@@ -441,10 +441,10 @@ grouping, no error, POC 2's signature. Nothing else in the suite detects the
 ordering, so that one case carries it. Observed red, not merely believed capable
 of it.
 
-## OPEN BUG — the generated correlation can resolve inward
+## FIXED — the generated correlation could resolve inward
 
-*Found 2026-08-04 by `test/prochostile.test`, which is red on case 3.0 and must
-stay red until this is fixed. **Fix the engine, not the expectation.***
+*Found 2026-08-04 by `test/prochostile.test` case 3.0, seen red, fixed the same
+day. The fix is the wrapped parent described at the end of this section.*
 
 Phase 5b generates `<child key expr> = <parent key expr>`, both copies of
 projected expressions. **If the child's `FROM` can supply a name matching the
@@ -470,7 +470,21 @@ expression *into a different scope* is a different operation: a duplicated
 expression re-resolves, and re-resolution is exactly what must not happen to the
 outer half of a correlation.
 
-**Fix directions, none yet chosen:**
+**Fixed by wrapping the parent** under an alias the inner scope cannot supply:
+
+```sql
+SELECT sqlite_proc_parent.id, sqlite_proc_parent.title, <fold subquery>
+  FROM ( <the original parent SELECT> ) AS sqlite_proc_parent
+```
+
+The parent half of the correlation is then `sqlite_proc_parent.<key>`. No child
+`FROM` can legally contain a source of that name, so the reference resolves
+outward **by construction** rather than by names happening not to collide. The
+inner `SELECT`'s outputs are aliased to the declared value-column names, which
+is what makes them referenceable at all — a projected expression need not have
+a name — and is legitimate because the declaration is the interface.
+
+**Directions considered and not taken:**
 - Put the child in an aliased derived table and qualify the parent side so the
   inner scope cannot provide it. Needs the parent's source name or alias, which
   is not known without resolution.
