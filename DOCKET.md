@@ -646,6 +646,61 @@ than permanently closed.
 
 ---
 
+### 3c design, written up 2026-08-04 — now the next thing, not future work
+
+Phase 5b made this urgent rather than desirable. The generated fold lives in the
+parent `SELECT`, so **every** client pays for it: stepping the parent scans the
+children even when nothing reads the column, and a segment-aware client that
+then reads the child segment scans them **twice**. Measured at 4 and 8 where
+laziness gave 0 and 4 (`proc6-8.5/8.6`). That is a regression for the typed
+client, which is the one the feature exists to serve.
+
+**Where the fold has to move.** It is currently baked into the body at CREATE
+(`procCheckAndLower`), which is why it is unconditional. Runtime suppression is
+not available — SQLite evaluates every result column of a row it produces. So
+the fold must move to **CALL-compile time**, where the requested projection is
+known and can be compiled in or out. The body stays canonical and unfolded;
+`codeProcBody` generates fold columns per request.
+
+**Consequence to plan for:** the proc cache is keyed by procedure. It must
+become keyed by *(procedure, projection)*, or two clients asking for different
+projections will silently share one compiled body — a wrong-answer bug of
+exactly the kind this feature keeps producing.
+
+**The surface.** The projection changes codegen, so it must be known at prepare,
+which means it belongs in the statement text rather than in a C setter. Proposal,
+costing **zero new keywords** — `RETURNING` is an existing token and already
+means "these are the columns I want back" in SQLite's own vocabulary:
+
+```sql
+CALL post_with_comments(1);                          -- all fold columns (default)
+CALL post_with_comments(1) RETURNING id, title;      -- no fold columns generated
+```
+
+**Semantics, deliberately narrow for v1:** the clause controls *only which
+generated fold columns are produced*. Segments are unaffected — they are the
+body's own `SELECT`s and always stream. So:
+
+- Omitting the clause folds everything. **The invariant is the default**, which
+  is what keeps an unmodified client working.
+- A typed client writes `RETURNING <value columns>` and gets no subquery at all.
+  The double scan disappears and `proc6-8.5/8.6` return to 0 and 4.
+- Naming some nested tables and not others works per-table, which is Sean's
+  "posts + comments but not posts + authors" case.
+
+**Deliberately NOT in v1:** dropping the child *segment* for an unprojected
+nested table. It would save the scan entirely, but it changes how many sets a
+client steps through, so `nresultsets` becomes projection-dependent and every
+segment-aware consumer has to agree about which sets exist. Worth doing, worth
+doing separately.
+
+**Open question the syntax raises:** `sqlite3_column_count` now varies with the
+projection. That is legal — it is per-statement — but `procgen` must emit
+accessors per projection rather than per procedure, which is a change to its
+output model and should be settled before the emitter is written.
+
+---
+
 ## 4. Incremental view maintenance — *the big one, and the one I most want*
 
 Materialized views that update as writes land rather than being recomputed.
