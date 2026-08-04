@@ -303,7 +303,7 @@ The risk this accepts: phase 5 briefly lands a fold that mis-groups children.
 It is on a branch, phase 3 immediately follows, and the mis-grouping is pinned
 by a test rather than unknown.
 
-## Phase 3 — the lowering — **DONE** (`nested-shapes`), phase 5 pending
+## Phase 3 — the lowering — **DONE** (`nested-shapes`)
 
 The engine attaches `ORDER BY <ordinal>` to every nested table's `SELECT`,
 derived from the declared `KEY`. An **ordinal**, not a name: the declaration is
@@ -369,6 +369,24 @@ test must go red with the POC 2 signature — far fewer pairs than expected,
 
 ---
 
+## Status, 2026-08-04
+
+| | |
+|---|---|
+| 1 grammar and storage | **done** |
+| 2 conformance | **done** |
+| 3 the lowering | **done** |
+| 5a segment reachability | **done** |
+| 5b flat-client column | **done** |
+| DOCKET 3c projection | **done** |
+| **4 per-parent cardinality** | **not started** |
+| **6 index advisory (R7)** | **not started** |
+| **7 generated reassembler** | **not started** |
+
+Branch `nested-shapes`, unmerged. Merging before 7 would ship a feature whose
+typed client does not exist yet, which is the half-present state this plan
+exists to avoid — so the merge waits on 7, and 4 and 6 are independent of it.
+
 ## Phase 4 — per-parent cardinality
 
 **Deliverable.** Each parent carries the number of children belonging to it.
@@ -387,7 +405,7 @@ and passes.
 
 ---
 
-## Phase 5a — segment reachability — **DONE**; 5b (the folded column) pending
+## Phase 5a — segment reachability — **DONE** (`nested-shapes`)
 
 `sqlite3VdbeSetProcShapes` built one descriptor per **declared shape**, so a
 shape holding a nested table left its child segment with no metadata and
@@ -500,7 +518,17 @@ to CALL-compile time. If it moves there, the parent expression can be resolved
 before duplication, and this bug may be fixed by the same change rather than
 separately.
 
-## Phase 5b — the flat-client column — *design settled, implementation next*
+## Phase 5b — the flat-client column — **DONE** (`nested-shapes`)
+
+Implemented as generated SQL, then made conditional by DOCKET 3c. `fold.test`
+holds the invariant against an unmodified client: `column_count` 3, third column
+valid JSON, BLOB children base64 via `sqlite_proc_jsonval`, childless parent
+`[]`. `proc3c.test` holds the projection, including the restored scan counts.
+
+**Superseded within the phase:** the fold was first applied at CREATE, baked
+into the stored body. That is now recorded as a *recipe* and applied at
+CALL-compile onto a copy — because a fold baked into the body cannot be
+declined, and declining it is the whole of 3c.
 
 **The column is generated as SQL, not assembled in C.** At CALL-compile time the
 parent `SELECT` gains a result column at the nested position:
