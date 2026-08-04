@@ -286,6 +286,57 @@ do_catchsql_test 4.7 {
 } {1 {branches of IF in procedure m8 stream different numbers of result sets (2 and 1); every path must stream the declared sequence in order}}
 
 #--------------------------------------------------------------------
+# 4.8-4.9: the lowering refuses what it cannot honour
+#
+# The engine supplies the child ordering (PLAN-NESTED phase 3), so an ORDER BY
+# the author wrote is refused rather than overridden -- overriding would
+# discard their code silently, which is the failure class this phase exists to
+# remove.  Merging (prepending the correlation term, so "ORDER BY created_at"
+# sorts by date WITHIN a parent) is the documented growth path: refuse-to-merge
+# breaks nothing later, merge-to-refuse would break bodies.
+#
+do_catchsql_test 4.8 {
+  CREATE PROCEDURE o1(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid ORDER BY body;
+  END;
+} {1 {the SELECT for nested table comments of procedure o1 may not have its own ORDER BY -- the correlation ordering is supplied by the engine}}
+
+# LIMIT is refused because its meaning per parent row is undefined, and an
+# imposed ORDER BY silently changes which rows it keeps.
+do_catchsql_test 4.9 {
+  CREATE PROCEDURE o2(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts WHERE id = pid;
+    SELECT post_id, body FROM comments WHERE post_id = pid LIMIT 5;
+  END;
+} {1 {the SELECT for nested table comments of procedure o2 may not use LIMIT: its meaning per parent row is undefined}}
+
+# CONTROL: the restriction is on CHILD selects only.  A parent SELECT keeps its
+# own ORDER BY and LIMIT, so the checks above cannot be refusing everything.
+do_execsql_test 4.10 {
+  CREATE PROCEDURE o3(pid INTEGER)
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts ORDER BY title LIMIT 3;
+    SELECT post_id, body FROM comments WHERE post_id = pid;
+  END;
+} {}
+
+# CONTROL: a procedure that nests nothing is untouched by the lowering.
+do_execsql_test 4.11 {
+  CREATE PROCEDURE o4(pid INTEGER) RETURNS TABLE(a INTEGER)
+  BEGIN SELECT id FROM posts ORDER BY id LIMIT 1; END;
+  CALL o4(1);
+} {1}
+
+#--------------------------------------------------------------------
 # 5.x: nothing that did not nest behaves differently
 #
 # The flattened expectation must be identical to the old shape array when

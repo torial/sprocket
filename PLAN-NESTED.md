@@ -303,7 +303,50 @@ The risk this accepts: phase 5 briefly lands a fold that mis-groups children.
 It is on a branch, phase 3 immediately follows, and the mis-grouping is pinned
 by a test rather than unknown.
 
-## Phase 3 — the lowering (body form 1½) *(runs after phase 5 — see above)*
+## Phase 3 — the lowering — **DONE** (`nested-shapes`), phase 5 pending
+
+The engine attaches `ORDER BY <ordinal>` to every nested table's `SELECT`,
+derived from the declared `KEY`. An **ordinal**, not a name: the declaration is
+the interface, so a body's `SELECT` need not spell its columns the way the
+shape does, and `ORDER BY post_id` would depend on a coincidence.
+
+**Author-written `ORDER BY` on a child `SELECT` is refused**, not overridden.
+Overriding discards their code silently, which is the failure class this phase
+exists to remove. *Merging* — prepending the correlation term so
+`ORDER BY created_at` sorts by date within a parent — serves a real need and is
+the documented growth path; refuse-to-merge breaks nothing later, merge-to-
+refuse would break bodies. `LIMIT` is likewise refused: its meaning per parent
+row is undefined, and an imposed sort silently changes which rows it keeps.
+
+**The bug worth recording.** The lowering was first placed inside the
+conformance check, which runs only when `!db->init.busy`. But a real
+`CREATE PROCEDURE` builds a `Proc`, writes the schema row, and then *re-parses*
+it — so the object checked at DDL time is discarded, and the one that answers
+`CALL` is built by the reparse with `init.busy` set. The lowering was being
+applied only to the copy that gets thrown away. Skipping the pass on that path
+was sound while it only *validated*; once it also *rewrites*, it has to run
+wherever the body is materialised. Renamed `procCheckAndLower` so the calling
+contract is visible at the call site.
+
+**How it was measured, since `CALL` is still refused.** `EXPLAIN QUERY PLAN`
+does not descend into a procedure's `SubProgram` — it returns empty for every
+`CALL`, so both-empty proves nothing and that instrument was discarded rather
+than believed. The `bytecode()` virtual table does see inside, counting
+`Sorter%` opcodes:
+
+| | sorter opcodes |
+|---|---|
+| two shapes, no nesting *(control: what "no sort" looks like)* | 0 |
+| two shapes, **hand-written** `ORDER BY 1` *(control: instrument can see)* | 5 |
+| one shape with a nested table, **lowered** | 5 |
+
+Before the fix the lowered body read **0** — the same number as the no-sort
+control, which is how the bug surfaced. Only the rejections could be pinned
+permanently: `bytecode('CALL ...')` must prepare the statement, which the phase
+2 guard refuses, so the three rows above become permanent tests when phase 5
+lifts it.
+
+### As originally planned
 
 **Deliverable.** The engine adds the `ORDER BY` to the child query itself,
 derived from the declared `KEY`. **The author never writes it.**

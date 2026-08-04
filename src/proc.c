@@ -219,6 +219,7 @@ struct ProcEmit {
   int nCol;               /* Columns the emitting SELECT must have */
   int nNested;            /* Nested tables in this shape (parent rows only) */
   const char *zNested;    /* Nested table name, or NULL if this is the parent */
+  int iKeyCol;            /* 1-based position of the correlation column */
 };
 
 typedef struct ProcConf ProcConf;
@@ -325,6 +326,58 @@ static void procCheckLoopBody(ProcConf *p, TriggerStep *pList){
 }
 
 /*
+** Impose the child ordering on one nested table's SELECT -- PLAN-NESTED phase
+** 3, "the lowering".  The author never writes this ORDER BY, which is the
+** whole point: POC 2's silent loss of 98% of child rows required an author to
+** write the ordering and get it wrong, and here there is nothing to get wrong.
+**
+** Returns non-zero if an error was reported.
+**
+** This runs inside the conformance walk rather than in a pass of its own
+** because the walk is the only place holding the mapping from an emission to
+** the statement that produces it, and because an IF may give one emission two
+** statements -- both of which need ordering.  Mutating a body whose CREATE
+** then fails is harmless: the Proc is discarded.
+*/
+static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
+  Select *pSel = pStep->pSelect;
+  sqlite3 *db = p->pParse->db;
+  char zNum[30];
+
+  /* An ORDER BY the author wrote is refused rather than overridden or merged.
+  ** Overriding would discard something they wrote, silently, which is the
+  ** exact failure class this phase exists to remove.  Merging -- prepending
+  ** the correlation term so "ORDER BY created_at" becomes "ORDER BY key,
+  ** created_at" -- would serve the real use of sorting within a parent, and is
+  ** the documented growth path; it is not v1 because going from refuse to
+  ** merge later breaks nothing, while the reverse breaks bodies. */
+  if( pSel->pOrderBy ){
+    sqlite3ErrorMsg(p->pParse,
+      "the SELECT for nested table %s of procedure %s%s may not have its own "
+      "ORDER BY -- the correlation ordering is supplied by the engine",
+      pE->zNested, p->zName, p->zWhere);
+    p->nErr = 1;
+    return 1;
+  }
+  /* LIMIT is refused because its meaning under a correlation is genuinely
+  ** ambiguous -- per parent, or across the whole child set? -- and an imposed
+  ** ORDER BY silently changes which rows a LIMIT keeps. */
+  if( pSel->pLimit ){
+    sqlite3ErrorMsg(p->pParse,
+      "the SELECT for nested table %s of procedure %s%s may not use LIMIT: "
+      "its meaning per parent row is undefined",
+      pE->zNested, p->zName, p->zWhere);
+    p->nErr = 1;
+    return 1;
+  }
+
+  sqlite3_snprintf(sizeof(zNum), zNum, "%d", pE->iKeyCol);
+  pSel->pOrderBy = sqlite3ExprListAppend(p->pParse, 0,
+                                         sqlite3Expr(db, TK_INTEGER, zNum));
+  return 0;
+}
+
+/*
 ** Walk one statement list with the shape cursor at iStart.  Returns the
 ** cursor after the list; *peEnd receives a PROC_PATH_* code.
 */
@@ -395,6 +448,9 @@ static int procCheckList(
               nCol==1 ? "" : "s", pE->nCol);
           }
           p->nErr = 1;
+          break;
+        }
+        if( p->aEmit[i].zNested && procLowerChild(p, pStep, &p->aEmit[i]) ){
           break;
         }
         i++;
@@ -563,6 +619,17 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
       }
       pConf->aEmit[n].nCol = pCol->pNested->nParam;
       pConf->aEmit[n].zNested = pCol->zName;
+      /* Recorded as an ordinal rather than a name because the declaration is
+      ** the interface: a body's SELECT need not spell its columns the way the
+      ** shape does, so "ORDER BY 2" is right where "ORDER BY post_id" would
+      ** depend on a coincidence. */
+      for(j=0; j<pCol->pNested->nParam; j++){
+        if( sqlite3StrICmp(pCol->pNested->a[j].zName, pCol->zKeyChild)==0 ){
+          pConf->aEmit[n].iKeyCol = j+1;
+          break;
+        }
+      }
+      assert( pConf->aEmit[n].iKeyCol>0 );  /* phase 1 validated the name */
       n++;
     }
   }
@@ -570,11 +637,15 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
 }
 
 /*
-** Check a procedure body against its declared result shapes, reporting
-** errors through pParse.  Procedures with no RETURNS clause are not
-** checked (legacy dynamic behavior).
+** Check a procedure body against its declared result shapes, reporting errors
+** through pParse, AND impose the child ordering on every nested table.
+** Procedures with no RETURNS clause are not checked (legacy dynamic behavior).
+**
+** The name says "and lower" because the second job changes the calling
+** contract: a checker may be skipped when its answer is already known, a
+** rewriter may not.  See the call site.
 */
-static void procCheckConformance(Parse *pParse, Proc *pProc){
+static void procCheckAndLower(Parse *pParse, Proc *pProc){
   sqlite3 *db = pParse->db;
   ProcConf conf;
   int iEnd, eEnd;
@@ -796,11 +867,20 @@ void sqlite3FinishProc(
   }
   pShapes = 0;
 
-  /* Enforce the declared shapes against the body.  Only on real DDL
-  ** execution: a procedure reaching the schema-reparse path already
-  ** passed this check when it was created. */
-  if( !db->init.busy && pProc->eRet!=PROC_RET_UNDECLARED ){
-    procCheckConformance(pParse, pProc);
+  /* Enforce the declared shapes against the body, and impose the child
+  ** ordering on any nested table (PLAN-NESTED phase 3).
+  **
+  ** This runs on BOTH paths, unlike the check it grew out of.  A real DDL
+  ** execution builds this Proc, writes the schema row, and then re-parses it
+  ** -- so the object checked here is thrown away and the one that answers
+  ** CALL is built by the reparse below with db->init.busy set.  While this
+  ** pass only validated, skipping it on that path was a sound optimisation.
+  ** Now that it also TRANSFORMS the body, skipping it meant the lowering was
+  ** applied only to the copy that gets discarded: measured as zero sorter
+  ** opcodes in a body whose hand-written equivalent emits five.  A pass that
+  ** rewrites a body has to run wherever that body is materialised. */
+  if( pProc->eRet!=PROC_RET_UNDECLARED ){
+    procCheckAndLower(pParse, pProc);
     if( pParse->nErr ) goto proc_cleanup;
   }
 
