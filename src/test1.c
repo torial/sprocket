@@ -5663,6 +5663,31 @@ static int SQLITE_TCLAPI test_norm_sql(
 */
 #ifndef SQLITE_OMIT_PROCEDURE
 /*
+** Usage: sqlite3_proc_child_count STMT N
+**
+** Children counted for the current parent row, for the N-th nested table.
+** -1 when the count was not requested or N is out of range.
+*/
+static int SQLITE_TCLAPI test_proc_child_count(
+  void * clientData,
+  Tcl_Interp *interp,
+  int objc,
+  Tcl_Obj *CONST objv[]
+){
+  sqlite3_stmt *pStmt;
+  int n;
+
+  if( objc!=3 ){
+    Tcl_WrongNumArgs(interp, 1, objv, "STMT N");
+    return TCL_ERROR;
+  }
+  if( getStmtPointer(interp, Tcl_GetString(objv[1]), &pStmt) ) return TCL_ERROR;
+  if( Tcl_GetIntFromObj(interp, objv[2], &n) ) return TCL_ERROR;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_proc_child_count(pStmt, n)));
+  return TCL_OK;
+}
+
+/*
 ** Usage: sqlite3_proc_next_resultset STMT
 **
 ** Advance a CALL statement to its next declared result set.  Returns the
@@ -9231,6 +9256,7 @@ int Sqlitetest1_Init(Tcl_Interp *interp){
      { "sqlite3_column_count",          test_column_count  ,0 },
 #ifndef SQLITE_OMIT_PROCEDURE
      { "sqlite3_proc_next_resultset",   test_proc_next_resultset ,0 },
+     { "sqlite3_proc_child_count",      test_proc_child_count ,0 },
 #endif
      { "sqlite3_data_count",            test_data_count    ,0 },
      { "sqlite3_column_type",           test_column_type   ,0 },

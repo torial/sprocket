@@ -5612,6 +5612,31 @@ int sqlite3_column_type(sqlite3_stmt*, int iCol);
 int sqlite3_proc_next_resultset(sqlite3_stmt*);
 
 /*
+** CAPI3REF: Children Counted For The Current Parent Row
+** METHOD: sqlite3_stmt
+**
+** ^This interface returns the number of child rows belonging to the current
+** row of the current result set, for the N-th nested table declared by that
+** set, counting from zero.
+**
+** ^The count is only available when the statement requested it with the
+** WITH COUNTS clause; without that clause this routine returns -1.  It also
+** returns -1 when N is out of range, when the statement is not a CALL, or
+** when no row is currently available.
+**
+** The distinction that matters to a client reassembling a nested result is
+** between -1 and 0: ^-1 means the count was not requested or does not exist,
+** while ^0 means the parent genuinely has no children.  A reassembler that
+** conflates them cannot tell an empty set from a missing answer.
+**
+** This is integrity metadata about the transfer rather than data about the
+** rows: it lets a client detect child rows lost or duplicated in transit.  It
+** does not validate the query.  A logic error in the procedure body produces
+** consistent counts and passes.
+*/
+int sqlite3_proc_child_count(sqlite3_stmt*, int);
+
+/*
 ** CAPI3REF: Destroy A Prepared Statement Object
 ** DESTRUCTOR: sqlite3_stmt
 **

@@ -931,6 +931,21 @@ end_of_step:
 ** error code.  Calling this on anything other than a paused CALL of a
 ** procedure with declared shapes is SQLITE_MISUSE.
 */
+/*
+** Children counted for the current parent row -- see sqlite3_proc_child_count()
+** in sqlite.h.in.  Returns -1 for every case in which no count is known, so
+** that "not asked" is never mistaken for "no children".
+*/
+int sqlite3_proc_child_count(sqlite3_stmt *pStmt, int N){
+  Vdbe *p = (Vdbe*)pStmt;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( p==0 ) return -1;
+#endif
+  if( p==0 || p->aChildCnt==0 ) return -1;
+  if( N<0 || N>=p->nChildCnt ) return -1;
+  return p->aChildCnt[N];
+}
+
 int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){
   Vdbe *p = (Vdbe*)pStmt;
   sqlite3 *db;
