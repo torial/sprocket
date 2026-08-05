@@ -701,20 +701,39 @@ static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
   Select *pSel = pStep->pSelect;
   sqlite3 *db = p->pParse->db;
 
-  /* An ORDER BY the author wrote is refused rather than overridden or merged.
-  ** Overriding would discard something they wrote, silently, which is the
-  ** exact failure class this phase exists to remove.  Merging -- prepending
-  ** the correlation term so "ORDER BY created_at" becomes "ORDER BY key,
-  ** created_at" -- would serve the real use of sorting within a parent, and is
-  ** the documented growth path; it is not v1 because going from refuse to
-  ** merge later breaks nothing, while the reverse breaks bodies. */
+  /* An author-written ORDER BY is MERGED, not refused and not overridden.
+  **
+  ** Overriding would discard their code silently.  Refusing -- which this did
+  ** until 2026-08-05 -- conflates two different things wearing one signature:
+  ** the CORRELATION ordering is not a parameter (nobody wants a different one;
+  ** it exists to make reassembly correct, not to be observed), but the
+  ** ORDERING WITHIN A GROUP is, and its caller is easy to name -- comments by
+  ** date within each post.  Hiding a non-parameter is declining to expose an
+  ** internal; refusing a parameter whose caller you can name is presumptuous.
+  **
+  ** So the key term is PREPENDED: "ORDER BY created_at" becomes
+  ** "ORDER BY <key>, created_at".  The correlation still cannot be got wrong,
+  ** because the author does not write that part and cannot displace it.  A
+  ** contradictory term (ORDER BY post_id DESC) simply becomes redundant after
+  ** the imposed one rather than fighting it. */
   if( pSel->pOrderBy ){
-    sqlite3ErrorMsg(p->pParse,
-      "the SELECT for nested table %s of procedure %s%s may not have its own "
-      "ORDER BY -- the correlation ordering is supplied by the engine",
-      pE->zNested, p->zName, p->zWhere);
-    p->nErr = 1;
-    return 1;
+    ExprList *pPrior = pSel->pOrderBy;
+    ExprList *pMerged;
+    int k;
+    pSel->pOrderBy = 0;
+    pMerged = sqlite3ExprListAppend(p->pParse, 0,
+        sqlite3ExprDup(db, pSel->pEList->a[pE->iKeyCol-1].pExpr, 0));
+    for(k=0; pMerged && k<pPrior->nExpr; k++){
+      pMerged = sqlite3ExprListAppend(p->pParse, pMerged, pPrior->a[k].pExpr);
+      if( pMerged==0 ) break;
+      pPrior->a[k].pExpr = 0;                      /* ownership moved */
+      pMerged->a[pMerged->nExpr-1].fg = pPrior->a[k].fg;      /* ASC/DESC */
+      pMerged->a[pMerged->nExpr-1].zEName = pPrior->a[k].zEName;
+      pPrior->a[k].zEName = 0;
+    }
+    sqlite3ExprListDelete(db, pPrior);
+    pSel->pOrderBy = pMerged;
+    return 0;
   }
   /* LIMIT is refused because its meaning under a correlation is genuinely
   ** ambiguous -- per parent, or across the whole child set? -- and an imposed

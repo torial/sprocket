@@ -295,7 +295,11 @@ do_catchsql_test 4.7 {
 # sorts by date WITHIN a parent) is the documented growth path: refuse-to-merge
 # breaks nothing later, merge-to-refuse would break bodies.
 #
-do_catchsql_test 4.8 {
+# An author ORDER BY is MERGED, not refused.  The correlation ordering is not a
+# parameter -- nobody wants a different one.  The ordering WITHIN a group is,
+# and its caller is easy to name: comments by date within each post.  Refusing
+# both conflated two things wearing one signature.
+do_execsql_test 4.8 {
   CREATE PROCEDURE o1(pid INTEGER)
     RETURNS TABLE(id INTEGER,
                   comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
@@ -303,7 +307,7 @@ do_catchsql_test 4.8 {
     SELECT id FROM posts WHERE id = pid;
     SELECT post_id, body FROM comments WHERE post_id = pid ORDER BY body;
   END;
-} {1 {the SELECT for nested table comments of procedure o1 may not have its own ORDER BY -- the correlation ordering is supplied by the engine}}
+} {}
 
 # LIMIT is refused because its meaning per parent row is undefined, and an
 # imposed ORDER BY silently changes which rows it keeps.
@@ -591,5 +595,70 @@ do_test 8.6 {
   sqlite3_finalize $S
   set ::nscan
 } {8}
+
+#--------------------------------------------------------------------
+# 9.x: the merged ordering -- key first, author's terms after
+#
+# The proof is a fixture where the two orderings DISAGREE: children whose
+# alphabetical order by body is the reverse of their key order.  If the key
+# term were not prepended, the rows would come back sorted by body alone.
+#
+do_execsql_test 9.0 {
+  CREATE TABLE p3(id INTEGER PRIMARY KEY);
+  CREATE TABLE c3(cid INTEGER PRIMARY KEY, pid INTEGER, body TEXT);
+  INSERT INTO p3 VALUES(1),(2);
+  -- Rows interleave the parents in SCAN order, so that scan order differs from
+  -- BOTH expected results below.  An earlier fixture had scan order equal to
+  -- the DESC case by coincidence, and 9.4 passed with the key prepend disabled
+  -- -- green for a reason unrelated to the feature, found by breaking it.
+  INSERT INTO c3 VALUES(1,2,'y'),(2,1,'z'),(3,1,'a'),(4,2,'b');
+  SELECT pid||body FROM c3;
+} {2y 1z 1a 2b}
+
+do_execsql_test 9.1 {
+  CREATE PROCEDURE merged()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(pid INTEGER, body TEXT) KEY(pid = id))
+  BEGIN
+    SELECT id FROM p3;
+    SELECT pid, body FROM c3 ORDER BY body;
+  END;
+} {}
+
+# Grouped by key FIRST, then alphabetical within each group: 1a 1z 2b 2y.
+# Sorted by body alone would be a,b,y,z -- interleaving the parents.
+do_test 9.2 {
+  set S [sqlite3_prepare_v2 db {CALL merged() RETURNING id} -1 T]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_column_int $S 0][sqlite3_column_text $S 1]
+  }
+  sqlite3_finalize $S
+  set r
+} {1a 1z 2b 2y}
+
+# DESC on the author's term is preserved -- the merge keeps sort flags.
+do_execsql_test 9.3 {
+  CREATE PROCEDURE merged2()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(pid INTEGER, body TEXT) KEY(pid = id))
+  BEGIN
+    SELECT id FROM p3;
+    SELECT pid, body FROM c3 ORDER BY body DESC;
+  END;
+} {}
+do_test 9.4 {
+  set S [sqlite3_prepare_v2 db {CALL merged2() RETURNING id} -1 T]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_column_int $S 0][sqlite3_column_text $S 1]
+  }
+  sqlite3_finalize $S
+  set r
+} {1z 1a 2y 2b}
 
 finish_test
