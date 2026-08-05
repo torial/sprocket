@@ -1,0 +1,90 @@
+# 2026-08-05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# A shape from a schema NOBODY DESIGNED FOR THIS FEATURE.  Taken from Mosaic
+# (C:\Projects\mosaic, schema/SCHEMA.md), the LXX/MT divergence atlas, whose
+# data model predates nested result shapes by a month.
+#
+# Two properties no other fixture in this repo has:
+#
+#   1. THREE nested tables in one shape.  Everything else tops out at two.
+#   2. Two of them draw from the SAME child table with DIFFERENT filters --
+#      present-witnesses and absent-witnesses are one table split by stance.
+#      The correlation key is identical; only the WHERE differs.
+#
+# It is also the project's flagship question -- "which witnesses have this
+# divergence, which lack it, and what do scholars think caused it" -- which is
+# one CALL rather than four queries or a cartesian join.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procmosaic
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE divergence(did TEXT PRIMARY KEY, address TEXT, kind TEXT);
+  CREATE TABLE dv_witness(did TEXT, witness TEXT, stance TEXT);
+  CREATE TABLE claim(cid TEXT PRIMARY KEY, subject TEXT, method TEXT, confidence TEXT);
+  CREATE TABLE dv_cause(did TEXT, cid TEXT);
+  INSERT INTO divergence VALUES('d:job-42-17a','Job 42:17','plus'),
+                               ('d:job-1-1','Job 1:1','substitution');
+  INSERT INTO dv_witness VALUES('d:job-42-17a','w:vaticanus','present'),
+                               ('d:job-42-17a','w:sinaiticus','present'),
+                               ('d:job-42-17a','w:leningradensis','absent'),
+                               ('d:job-1-1','w:vaticanus','present');
+  INSERT INTO claim VALUES('c:0001','d:job-42-17a','editorial-judgment','to-verify'),
+                          ('c:0002','d:job-42-17a','empirical-alignment','model-inference');
+  INSERT INTO dv_cause VALUES('d:job-42-17a','c:0001'),('d:job-42-17a','c:0002');
+} {}
+
+do_execsql_test 1.0 {
+  CREATE PROCEDURE divergences()
+    RETURNS TABLE(
+      did TEXT, address TEXT, kind TEXT,
+      present TABLE(did2 TEXT, witness TEXT) KEY(did2 = did),
+      absent  TABLE(did3 TEXT, witness TEXT) KEY(did3 = did),
+      causes  TABLE(did4 TEXT, cid TEXT, method TEXT) KEY(did4 = did)
+    )
+  BEGIN
+    SELECT did, address, kind FROM divergence;
+    SELECT did, witness FROM dv_witness WHERE stance = 'present';
+    SELECT did, witness FROM dv_witness WHERE stance = 'absent';
+    SELECT c.subject, c.cid, c.method FROM claim c JOIN dv_cause d ON d.cid = c.cid;
+  END;
+} {}
+
+# Six columns declared, three of them nested; four SEGMENTS on the wire.
+do_execsql_test 1.1 {
+  SELECT nresultsets FROM pragma_proc_list WHERE name='divergences';
+} {4}
+
+# The flagship query, folded.  Note d:job-1-1 gets [] for BOTH tables it has no
+# rows in -- two independent childless cases on one parent row.
+do_execsql_test 2.0 {
+  CALL divergences();
+} {d:job-42-17a {Job 42:17} plus {[{"did2":"d:job-42-17a","witness":"w:vaticanus"},{"did2":"d:job-42-17a","witness":"w:sinaiticus"}]} {[{"did3":"d:job-42-17a","witness":"w:leningradensis"}]} {[{"did4":"d:job-42-17a","cid":"c:0001","method":"editorial-judgment"},{"did4":"d:job-42-17a","cid":"c:0002","method":"empirical-alignment"}]} d:job-1-1 {Job 1:1} substitution {[{"did2":"d:job-1-1","witness":"w:vaticanus"}]} {[]} {[]}}
+
+# THE SAME-TABLE-DIFFERENT-FILTER PROPERTY, isolated.  present and absent draw
+# from one table on one correlation key; only the WHERE differs.  If the
+# imposed ordering or the fold confused the two, vaticanus would appear in
+# `absent` or leningradensis in `present`.
+do_test 2.2 {
+  set S [sqlite3_prepare_v2 db {CALL divergences() WITH COUNTS} -1 T]
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_proc_child_count $S 0][sqlite3_proc_child_count $S 1][sqlite3_proc_child_count $S 2]
+  }
+  sqlite3_finalize $S
+  set r
+} {212 100}   ;# present,absent,causes per parent: 2/1/2 and 1/0/0
+
+finish_test
