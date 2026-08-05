@@ -1011,7 +1011,13 @@ must go red.
 
 ## Deliberately out of scope
 
-- **Depth ≥ 2.** Rejected at the grammar in phase 1. Each level would have to
+- **Depth ≥ 2.** Rejected at the grammar in phase 1. **Tested against a real
+  schema 2026-08-05 (DOCKET 3g) and the refusal does not hold:** an author
+  reaches depth 2 in four lines by hand-rolling the inner `json_group_array`,
+  keeping one `CALL` and a correct answer while silently forfeiting the
+  correlation check, the imposed ordering, conformance, counts, introspection
+  and the segment path. The refusal redirects rather than prevents, into a form
+  that looks identical from outside. See 3g for the options. Each level would have to
   be ordered by the full *ancestor path*, not by its own parent key, and each
   level would have to expose every ancestor key — which a `replies` table
   holding only `comment_id` does not have. That is a genuine blocker no syntax

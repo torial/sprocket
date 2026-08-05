@@ -768,6 +768,70 @@ occasional deep check.
 
 ---
 
+## 3g. The depth-2 refusal does not prevent depth 2 — it makes it unguarded
+
+**Found 2026-08-05 by trying it against Mosaic, the first schema not designed
+for this feature.** Its model has a genuine depth-2 shape, stated in the schema:
+*"`addresses` is an ARRAY: a floating interval is an interval with multiple
+attested addresses."* So witness → intervals → addresses.
+
+Declared the obvious way, the engine refuses:
+
+```
+Parse error: nested tables may not themselves nest: addresses
+```
+
+**But the author gets it anyway, in four lines**, by writing the inner level
+with the same `json_group_array` the engine uses for the outer one:
+
+```sql
+SELECT i.wid, i.iid, i.book,
+       (SELECT json_group_array(json_object('tradition', a.tradition, 'rng', a.rng))
+          FROM address a WHERE a.iid = i.iid)
+  FROM interval i;
+```
+
+One `CALL`, correct answer, readable declaration, properly nested JSON out.
+
+**And every guarantee is gone.** This is the uncomfortable part, and it is worse
+than the refusal being galling — it is *seductive*:
+
+| | declared nesting | hand-rolled inner level |
+|---|---|---|
+| correlation checked at CREATE | yes | **no** |
+| ordering imposed by the engine | yes | **author writes it, or omits it** |
+| conformance checked against the body | yes | **no** |
+| `WITH COUNTS` integrity | yes | **no** |
+| introspectable by `procgen` | yes | **no — it is a `TEXT` column** |
+| reachable on the segment path | yes | **no — fold only** |
+
+A typo in `a.iid = i.iid` silently returns wrong groupings. **That is exactly
+the class of failure this feature exists to prevent, reintroduced by hand one
+level down, with no signal that the safety net has ended.**
+
+**So the refusal is not protecting anyone.** It redirects depth 2 into a form
+that looks identical from outside and is unguarded. Authors will take that route
+because it is four lines and it works.
+
+**Options, none obviously right:**
+
+- **Support depth ≥ 2 properly.** The recorded blockers stand: ordering by the
+  full ancestor path, and every ancestor key must be exposed — a `replies` table
+  holding only `comment_id` cannot correlate to a post. Real work, not a syntax
+  fix.
+- **Notice and advise.** The engine already inspects child `SELECT`s (phase 3,
+  phase 6). A `json_group_array` in one is detectable, and an advisory —
+  *"this column nests by hand; its correlation is not checked"* — costs little
+  and removes the silence. Cheapest honest option.
+- **Refuse harder.** Reject hand-rolled aggregates in a child `SELECT`. Wrong:
+  it forbids legitimate aggregation and would not be enforceable anyway.
+
+**Recommendation: the advisory.** The value of the declared form is that it
+cannot be got wrong; the value of the hand-rolled form is that it exists. What
+the author is currently denied is *knowing which one they are in*.
+
+---
+
 ## 3f. The segment total — the one check per-parent counts cannot make
 
 **Found 2026-08-05 by adversarial review, pinned in `test/procnull.test`.**
