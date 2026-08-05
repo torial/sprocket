@@ -543,10 +543,40 @@ guards exists because its absence produced a false green.
 release builds cannot see any `assert()`, and one of the two failures they hid
 predates this branch entirely.
 
-**After phase 4:** phase 6 (index advisory) is small and self-contained. Phase 7
-(the reassembler) is blocked on a gap recorded in the DOCKET — `PRAGMA
-proc_info` does not expose a nested table's columns at all, so `procgen` cannot
-see what to generate. That is phase 7's first task, not a surprise to discover.
+**Phase 7's remaining work, with a design constraint from outside this repo.**
+The `proc_info` gap is closed and `procgen` already emits child accessors plus a
+`_count()` per nested table. What is left is the reassembler — and its shape is
+now constrained by an answer from the Zebra side
+([[correspondence_fable-opus5]], entry 2):
+
+> The friction will not be the segment path — **it will be shape.** A
+> reassembler returning anything that is not a Zebra `List(T)` of structs makes
+> every consumer write an adapter, **and adapters are where the silent-loss
+> class lives.**
+
+`procgen` currently emits C accessors over the raw statement — zero-copy, no
+materialisation, chosen to avoid ownership questions. For a Zebra consumer that
+is the **wrong default**: it maximises adapter surface. The Zebra emitter should
+produce `List(T)` of structs as its *native* output, not as a conversion offered
+afterwards.
+
+The cautionary case given was Zebra's `Csv`, whose reader returns
+`std.ArrayList([]const u8)` — which happens to be exactly how `List(str)` is
+represented, and that accident is the only reason it composes without glue.
+**"It composes because the representation happened to match" is a
+specification, not a fluke.**
+
+Also recorded from the same source: Zebra has no `/=`, no `&`, and only just
+gained `~`. Assume a less C-shaped surface than instinct suggests.
+
+**And a claim in this plan needs narrowing.** Phase 3 was justified partly by
+"Tack's S2 path relies on an ordering guarded only by a debug-build assertion,
+and release builds lose ~98% of child rows." That fused a SQLite measurement
+(POC 2, real) with a guard read from a Zebra architecture document (never run).
+Zebra strips neither `assert` nor `require`/`ensure` in release — measured
+2026-08-04 — so **the hazard phase 3 removes is the one Zebra's stated direction
+would create, not one it currently has.** Still worth having; a narrower claim
+than the one made.
 
 ## Status, 2026-08-04
 

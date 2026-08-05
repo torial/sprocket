@@ -592,6 +592,24 @@ here is **to push SQLite as far as it will go**, not to reimplement MetaKit —
 its other features are likely not part of this journey. Nesting earns its place
 on merit, not lineage.
 
+### #2 addendum, 2026-08-04 — the Zebra emitter is the priority, and its output shape is specified
+
+`procgen` emits C today. The obvious next emitters were TypeScript/Python/Zebra
+in no particular order. **Zebra is now first**, because the fork's named
+consumer is Zebra's ORM, and its required output shape is already known from the
+Zebra side rather than guessed:
+
+- **native output must be `List(T)` of structs**, not accessors a consumer
+  adapts. Adapters are where the silent-loss class lives.
+- Zebra's data access is positional binds via list literals, `?`-optionals on
+  every handle, nil-checked before use.
+- Zebra has no `/=`, no `&`, and only just gained `~`. Less C-shaped than
+  instinct suggests.
+
+Source: [[correspondence_fable-opus5]] entry 2. Not inferred here.
+
+---
+
 ## 3b. The rowid spine — *late materialisation, and MetaKit's trick returning*
 
 **Sean's, 2026-08-03, while reviewing the phase 5 blocker.** Let the parent
