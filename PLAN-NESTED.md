@@ -955,7 +955,46 @@ detector.
 
 ---
 
-## Phase 7 — the generated reassembler
+## Phase 7 — REVISED 2026-08-05: not a reassembler. Typed streams.
+
+**The plan said "procgen emits the client-side reassembler." That is wrong for
+the actual consumer, and reading its architecture document rather than guessing
+is what shows it.**
+
+Tack (`zebra-language/docs/ZEBRA_ORM_ARCHITECTURE.md` §6) already has a
+stitcher:
+
+> "The stitcher consumes **N typed streams** and yields one stream of
+> parent-with-children projections; stream *sources* are interchangeable."
+
+and multi-set procs are already a designed-in source — S4, *"feeds the same S2
+zipper."* **Generating a reassembler would duplicate machinery the consumer
+already has, which is exactly the adapter surface we were warned about.**
+
+**Corrected deliverable.** `procgen`'s Zebra emitter produces **one typed stream
+per segment**, elements being typed structs. The stitcher zips them. That is a
+substantially smaller job than the plan assumed, and better fitted.
+
+**And a refinement to the advice that prompted this.** Opus 5 said the native
+output must be `List(T)` of structs. Right about the *element* — structs, not
+accessors over a raw statement — but the doc is explicit about the *container*:
+
+> "`.collect()` on any stream makes it concrete as an arena-allocated list; this
+> is the **only** way to get a list, and it is always explicit."
+
+So emitting lists would take a decision that belongs to the caller. **Streams are
+the currency; `.collect()` is the consumer's explicit choice.** Lazy loading is
+unrepresentable there by design (G5), which is why the distinction is load-bearing
+rather than stylistic.
+
+**What `WITH COUNTS` buys them, concretely.** §6 gives S4 a proc-author contract
+checked by "a cheap key-monotonicity assertion in the stitcher" on debug builds.
+Monotonicity catches a *disordered* stream. It cannot catch a *truncated* one —
+losing a parent's last child leaves the sequence perfectly monotonic. Per-parent
+counts do catch that, and they are already implemented. Worth offering as an
+upgrade to their check rather than a replacement for it.
+
+## Phase 7 — the generated reassembler *(as originally planned; superseded above)*
 
 **Deliverable.** `procgen` emits the client-side reassembler: typed parent
 accessors, a child cursor per nested column, and the cardinality check.
