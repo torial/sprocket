@@ -768,6 +768,44 @@ occasional deep check.
 
 ---
 
+## 3f. The segment total — the one check per-parent counts cannot make
+
+**Found 2026-08-05 by adversarial review, pinned in `test/procnull.test`.**
+
+A child row whose correlation key is **NULL** attaches to no parent. SQL equality
+with NULL is NULL, not true, so the row is absent from the fold, absent from the
+segment grouping, and absent from every count. Measured:
+
+| | |
+|---|---|
+| child rows in the table | **3** |
+| rows appearing under a parent | **2** |
+| `sqlite3_proc_child_count()` for that parent | **2** — agrees with the fold |
+| sum of per-parent counts vs. child segment row count | **2 vs 3** |
+
+**`WITH COUNTS` is structurally blind to this**, and for the reason POC 3
+already recorded: the count derives from *the same predicate as the data*, so
+the two cannot disagree. Per-parent cardinality catches rows lost **in
+transit**. It cannot catch rows that never belonged to a parent at all.
+
+**The check that does catch it is a total** — sum of per-parent counts against
+the number of rows the child segment actually produced. That comparison crosses
+the predicate: one side is grouped by the correlation, the other is not.
+
+**Proposal:** `WITH COUNTS` also carries a per-segment total, exposed as
+`sqlite3_proc_child_count(stmt, -1)` or a sibling call, so a reassembler can
+assert `sum(parents) == total` without counting rows itself.
+
+**Not a bug in the fold.** A NULL key genuinely correlates to nothing, and
+inventing a parent for it would be worse. This is about *detectability*: today
+the loss is silent, and it should be loud enough that a client can choose.
+
+**Also worth documenting either way:** authors should consider `NOT NULL` on a
+correlation column, and the R7 index advisory is the natural place to mention it
+— it already inspects the correlation.
+
+---
+
 ## 3e. Declared idempotency — *the engine knows; nobody can ask*
 
 **Raised 2026-08-05 while checking whether Tack's design accounted for the wire

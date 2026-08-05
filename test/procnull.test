@@ -1,0 +1,81 @@
+# 2026-08-05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# NULL correlation keys.  The generated correlation is
+# "<child key> = <parent key>", and SQL equality with NULL is NULL, not true.
+# A child row whose key is NULL therefore attaches to NO parent and disappears
+# from the fold, from the segment grouping, and from every count.
+#
+# WITH COUNTS cannot flag it: the count derives from the SAME predicate as the
+# data, which is POC 3's finding that a check drawn from the same source as the
+# data cannot validate it.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procnull
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body TEXT);
+  INSERT INTO posts VALUES(1,'first');
+  -- two children of post 1, and ONE ORPHAN whose key is NULL
+  INSERT INTO comments VALUES(1,1,'a'),(2,1,'b'),(3,NULL,'orphan');
+  SELECT count(*) FROM comments;
+} {3}
+
+do_execsql_test 0.1 {
+  CREATE PROCEDURE pwc()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, body FROM comments;
+  END;
+} {}
+
+# 1.1  THE ORPHAN VANISHES.  Three child rows exist; two appear in the fold.
+#      Not an error, not a warning -- a wrong answer that reports success.
+do_test 1.1 {
+  set r [execsql {CALL pwc()}]
+  # parent row is (id, title, comments-json)
+  lindex $r 2
+} {[{"post_id":1,"body":"a"},{"post_id":1,"body":"b"}]}
+
+# 1.2  ...and the per-parent count agrees with the fold, so WITH COUNTS is
+#      silent about it.  This is the POC 3 shape: the check and the data come
+#      from one predicate, so they cannot disagree.
+do_test 1.2 {
+  set S [sqlite3_prepare_v2 db {CALL pwc() WITH COUNTS} -1 T]
+  sqlite3_step $S
+  set n [sqlite3_proc_child_count $S 0]
+  sqlite3_finalize $S
+  set n
+} {2}
+
+# 1.3  THE TOTAL IS WHAT CATCHES IT.  Sum of per-parent counts (2) against the
+#      child segment's actual row count (3).  A discrepancy means rows exist
+#      that belong to no parent -- which no per-parent check can see.
+do_test 1.3 {
+  set S [sqlite3_prepare_v2 db {CALL pwc() WITH COUNTS} -1 T]
+  set sum 0
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    incr sum [sqlite3_proc_child_count $S 0]
+  }
+  sqlite3_proc_next_resultset $S
+  set actual 0
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { incr actual }
+  sqlite3_finalize $S
+  list $sum $actual [expr {$sum == $actual}]
+} {2 3 0}
+
+finish_test
