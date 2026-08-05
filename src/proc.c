@@ -466,10 +466,18 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
   sqlite3ExprListDelete(db, pSub->pOrderBy);   /* the segment's, not ours */
   pSub->pOrderBy = 0;
   pOld = pSub->pEList;
+  /* Returning here without adding a column would leave the parent row NARROWER
+  ** than sqlite3VdbeSetProcShapes() declares, which is precisely the
+  ** metadata/register mismatch that produced a fabricated value the first time
+  ** this feature was measured.  Conformance guarantees the arity, so this is
+  ** unreachable; assert rather than degrade. */
+  assert( pOld!=0 && pOld->nExpr>=pF->pNested->nParam
+          && pF->iKeyCol<=pOld->nExpr );
   if( pOld==0 || pOld->nExpr<pF->pNested->nParam || pF->iKeyCol>pOld->nExpr ){
     pSub->pEList = 0;
     sqlite3SelectDelete(db, pSub);
     sqlite3ExprListDelete(db, pOld);
+    sqlite3ErrorMsg(pParse, "cannot build the nested column for %s", pF->zName);
     return;
   }
 
@@ -560,10 +568,12 @@ static void procAddCountColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
   sqlite3ExprListDelete(db, pSub->pOrderBy);
   pSub->pOrderBy = 0;
   pOld = pSub->pEList;
+  assert( pOld!=0 && pF->iKeyCol<=pOld->nExpr );
   if( pOld==0 || pF->iKeyCol>pOld->nExpr ){
     pSub->pEList = 0;
     sqlite3SelectDelete(db, pSub);
     sqlite3ExprListDelete(db, pOld);
+    sqlite3ErrorMsg(pParse, "cannot build the child count for %s", pF->zName);
     return;
   }
   {
@@ -728,7 +738,20 @@ static int procLowerChild(ProcConf *p, TriggerStep *pStep, ProcEmit *pE){
     p->nErr = 1;
     return 1;
   }
-  if( pSel->pEList==0 || pE->iKeyCol>pSel->pEList->nExpr ) return 0;
+  /* REFUSE RATHER THAN DEGRADE.  Conformance has already matched this SELECT's
+  ** arity against the nested table's declared columns, and phase 1 validated
+  ** that KEY names one of them, so iKeyCol is in range by construction.  If it
+  ** ever is not, the engine cannot impose the ordering -- and quietly not
+  ** imposing it is the one outcome this whole feature exists to prevent, since
+  ** a client that never wrote the ordering has no way to notice its absence.
+  ** Fail loudly instead. */
+  if( pSel->pEList==0 || pE->iKeyCol>pSel->pEList->nExpr ){
+    sqlite3ErrorMsg(p->pParse,
+      "cannot impose the correlation ordering for nested table %s of "
+      "procedure %s%s", pE->zNested, p->zName, p->zWhere);
+    p->nErr = 1;
+    return 1;
+  }
 
   /* Sort by a COPY OF THE PROJECTED EXPRESSION rather than by the ordinal
   ** "ORDER BY <n>".  A constructed TK_INTEGER is not resolved as an ordinal
