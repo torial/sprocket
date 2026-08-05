@@ -448,6 +448,23 @@ provided." Follow it rather than inventing a warning mechanism.
   and reads `proc_info`; preparing each CALL to collect this is a small
   extension of what it does.
 
+**Refined 2026-08-04, on implementing it.** The advisory is emitted **at
+compile**, not at every prepare — a body served from the procedure cache does
+not re-advise. That is sufficient for the stated purpose: an index dropped after
+deployment changes the schema, which expires statements and forces a recompile,
+so the advisory reappears exactly when the situation it warns about arises.
+Requiring a log on every prepare would re-advise for a repeated identical call,
+which is noise rather than signal. `test/proc6adv.test` had originally demanded
+that, and the *spec* was corrected rather than the engine.
+
+**Detection method, with its limit.** The generated code for the child `SELECT`
+is scanned for `OP_SorterOpen`: an ordering an index satisfied emits no sorter.
+`sqlite3WhereIsOrdered()` would be more precise but is only reachable during
+where-loop generation, not after `sqlite3Select()` returns. The consequence is
+that a sorter the child query needed **anyway** — its own `GROUP BY`, say — is
+indistinguishable, so this can over-report. It never under-reports, which is the
+right direction for an advisory.
+
 **Honest limit:** performance advice ages badly. This says the ordering costs a
 sort, which is a fact; whether that matters is a judgement the tool cannot
 make. Report the fact, let the developer judge.

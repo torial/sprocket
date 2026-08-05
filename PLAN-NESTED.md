@@ -559,8 +559,8 @@ see what to generate. That is phase 7's first task, not a surprise to discover.
 | 5b flat-client column | **done** |
 | DOCKET 3c projection | **done** |
 | 4 per-parent cardinality | **done** |
-| **6 index advisory (R7)** | **not started** |
-| **7 generated reassembler** | **not started** |
+| 6 index advisory (R7) | **done** |
+| **7 generated reassembler** | **not started** — the last one |
 
 Branch `nested-shapes`, unmerged. Merging before 7 would ship a feature whose
 typed client does not exist yet, which is the half-present state this plan

@@ -1661,6 +1661,10 @@ static void procTransferParseError(Parse *pTo, Parse *pFrom){
 ** procedure must have the same number of result columns; pPrg->nResCol
 ** records that count (-1 until the first row-producing SELECT is seen).
 */
+/* Defined below, next to the projection checks; called from the codegen. */
+static void procNoteChildSort(Vdbe*, int, Proc*, TriggerStep*);
+static void procAdviseIndexes(Proc*);
+
 static void codeProcProgram(
   Parse *pParse,            /* Sub-parse context for the body */
   TriggerStep *pStepList,   /* List of statements in the body */
@@ -1893,7 +1897,11 @@ static void codeProcProgram(
           /* pSelect can be 0 here after an OOM in the dup or in the fold
           ** generation above; mallocFailed is already set, so skipping the
           ** codegen simply lets the error propagate. */
-          if( pSelect ) sqlite3Select(pParse, pSelect, &sDest);
+          if( pSelect ){
+            int iCodeStart = sqlite3VdbeCurrentAddr(v);
+            sqlite3Select(pParse, pSelect, &sDest);
+            procNoteChildSort(v, iCodeStart, pPrg->pProc, pStep);
+          }
           if( pParse->nErr==0 && pSelect ){
             int nCol = pSelect->pEList->nExpr;
             Proc *pProcC = pPrg->pProc;
@@ -2213,6 +2221,60 @@ int sqlite3ProcWithCounts(Parse *pParse, Token *pWord){
 }
 
 /*
+** DOCKET R7 / PLAN-NESTED phase 6 -- the index advisory.
+**
+** The engine imposes the child ordering, so the author never writes it and
+** never sees that it costs a sort when no index supplies it.  Making the
+** engine responsible for the ordering makes it responsible for saying when the
+** ordering is expensive.
+**
+** Detection is by inspecting the code just generated for the child SELECT: a
+** sort that an index satisfied emits no sorter.  The honest limitation is that
+** a sorter the child query needed ANYWAY -- its own GROUP BY, say -- is
+** indistinguishable here, so this can over-report.  It never under-reports,
+** which is the right direction for an advisory.
+**
+** Never an error.  A ten-row child table does not need an index, and the
+** author may know better than the check.
+*/
+static void procNoteChildSort(Vdbe *v, int iStart, Proc *pProc,
+                              TriggerStep *pStep){
+  ProcFold *pF;
+  int i, nOp, bSort = 0;
+  if( pProc==0 || v==0 ) return;
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    if( pF->pChild==pStep ) break;
+  }
+  if( pF==0 ) return;
+  nOp = sqlite3VdbeCurrentAddr(v);
+  for(i=iStart; i<nOp; i++){
+    if( sqlite3VdbeGetOp(v, i)->opcode==OP_SorterOpen ){
+      bSort = 1;
+      break;
+    }
+  }
+  pF->bNeedsSort = (u8)bSort;
+}
+
+/*
+** Emit the advisory for every nested table whose imposed ordering needed a
+** sort.  Called at prepare, after the body has been acquired, so that a body
+** served from the procedure cache still advises -- the point is to catch an
+** index dropped after deployment, which is exactly the case where nothing
+** recompiles.
+*/
+static void procAdviseIndexes(Proc *pProc){
+  ProcFold *pF;
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    if( pF->bNeedsSort==0 ) continue;
+    sqlite3_log(SQLITE_WARNING,
+      "procedure %s: the declared correlation %s.%s requires an ordering that "
+      "no index supplies", pProc->zName, pF->zName,
+      pF->pNested->a[pF->iKeyCol-1].zName);
+  }
+}
+
+/*
 ** Validate a RETURNING projection against a procedure's declared shapes --
 ** DOCKET 3c, step 3a.  Returns non-zero if an error was reported.
 **
@@ -2469,6 +2531,12 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       }
     }
   }
+
+  /* Advisory comes AFTER the body is acquired: a fresh compile is what
+  ** discovers whether the ordering needed a sort, and a cache hit carries that
+  ** answer forward from one -- which is the case that matters, since an index
+  ** dropped after deployment is exactly when nothing recompiles. */
+  procAdviseIndexes(pProc);
 
   /* Declared result shapes (RETURNS TABLE / RETURNS NOTHING): a toplevel
   ** prepared CALL reports the FIRST declared shape through the standard

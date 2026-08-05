@@ -4302,6 +4302,7 @@ struct ProcFold {
   const char *zKeyParent;   /* Declared name of the parent-side key column */
   int iDeclPos;             /* 0-based position within the shape */
   int iKeyCol;              /* 1-based key position among the child's columns */
+  u8 bNeedsSort;            /* True if the imposed ordering costs a sort */
 };
 
 struct Proc {
