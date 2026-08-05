@@ -768,6 +768,49 @@ occasional deep check.
 
 ---
 
+## 3e. Declared idempotency — *the engine knows; nobody can ask*
+
+**Raised 2026-08-05 while checking whether Tack's design accounted for the wire
+transport. It does (`ZEBRA_ORM_ARCHITECTURE.md` §14.6) — but it predates this,
+and getting it wrong duplicates writes.**
+
+**The problem.** The transport makes the request a `CALL`. Every RPC client that
+has ever existed eventually asks: *the connection dropped before I saw a
+response — may I resend?* For a read, yes. For a write, resending may apply it
+twice. A client cannot tell which a procedure is, so it must either never retry
+(and surface every blip as a failure) or always retry (and risk duplicates).
+
+**The engine already knows.** `procCachePopulate` sets `PROCCACHE_WRITES` from
+`DbMaskTest(pParse->writeMask, iDb)`. It is computed, stored, and unreachable —
+`PRAGMA proc_list` exposes `name, nparams, nresultsets, declared, security` and
+nothing about whether the body writes.
+
+**Proposal.** A `writes` column on `proc_list`, so a generated client learns at
+build time whether a `CALL` is retry-safe, and a remote binding can retry reads
+automatically while refusing to retry writes.
+
+**Derive it statically, not from the cache.** `PROCCACHE_WRITES` is set when the
+body is *compiled*, and `proc_list` reads the schema-resident `Proc`, which has
+never been compiled. Walking the body's `TriggerStep` list for `TK_INSERT` /
+`TK_UPDATE` / `TK_DELETE` (and for a `CALL` of a procedure that writes) answers
+it at CREATE time, where the answer belongs. The conformance walk already
+traverses exactly that list.
+
+**Be conservative in the right direction.** Unknown must mean *writes*. A
+procedure wrongly marked read-only produces duplicate writes on a retry — silent,
+data-corrupting, and discovered late. One wrongly marked as writing produces an
+unnecessary error on a dropped connection. Misses are recoverable; false
+assurances are not.
+
+**Honest limit.** "Does not write" is not the same as "idempotent." A read-only
+procedure calling a non-deterministic function, or one whose result feeds a
+later decision, is safe to *resend* but not necessarily safe to *treat as
+unchanged*. This buys retry-safety for reads, not general idempotency, and the
+column should be named `writes` rather than `idempotent` so it cannot be
+over-read.
+
+---
+
 ## 4. Incremental view maintenance — *the big one, and the one I most want*
 
 Materialized views that update as writes land rather than being recomputed.
