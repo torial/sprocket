@@ -174,7 +174,7 @@ int main(int argc, char **argv){
     sqlite3_stmt *pInfo = 0;
     Col *aCol = 0;
     int nCol = 0, nAlloc = 0;
-    int i, iSet;
+    int i, iSet, nNestSeen = 0;
 
     /* Collect the whole signature in one query: set 0 = parameters,
     ** 1..n = declared result shapes. */
@@ -273,6 +273,7 @@ int main(int argc, char **argv){
 
     /* typed column accessors, per result set */
     for(iSet=1; iSet<=nSet; iSet++){
+      nNestSeen = 0;
       for(i=0; i<nCol; i++){
         CType t;
         if( aCol[i].iSet!=iSet ) continue;
@@ -289,6 +290,28 @@ int main(int argc, char **argv){
           fputs("_bytes(", out); emitIdent(zProc);
           fprintf(out, "_stmt *p){ return sqlite3_column_bytes(p->pStmt, %d); }\n",
                   aCol[i].iPos);
+        }
+        /* A NESTED TABLE.  Recognised by an EMPTY decltype, unambiguous
+        ** because CREATE requires a type on every scalar column.  Its own
+        ** columns are the next result set, in declaration order -- and that
+        ** ordering is the only link between the two, so the generated header
+        ** states it rather than leaving a reader to rediscover it. */
+        if( aCol[i].zDecl==0 || aCol[i].zDecl[0]==0 ){
+          fprintf(out,
+            "/* %s: NESTED TABLE.  Its rows are result set %d -- reach them\n"
+            "** with %s_next_resultset().  The accessor above yields the whole\n"
+            "** table as JSON for a flat client; a typed client ignores it. */\n",
+            aCol[i].zName, iSet + 1 + nNestSeen, zProc);
+          fputs("static int ", out); emitIdent(zProc);
+          fprintf(out, "_rs%d_", iSet); emitIdent(aCol[i].zName);
+          fputs("_count(", out); emitIdent(zProc);
+          fprintf(out,
+            "_stmt *p){ return sqlite3_proc_child_count(p->pStmt, %d); }\n",
+            nNestSeen);
+          fputs("/* ^ children of the CURRENT parent row.  -1 unless the CALL\n"
+                "** was prepared WITH COUNTS; 0 means genuinely childless. */\n",
+                out);
+          nNestSeen++;
         }
       }
     }
