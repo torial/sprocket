@@ -1539,11 +1539,32 @@ void sqlite3Pragma(
         sqlite3VdbeMultiLoad(v, 1, "iiss", 0, j, pP->a[j].zName,
                              pP->a[j].zType);
       }
-      for(pS=pProc->pShapes; pS; pS=pS->pNext, iSet++){
+      /* Sets 1..n are SEGMENTS, not declared shapes: a shape holding a nested
+      ** table is followed by that table's own set, in declaration order.  That
+      ** makes resultset_index agree with proc_list.nresultsets, which counts
+      ** segments, and with sqlite3_proc_next_resultset(), which advances
+      ** through them -- and it is the only way procgen can see a nested
+      ** table's columns at all.
+      **
+      ** A nested column appears in its parent set with an EMPTY decltype,
+      ** which is how a client tells "this is a nested table" from a scalar.
+      ** Its columns are then the next set. */
+      for(pS=pProc->pShapes; pS; pS=pS->pNext){
         ProcParamList *pC = pS->pCols;
+        int k;
         for(j=0; pC && j<pC->nParam; j++){
           sqlite3VdbeMultiLoad(v, 1, "iiss", iSet, j, pC->a[j].zName,
                                pC->a[j].zType);
+        }
+        iSet++;
+        for(j=0; pC && j<pC->nParam; j++){
+          ProcParamList *pN = pC->a[j].pNested;
+          if( pN==0 ) continue;
+          for(k=0; k<pN->nParam; k++){
+            sqlite3VdbeMultiLoad(v, 1, "iiss", iSet, k, pN->a[k].zName,
+                                 pN->a[k].zType);
+          }
+          iSet++;
         }
       }
     }

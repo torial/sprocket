@@ -207,10 +207,23 @@ client will step through, and it agrees with the API that shares its name.
 For every procedure that does not nest, shapes and segments are equal and the
 value is unchanged from previous releases.
 
-Note the one place this vocabulary is still split: `PRAGMA proc_info`'s
-`resultset_index` enumerates **declared shapes**, not segments, and it does not
-yet list a nested table's own columns at all. Closing that is phase 7 work —
-`procgen` needs those columns to generate a typed child accessor.
+`PRAGMA proc_info`'s `resultset_index` counts segments too, so all three agree.
+A nested table's own columns appear as the segment following its parent, in
+declaration order:
+
+```
+resultset_index  position  name       decltype
+0                0         pid        INTEGER     <- parameters
+1                0         id         INTEGER
+1                1         title      TEXT
+1                2         comments               <- nested: EMPTY decltype
+2                0         post_id    INTEGER     <- the nested table's columns
+2                1         cid        INTEGER
+```
+
+**An empty `decltype` is how a client recognises a nested column**, since
+`CREATE` requires a type on every scalar one. Declaration order is what links
+segment N back to the column it belongs to — nothing else does.
 
 One property is intentionally **not** enforced:
 

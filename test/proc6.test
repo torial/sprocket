@@ -408,12 +408,23 @@ do_execsql_test 6.1 {
   CALL flat(1);
 } {1 first}
 
-# Introspection is unaffected -- a nested declaration remains readable even
-# though it cannot be executed, which is what lets procgen work ahead of the
-# runtime.
+# Introspection exposes the nested table's OWN COLUMNS as the segment that
+# follows its parent -- without this, procgen cannot see what to generate a
+# child accessor from.  resultset_index therefore counts SEGMENTS, agreeing
+# with proc_list.nresultsets and with sqlite3_proc_next_resultset().
+#
+# A nested column is recognisable in its parent set by an EMPTY decltype: a
+# scalar column always has one, because CREATE requires it.
 do_execsql_test 6.2 {
   SELECT resultset_index, position, name, decltype FROM pragma_proc_info('pwc');
-} {0 0 pid INTEGER 1 0 id INTEGER 1 1 title TEXT 1 2 comments {}}
+} {0 0 pid INTEGER 1 0 id INTEGER 1 1 title TEXT 1 2 comments {} 2 0 post_id INTEGER 2 1 cid INTEGER 2 2 body TEXT}
+
+# Two nested tables in one shape become two following segments, in declaration
+# order -- which is how a client maps segment N back to the column it belongs
+# to, since nothing else links them.
+do_execsql_test 6.3 {
+  SELECT resultset_index, position, name FROM pragma_proc_info('pwc2');
+} {0 0 pid 1 0 id 1 1 comments 1 2 tags 2 0 post_id 2 1 body 3 0 pid2 3 1 tag}
 
 #--------------------------------------------------------------------
 # 7.x: the step model is lazy per ROW, which is what phase 5's fold rests on
