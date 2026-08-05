@@ -231,6 +231,29 @@ One property is intentionally **not** enforced:
   are not checked against the body. In SQLite a declared type expresses
   affinity and intent rather than a constraint; this follows that model.
 
+## What it costs — measured, 2026-08-04
+
+Deterministic VDBE step counts, 200 parents x 5 children, data-local:
+
+| | VDBE steps | vs N+1 |
+|---|---|---|
+| N+1 (one child query per parent — the naive ORM pattern) | 9,805 | — |
+| **nested procedure, segment path** | **6,815** | **30% less** |
+| nested procedure, folded JSON column | 17,408 | **1.8× more** |
+
+**The typed path pays. The flat path does not, and that is worth stating
+plainly:** the folded JSON column costs *more* than the N+1 it appears to
+replace, because it **is** an N+1 — a correlated subquery per parent row — with
+JSON construction on top. It exists so that an unmodified client works at all.
+It is a **compatibility feature**, not an optimisation, and a client that can be
+taught anything should project it away with `RETURNING` and read the segments.
+
+**What this does not measure: round trips.** Locally, N+1 costs 200 statement
+executions in the same process. Across a connection it costs 200 *round trips*
+against one, and no VDBE counter can see that. These numbers are the data-local
+case — the one the fork was built for — and they understate both procedure
+paths everywhere else.
+
 ## Known limitations (deliberate, v1)
 
 - **A nested table streams as its own segment, not yet as a column** (branch
