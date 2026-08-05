@@ -241,12 +241,38 @@ Deterministic VDBE step counts, 200 parents x 5 children, data-local:
 | **nested procedure, segment path** | **6,815** | **30% less** |
 | nested procedure, folded JSON column | 17,408 | **1.8× more** |
 
-**The typed path pays. The flat path does not, and that is worth stating
-plainly:** the folded JSON column costs *more* than the N+1 it appears to
-replace, because it **is** an N+1 — a correlated subquery per parent row — with
-JSON construction on top. It exists so that an unmodified client works at all.
-It is a **compatibility feature**, not an optimisation, and a client that can be
-taught anything should project it away with `RETURNING` and read the segments.
+**The typed path pays. The flat path does not.** The folded JSON column costs
+*more* than the N+1 it appears to replace. It exists so an unmodified client
+works at all: a **compatibility feature**, not an optimisation, and a client that
+can be taught anything should project it away with `RETURNING` and read the
+segments.
+
+### The whole fan-out curve, 1000 children held constant
+
+| shape | N+1 | segments | fold |
+|---|---|---|---|
+| 200 × 5 | 9,805 | **6,815** | 17,408 |
+| 100 × 10 | 8,405 | **6,415** | 15,708 |
+| 50 × 20 | 7,705 | **6,215** | 14,858 |
+| 20 × 50 | 7,285 | **6,095** | 14,348 |
+| 10 × 100 | 7,145 | **6,055** | 14,178 |
+| 5 × 200 | 7,075 | **6,035** | 14,093 |
+
+**Segments win at every shape** — the gap narrows from 3,000 to 1,040 as fan-out
+widens, but never closes. There is no crossover where N+1 becomes the better
+choice.
+
+All three curves flatten toward a floor set by the 1000 child rows every
+approach must deliver; what separates them is per-parent overhead, roughly 14
+steps for N+1, 4 for segments, 17 for the fold.
+
+**And the fold's cost is mostly NOT the correlated subquery.** An earlier note
+here said the fold "is an N+1 with JSON on top." The scan says otherwise: at
+5 parents there are only five subqueries, and the fold still costs about twice
+N+1. Its overhead above the floor stays near 8,000 regardless of parent count,
+because **`json_object`/`json_group_array` construction scales with the number of
+CHILD rows, not with the number of parents.** Widening the fan-out does not help
+it. That is the honest mechanism, and it was measured rather than reasoned.
 
 **What this does not measure: round trips.** Locally, N+1 costs 200 statement
 executions in the same process. Across a connection it costs 200 *round trips*
