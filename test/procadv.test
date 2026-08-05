@@ -1,0 +1,141 @@
+# 2026-08-05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# Adversarial cases suggested by review rather than by the author.  Each targets
+# state that is per-STATEMENT (the compiled body, aProcSet, nHiddenCol) against
+# events that happen outside the statement's control.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procadv
+
+ifcapable {!trigger} { finish_test ; return }
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(cid INTEGER PRIMARY KEY, post_id INTEGER, body TEXT);
+  CREATE TABLE tags(tid INTEGER PRIMARY KEY, post_id INTEGER, tag TEXT);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,1,'a'),(2,1,'b'),(3,2,'c');
+  INSERT INTO tags VALUES(1,1,'x'),(2,2,'y'),(3,2,'z');
+} {}
+
+#--------------------------------------------------------------------
+# 1.x: the schema moves under a prepared statement, from ANOTHER connection
+#
+# The compiled body, aProcSet and nHiddenCol are all built at prepare, against
+# the schema as it was.  A second connection dropping and recreating the
+# procedure with a DIFFERENT SHAPE must not leave the first statement reading
+# its old metadata against a new body.
+#
+do_execsql_test 1.0 {
+  CREATE PROCEDURE shifty()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, body FROM comments;
+  END;
+} {}
+
+do_test 1.1 {
+  sqlite3 db2 test.db
+  set S [sqlite3_prepare_v2 db {CALL shifty()} -1 T]
+  set before [sqlite3_column_count $S]
+  # another connection replaces the procedure with a NARROWER shape
+  db2 eval {DROP PROCEDURE shifty}
+  db2 eval {CREATE PROCEDURE shifty() RETURNS TABLE(id INTEGER) BEGIN SELECT id FROM posts; END}
+  set rc [catch {
+    set rows 0
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} { incr rows }
+    set rows
+  } res]
+  set after [sqlite3_column_count $S]
+  sqlite3_finalize $S
+  db2 close
+  # Either the statement re-prepares against the new shape (1 column) or it
+  # errors.  What it must NOT do is report 3 columns over a 1-column body.
+  list $before [expr {$after==1 || $rc!=0}]
+} {3 1}
+
+#--------------------------------------------------------------------
+# 2.x: partial projection with counts
+#
+# Two nested tables; keep one, project the other away, request counts.  Visible
+# fold columns shrink; hidden count columns do not.  child_count(N) indexes at
+# nVisible+N, so N must still mean the N-th DECLARED nested table rather than
+# the N-th surviving one.
+#
+do_execsql_test 2.0 {
+  CREATE PROCEDURE two()
+    RETURNS TABLE(id INTEGER,
+                  comments TABLE(post_id INTEGER, body TEXT) KEY(post_id = id),
+                  tags TABLE(post_id INTEGER, tag TEXT) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT post_id, body FROM comments;
+    SELECT post_id, tag FROM tags;
+  END;
+} {}
+
+# post 1 has 2 comments and 1 tag; post 2 has 1 comment and 2 tags.
+do_test 2.1 {
+  set S [sqlite3_prepare_v2 db {CALL two() WITH COUNTS} -1 T]
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_proc_child_count $S 0][sqlite3_proc_child_count $S 1]
+  }
+  sqlite3_finalize $S
+  set r
+} {21 12}
+
+# Project `comments` away.  `tags` is still declared SECOND, so its count must
+# still be index 1 -- not 0, which is what a naive "index among survivors"
+# would give.
+do_test 2.2 {
+  set S [sqlite3_prepare_v2 db {CALL two() RETURNING id, tags WITH COUNTS} -1 T]
+  set nm {}
+  for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+    lappend nm [sqlite3_column_name $S $i]
+  }
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_proc_child_count $S 1]
+  }
+  sqlite3_finalize $S
+  list $nm $r
+} {{id tags} {1 2}}
+
+#--------------------------------------------------------------------
+# 3.x: counts read from positions the row does not occupy
+#
+do_test 3.0 {
+  set S [sqlite3_prepare_v2 db {CALL two() WITH COUNTS} -1 T]
+  # before any step: no current row
+  set pre [sqlite3_proc_child_count $S 0]
+  # EXHAUST the parent set first.  An earlier draft stepped once of two parent
+  # rows and asserted on the result of next_resultset without checking that it
+  # advanced -- the engine enforces in-order consumption, so it had not, and the
+  # count read was a correct value for a row we were still sitting on.  A test
+  # that does not verify its own precondition measures the precondition.
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  set adv [sqlite3_proc_next_resultset $S]
+  sqlite3_step $S
+  # positioned in the CHILD segment, which declares no counts of its own
+  set mid [sqlite3_proc_child_count $S 0]
+  sqlite3_reset $S
+  # after reset: no current row again
+  set post [sqlite3_proc_child_count $S 0]
+  sqlite3_finalize $S
+  list $adv $pre $mid $post
+} {SQLITE_OK -1 -1 -1}
+
+finish_test
