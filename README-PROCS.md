@@ -280,6 +280,33 @@ against one, and no VDBE counter can see that. These numbers are the data-local
 case — the one the fork was built for — and they understate both procedure
 paths everywhere else.
 
+### What happens when the correlation is not indexed
+
+The table above indexed `comments(post_id)`. Removing it — the exact case the
+phase 6 advisory warns about — separates the two approaches by a different order
+of magnitude:
+
+| shape | index | N+1 | segments |
+|---|---|---|---|
+| 200 × 5 | yes | 9,805 | 6,815 |
+| 200 × 5 | **no** | **606,206** | **12,816** |
+| 20 × 50 | yes | 7,285 | 6,095 |
+| 20 × 50 | **no** | **64,226** | **12,096** |
+
+**Segments degrade gracefully; N+1 degrades catastrophically.** Without the
+index, segments pay a single sort — roughly **2×**, bounded and one-off. N+1
+pays a full scan of the child table *per parent row* — **62×** at 200 parents,
+and growing with the parent count rather than the data.
+
+That is the real argument for pushing the correlation into the engine. Indexed,
+segments win by 1.4×, which is worth having. Unindexed, they win by **47×**,
+because the engine's plan is O(n log n) once where the client's is O(parents ×
+children).
+
+It also explains why the phase 6 advisory is **advisory and never an error**:
+even unindexed, the procedure path is *fine*. A 2× sort is a nuisance worth
+mentioning. It is the naive client, not the engine, that falls off a cliff.
+
 ## Known limitations (deliberate, v1)
 
 - **A nested table streams as its own segment, not yet as a column** (branch
