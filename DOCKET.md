@@ -971,6 +971,31 @@ mistakes reading for evidence.
   finalized or automatically reprepared). Mitigated by the mode being opt-in,
   but generated clients must read names per row or cache per segment index.
 
+### IMPLEMENTED 2026-08-06 -- the rewrite, and what its tests caught
+
+`CALL p() WITH INTERLEAVED` works: one discriminated result set (`_segment,
+_key, payload...`), engine-merged in a single pass, `procinter` 6.x pinning
+output, names, tie order, author within-group ORDER BY survival, and every
+refusal.  procfault grew 1064 -> 1442 walking the new constructors under OOM.
+
+Three bugs found by the tests before the commit, in escalating severity:
+a constructed ORDER BY ordinal not recognized by the compound resolver (the
+phase-3 constructed-token lesson, third occurrence); a pProj double free in
+the composition refusal (owner is CallProcProject -- crashed as a MISSING
+summary line, not an error); and one SHIPPED bug latent since 08-05: the
+author-ORDER-BY merge path in procLowerChild returned before procRecordFold
+and before the LIMIT/compound guards, so an author-ordered child had no fold
+recipe at all -- phantom column on the flat path, counts wrongly refused,
+advisory blind, LIMIT unrefused.  The fold path had simply never been tested
+with an author-ordered child.
+
+Still open here: COUNTS+INTERLEAVED and RETURNING+INTERLEAVED compositions
+(refused, not built); the zebra-sprocket seam upgrade (its _fetch_segments can
+become one WITH INTERLEAVED query with no client change); and the CALL-vs-
+EXPLAIN error-surfacing asymmetry observed on the pre-fix ordinal -- the same
+resolution failure was loud under EXPLAIN and silent at CALL, which deserves
+an entry of its own if it reproduces on a deliberately broken input.
+
 ### The implementation fork, probed 2026-08-06 — rewrite vs driver
 
 Planning the codegen exposed two materially different implementations, so the

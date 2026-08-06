@@ -6,6 +6,14 @@ long and mostly historical.*
 
 ## NEXT ACTION
 
+**DONE 2026-08-06 — WITH INTERLEAVED shipped** as the tree rewrite (see DOCKET
+3h "IMPLEMENTED"): one discriminated result set, engine-merged, procinter 6.x +
+procfault 1442 green. Remaining: the COUNTS/RETURNING compositions (refused,
+not built) and the zebra-sprocket seam upgrade (its `_fetch_segments` can
+become one `WITH INTERLEAVED` query with no client change).
+
+*(Historical next-action below, kept for the reasoning pointers.)*
+
 **Build the merge driver** — now the ONLY remaining engine piece. The ORM
 milestone was reached 2026-08-06: `procgen --lang zebra` emits typed nested
 structs (child structs + `List(Child)` fields + a stitch keyed by the new
