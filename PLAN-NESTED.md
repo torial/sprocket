@@ -1017,7 +1017,33 @@ must go red.
   keeping one `CALL` and a correct answer while silently forfeiting the
   correlation check, the imposed ordering, conformance, counts, introspection
   and the segment path. The refusal redirects rather than prevents, into a form
-  that looks identical from outside. See 3g for the options. Each level would have to
+  that looks identical from outside. See 3g for the options.
+
+  **NO LONGER OUT OF SCOPE — and the blocker recorded below was wrong about the
+  mechanism (2026-08-05, on Sean's "I'm open to widening past 2 levels").** It
+  describes a lockstep-streaming protocol that this code does not implement.
+  `procLowerChild` orders each child segment by *its own key only*, and the
+  parent segment is not ordered at all — so reassembly is already key-based
+  grouping, not a merge. A grandchild segment ordered by its own key therefore
+  attaches to child rows by exactly the rule children attach to parents.
+  Uniform, recursive, no ancestor path — and a `replies` table holding only
+  `comment_id` is sufficient, because it correlates to a *comment*, never to a
+  post.
+
+  Nor is the wire format affected: `VdbeProcSet.nHidden` is already per-segment,
+  so a child row carries the hidden counts for *its* nested tables and
+  `sqlite3_proc_child_count(stmt, N)` reads them with no change. Duplicate
+  parent-side keys behave at depth 2 exactly as at depth 1 — it is a join at
+  every level — so those semantics are inherited, not extended.
+
+  What the widening actually costs is **recursion in four places that currently
+  walk one level** (`sqlite3ProcSegmentCount`, `procBuildEmits`,
+  `procApplyFolds`, `sqlite3VdbeSetProcShapes`), plus a changed meaning for the
+  3g advisory: it currently means "hand-rolled because they had to" and would
+  come to mean "hand-rolled by choice" (`proc6adv` 4.1/4.2 pin it in both
+  directions and change with it).
+
+  *Superseded text, for the record:* Each level would have to
   be ordered by the full *ancestor path*, not by its own parent key, and each
   level would have to expose every ancestor key — which a `replies` table
   holding only `comment_id` does not have. That is a genuine blocker no syntax

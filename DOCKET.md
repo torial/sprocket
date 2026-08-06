@@ -819,6 +819,19 @@ because it is four lines and it works.
   full ancestor path, and every ancestor key must be exposed — a `replies` table
   holding only `comment_id` cannot correlate to a post. Real work, not a syntax
   fix.
+  **— RETRACTED 2026-08-05. Those blockers describe a protocol this code does
+  not implement.** `procLowerChild` orders each child segment by *its own key
+  only*; the parent segment is not ordered at all. Reassembly is therefore
+  already key-based grouping rather than a lockstep merge, so a grandchild
+  segment ordered by its own key attaches to children by the same rule children
+  attach to parents — no ancestor path, and `comment_id` alone is sufficient
+  because a reply correlates to a *comment*, never to a post. The wire format is
+  untouched as well: `VdbeProcSet.nHidden` is per-segment, so a child row
+  carries counts for its own nested tables and `sqlite3_proc_child_count()`
+  reads them unchanged. The real cost is recursion in four one-level walks
+  (`sqlite3ProcSegmentCount`, `procBuildEmits`, `procApplyFolds`,
+  `sqlite3VdbeSetProcShapes`). Sean opened this option 2026-08-05; it is the
+  chosen direction, scheduled after phase 7.
 - **Notice and advise.** The engine already inspects child `SELECT`s (phase 3,
   phase 6). A `json_group_array` in one is detectable, and an advisory —
   *"this column nests by hand; its correlation is not checked"* — costs little
