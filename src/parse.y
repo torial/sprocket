@@ -2018,7 +2018,17 @@ cmd ::= CALL fullname(X) wcounts(C). {
 // no keywords -- verified with lemon rather than assumed.
 %type wcounts {int}
 wcounts(A) ::= . { A = 0; }
-wcounts(A) ::= WITH nm(X). { A = sqlite3ProcWithCounts(pParse, &X); }
+wcounts(A) ::= WITH optlist(X). { A = X; }
+// The list hangs off WITH rather than off the OPTIONAL wcounts nonterminal.
+// Making wcounts itself left-recursive produced 2 parsing conflicts, because
+// an empty wcounts followed by COMMA is ambiguous against every other comma in
+// the grammar.  lemon reported it and the build refused -- verified, not
+// assumed.
+%type optlist {int}
+optlist(A) ::= nm(X). { A = sqlite3ProcCallOption(pParse, &X); }
+optlist(A) ::= optlist(B) COMMA nm(X). {
+  A = B | sqlite3ProcCallOption(pParse, &X);
+}
 
 // DOCKET 3c, projection.  RETURNING is an existing token, so this is a
 // grammar-only probe: does it attach after CALL without conflicts?

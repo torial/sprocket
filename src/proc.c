@@ -2290,16 +2290,20 @@ static void procCachePopulate(
 ** pass (it expects -1) while 1.0 failed, which reads as a partial feature
 ** rather than an absent one.
 */
-int sqlite3ProcWithCounts(Parse *pParse, Token *pWord){
+int sqlite3ProcCallOption(Parse *pParse, Token *pWord){
   char *z = sqlite3NameFromToken(pParse->db, pWord);
+  int r = 0;
   if( z==0 ) return 0;
-  if( sqlite3StrICmp(z, "counts")!=0 ){
-    sqlite3ErrorMsg(pParse, "expected COUNTS after WITH, got %s", z);
-    sqlite3DbFree(pParse->db, z);
-    return 0;
+  if( sqlite3StrICmp(z, "counts")==0 ){
+    r = PROC_OPT_COUNTS;
+  }else if( sqlite3StrICmp(z, "interleaved")==0 ){
+    r = PROC_OPT_INTERLEAVED;
+  }else{
+    sqlite3ErrorMsg(pParse,
+        "expected COUNTS or INTERLEAVED after WITH, got %s", z);
   }
   sqlite3DbFree(pParse->db, z);
-  return 1;
+  return r;
 }
 
 /*
@@ -2477,6 +2481,19 @@ proj_cleanup:
 
 void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
                      IdList *pProj, int bCounts){
+  /* DOCKET 3h.  The syntax is reserved now so that the grammar and the option
+  ** bitmask are settled before the merge driver exists, but accepting the word
+  ** and then streaming ordinary segments would be a silent wrong answer -- the
+  ** client would dispatch per row on a stream that is not interleaved.  Refuse
+  ** until it does something. */
+  if( bCounts & PROC_OPT_INTERLEAVED ){
+    sqlite3ErrorMsg(pParse, "WITH INTERLEAVED is not implemented yet");
+    sqlite3SrcListDelete(pParse->db, pName);
+    sqlite3ExprListDelete(pParse->db, pArgs);
+    sqlite3IdListDelete(pParse->db, pProj);
+    return;
+  }
+  bCounts &= PROC_OPT_COUNTS;
   sqlite3 *db = pParse->db;
   Proc *pProc = 0;
   ProcPrg *pPrg;

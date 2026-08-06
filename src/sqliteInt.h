@@ -5469,7 +5469,13 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
   void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*, int);
   int sqlite3ProcProjKeeps(IdList*,const char*);
-  int sqlite3ProcWithCounts(Parse*,Token*);
+  int sqlite3ProcCallOption(Parse*,Token*);
+/* Options on a CALL, a bitmask so they compose rather than multiply the
+** grammar.  PROC_OPT_INTERLEAVED is accepted by the parser and REFUSED at
+** CALL until the merge driver lands -- a flag that parses and silently does
+** nothing is the exact failure this feature keeps guarding against. */
+#define PROC_OPT_COUNTS       0x01
+#define PROC_OPT_INTERLEAVED  0x02
   void sqlite3VdbeApplyProcSet(Vdbe*, int);
   char **sqlite3VdbeCaptureColumnNames(Vdbe*, int);
   TriggerStep *sqlite3ProcDeclareStep(Parse*, Token*, Token*, Expr*);

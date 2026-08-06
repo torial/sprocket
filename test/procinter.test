@@ -187,4 +187,37 @@ do_test 3.4 {
   set r
 } {-1}
 
+#--------------------------------------------------------------------
+# 4.x: the CALL option bitmask (DOCKET 3h).  Syntax reserved before the merge
+# driver exists, so the grammar is settled once; but INTERLEAVED is REFUSED
+# rather than accepted-and-ignored.  A flag that parses and silently streams
+# ordinary segments would have the client dispatching per row on a stream that
+# is not interleaved -- a wrong answer wearing a working one's clothes.
+#
+do_catchsql_test 4.0 {
+  CALL atlas() WITH INTERLEAVED;
+} {1 {WITH INTERLEAVED is not implemented yet}}
+
+# Composition parses -- the options are a bitmask, not alternatives -- and the
+# refusal still fires.  This is what proves the comma list works at all.
+do_catchsql_test 4.1 {
+  CALL atlas() WITH COUNTS, INTERLEAVED;
+} {1 {WITH INTERLEAVED is not implemented yet}}
+
+# REGRESSION CONTROL: the pre-existing option must still work.  Without this,
+# 4.0 and 4.1 would pass just as well against a change that broke WITH COUNTS
+# outright, since both only assert that something errors.
+do_test 4.2 {
+  set S [sqlite3_prepare_v2 db {CALL atlas() WITH COUNTS} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_proc_child_count $S 0] [sqlite3_proc_child_count $S 1]]
+  sqlite3_finalize $S
+  set r
+} {2 1}
+
+# An unknown word names both legal options rather than only the older one.
+do_catchsql_test 4.3 {
+  CALL atlas() WITH SPRINKLES;
+} {1 {expected COUNTS or INTERLEAVED after WITH, got SPRINKLES}}
+
 finish_test
