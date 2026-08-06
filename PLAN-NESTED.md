@@ -1033,6 +1033,61 @@ sequential multi-set cursor admits no other shape." Three ways out, none free:
   redesign, not a phase-7 item. **Worth its own docket entry** — it is the only
   option that gets both laziness and one round trip.
 
+### Phase 7 probe 2026-08-05 — coroutines survive the proc SubProgram frame
+
+**Sean asked whether multiple cursors could let child segments stream alongside
+the parent. The answer is that SQLite already does this internally**, and the
+one risk that would have killed it is now measured rather than assumed.
+
+`multiSelectOrderBy` (`src/select.c` ~3580) runs two sub-selects as *concurrent*
+coroutines — `OP_InitCoroutine` on `regAddrA` and `regAddrB`, separate resumable
+program counters in one VDBE — and advances whichever is behind by comparing
+sort keys. That is structurally the parent/children merge, with the upstream
+suite behind it.
+
+**The risk:** proc bodies compile to SubPrograms, and `OP_Yield` moves the PC
+across frame push/pop. If coroutines did not survive a frame, the design was
+dead.
+
+**Measured, not inferred.** `EXPLAIN CALL fill()` on a body containing
+`INSERT INTO dst SELECT a FROM src ORDER BY a`:
+
+```
+1  Program        1  2  1  program   Call: fill
+2  InitCoroutine  3  17 3
+14   Yield        3  0  0
+16 EndCoroutine   3  0  0
+18   Yield        3  23 0
+```
+
+Coroutine opcodes *inside* the `Program` frame, and the call moves all 5 rows.
+
+**The probe was built to be capable of failing.** Row counts alone prove nothing
+here — `INSERT...SELECT` has a non-coroutine path that also yields 5 — so the
+`EXPLAIN` check is what makes the result mean anything, and a negative control
+(`WHERE a<=3` → 3) confirms the counter can report a number other than the
+expected one. Control A was the same construct in a *trigger* SubProgram, which
+upstream already exercises.
+
+**Also corrected:** the earlier claim that one-statement-per-segment costs "a
+lost transactional snapshot" is **wrong** — statements on one connection in one
+transaction share a snapshot. The real objection is that it runs the body N
+times, so side effects, temp tables and mid-body computation happen N times.
+A semantics problem, not a visibility one.
+
+**What remains before the merge driver is real:**
+
+- Two *body statements* compiled with `SRT_Coroutine` destinations and a merge
+  driver between them — probe covered one coroutine, not two merged.
+- **Interleaved rows change shape per row**, and that is the hard API question:
+  `sqlite3_column_count()` is currently constant between segment boundaries and
+  changes only on an explicit `sqlite3_proc_next_resultset()`. Per-row variation
+  needs a discriminator and a decision about what legacy accessors see.
+- An interleaved merge **does** require each level ordered by its parent key —
+  the ancestor-path constraint from the retracted blocker returns as a genuine
+  requirement *in this design*. The retraction stands for the shipped protocol;
+  it does not transfer to a merging one.
+
 **What `WITH COUNTS` buys them, concretely.** §6 gives S4 a proc-author contract
 checked by "a cheap key-monotonicity assertion in the stitcher" on debug builds.
 Monotonicity catches a *disordered* stream. It cannot catch a *truncated* one —
