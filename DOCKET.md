@@ -971,6 +971,57 @@ mistakes reading for evidence.
   finalized or automatically reprepared). Mitigated by the mode being opt-in,
   but generated clients must read names per row or cache per segment index.
 
+### The implementation fork, probed 2026-08-06 — rewrite vs driver
+
+Planning the codegen exposed two materially different implementations, so the
+choice is recorded here and put to Sean rather than made silently.
+
+**A. The tree rewrite.** `WITH INTERLEAVED` compiles the shape into a compound
+`UNION ALL` ordered by the correlation key -- one result set, uniform
+NULL-padded arity, a leading `_segment` column:
+
+```sql
+SELECT id, 0 AS _segment, id, title FROM (parent...)
+UNION ALL
+SELECT post_id, 1, post_id, cid FROM (child...)
+ORDER BY 1
+```
+
+Probed against a live fixture: the output IS the interleaved stream (P1, its
+children, P2, ..., childless parent present), the planner chooses
+`MERGE (UNION ALL)` -- two coroutines, parent by ordered scan, child by its key
+index, single pass -- and with the key as the only ORDER BY term there is NO
+temp b-tree: ties between arms favor the left arm, so a parent precedes its
+own children for free.  (Left-arm-on-ties is implementation behavior, not
+contract; building on it means pinning it with a test in this fork.)
+
+What A dissolves: every per-row metadata risk measured above -- one result set
+means no per-row ApplyProcSet, constant column_count, no stale name pointers,
+and `next_resultset` returning DONE honestly rather than MISUSE by decree.
+The zebra-sprocket seam keeps emitting real per-segment names by renaming
+positionally (it can read PRAGMA proc_info at runtime), so generated clients
+do not change.  Server economics are the segment economics: one pass, index
+driven, streaming in bounded memory.
+
+What A refuses: two nested tables that correlate on DIFFERENT parent columns
+cannot share one merge order -- `KEY(a_id = a)` and `KEY(b_id = b)` have no
+common sort.  Refused at CALL with a clear error; same-key siblings (both
+fixtures, Mosaic) work.  And interleaved output is ordered by the correlation
+key, not the author's parent order -- a real, documented semantic of the
+opt-in.
+
+**B. The hand-written driver.** Parent coroutine; per parent row, run each
+child SELECT correlated to the current key (the fold recipe minus the JSON),
+bumping iProcSet per row.  Keeps per-segment metadata on the wire, arbitrary
+sibling keys, and the author's parent order.  Costs: server-side N+1 -- the
+economics this feature's own benchmark exists to beat -- plus all the per-row
+metadata hazards return, plus substantially more new VDBE codegen.
+
+**Recommendation: A.** The shared-parent-key restriction is honest and
+refusable; B buys generality for the rarer shape at N+1 cost and more
+machinery.  A also converges the layers: the seam's client shape becomes the
+engine's native protocol.
+
 ### Measure before building
 
 - Two body statements compiled with `SRT_Coroutine` and merged — the probe
