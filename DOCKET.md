@@ -923,7 +923,37 @@ containing 2, because the probe's own `.print` banner contained the word. The
 opcode-only count is 2. Counting matches of a term that appears in your own
 labels inflates toward the answer you are hoping for.*
 
-### Risks 2 and 3 — reasoned from source, NOT measured
+### Risks 2 and 3 — MEASURED 2026-08-06, `test/procinter.test`
+
+Promoted from the reasoning below to evidence. Eight tests, no leaks.
+
+A shape with **two sibling nested tables of different widths** gives three
+segments of arity **4 → 2 → 3**, so the widest-set name array is exercised
+narrowing *and* widening rather than only growing.
+
+- **Risk 2 — repeated `ApplyProcSet` holds.** Arity and every column name are
+  correct at each segment across both transitions, and two independent walks of
+  the same statement return byte-identical metadata (1.2) — a reused buffer or
+  a stale pointer would drift on the second pass. No leaks. Per-*row* remains
+  untested, but per-row differs from per-segment only in frequency: the call
+  does not allocate.
+- **Risk 3 — out-of-range is empty, not stale.** On segment 1 (2 columns),
+  index 3 — valid on segment 0 — yields empty rather than the segment-0 value
+  that occupied that register. Better than feared: registers are not leaking
+  the wider segment's data. Still **silent**, since nothing surfaces to a client
+  that does not check `sqlite3_errcode()`. 2.1 is the positive control: the same
+  accessor returns non-empty at indices the segment does have, on the same row,
+  so 2.0 cannot pass merely because the accessor is broken or no row was
+  produced.
+
+**The draft of that test demonstrated the hazard it was written to pin.** It
+asked for the width *after* `sqlite3_finalize()` and got **4** — the previous
+segment's width, read out of freed memory. Not a crash, and a number plausible
+enough to read as an answer. The corrected version reads everything before
+finalize and says so in a comment, because the next person to edit it will be
+tempted the same way.
+
+### Superseded reasoning, kept for the record — source-only, NOT measured
 
 Recorded at a lower confidence than the above, and labelled so no one later
 mistakes reading for evidence.

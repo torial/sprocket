@@ -1,0 +1,133 @@
+# 2026-08-06
+#
+# Sanity checks standing behind DOCKET 3h (interleaved segments), taken BEFORE
+# the merge driver is written rather than after.
+#
+# Two questions were recorded there as reasoned-from-source but NOT measured:
+#
+#   Risk 2. Is sqlite3VdbeApplyProcSet safe to apply repeatedly mid-statement?
+#           Its column-name array is deliberately sized for the WIDEST set so
+#           advancing never reallocates -- but "written for mid-statement
+#           change" is not "written for per-row change", and interleaving would
+#           call it per row.
+#
+#   Risk 3. What does a client see at an index the CURRENT segment does not
+#           have?  columnMem() returns columnNullValue() with SQLITE_RANGE, so
+#           the answer is NULL -- not a crash, and not stale data from the wider
+#           segment.  That silent failure mode is the reason interleaving must
+#           be opt-in, so it is pinned here as a test rather than left as a
+#           reading of the source.
+#
+# The shape gives three segments whose widths NARROW then WIDEN (4, 2, 3), so
+# the widest-set array is exercised in both directions.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procinter
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(post_id INTEGER, cid INTEGER);
+  CREATE TABLE tags(post_id INTEGER, tag TEXT, weight INTEGER);
+  INSERT INTO posts VALUES(1,'first'),(2,'second');
+  INSERT INTO comments VALUES(1,10),(1,11),(2,12);
+  INSERT INTO tags VALUES(1,'sql',5),(2,'zig',7);
+
+  CREATE PROCEDURE atlas()
+  RETURNS TABLE(id INTEGER, title TEXT,
+                comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id),
+                tags TABLE(post_id INTEGER, tag TEXT, weight INTEGER)
+                     KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid FROM comments;
+    SELECT post_id, tag, weight FROM tags;
+  END;
+} {}
+
+# Magnitudes stated before anything is compared, so a wrong number is visible
+# as wrong rather than merely unfamiliar.
+do_execsql_test 0.1 {
+  SELECT (SELECT count(*) FROM posts),
+         (SELECT count(*) FROM comments),
+         (SELECT count(*) FROM tags);
+} {2 3 2}
+
+# Walk every segment, recording arity and names as we go.  Returns a list of
+# {width name name ...} per segment.
+proc walk {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  set out {}
+  while {1} {
+    set seg [list [sqlite3_column_count $S]]
+    for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+      lappend seg [sqlite3_column_name $S $i]
+    }
+    lappend out $seg
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+  return $out
+}
+
+#--------------------------------------------------------------------
+# 1.x: risk 2 -- repeated ApplyProcSet across narrowing and widening
+#
+do_test 1.0 {
+  set r {}
+  foreach seg [walk {CALL atlas()}] { lappend r [lindex $seg 0] }
+  set r
+} {4 2 3}
+
+do_test 1.1 {
+  walk {CALL atlas()}
+} {{4 id title comments tags} {2 post_id cid} {3 post_id tag weight}}
+
+# The metadata must survive being applied repeatedly, not merely once: walking
+# the same statement shape twice must give byte-identical answers.  A stale
+# pointer or a reused buffer would show up here as drift on the second pass.
+do_test 1.2 {
+  expr {[walk {CALL atlas()}] eq [walk {CALL atlas()}]}
+} {1}
+
+#--------------------------------------------------------------------
+# 2.x: risk 3 -- what an out-of-range index yields on a NARROWER segment
+#
+# Segment 1 (comments) has 2 columns.  Index 3 is valid on segment 0 and not
+# here.  The value must be NULL/empty -- NOT the segment-0 value that occupied
+# that register, which is the failure a client would misread as data.
+#
+do_test 2.0 {
+  set S [sqlite3_prepare_v2 db {CALL atlas()} -1 TAIL]
+  # drain segment 0 (width 4), then advance to segment 1 (width 2)
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  sqlite3_step $S
+  # NB: every read must happen BEFORE finalize.  An earlier draft of this test
+  # asked for the width after finalizing and got 4 -- the PREVIOUS segment's
+  # width, read out of freed memory.  Not a crash, and a number plausible
+  # enough to look like a real answer.
+  set width [sqlite3_column_count $S]
+  set inrange [sqlite3_column_text $S 0]
+  set outrange [sqlite3_column_text $S 3]
+  sqlite3_finalize $S
+  list $width $inrange $outrange
+} {2 1 {}}
+
+# POSITIVE CONTROL for 2.0.  If sqlite3_column_text returned "" for every index
+# -- a broken accessor, or a statement that never produced a row -- then 2.0
+# would pass while proving nothing.  This asserts the same accessor DOES return
+# a non-empty value at an index the segment has, on the same row.
+do_test 2.1 {
+  set S [sqlite3_prepare_v2 db {CALL atlas()} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  sqlite3_step $S
+  set c0 [sqlite3_column_text $S 0]
+  set c1 [sqlite3_column_text $S 1]
+  sqlite3_finalize $S
+  list [expr {$c0 ne ""}] [expr {$c1 ne ""}]
+} {1 1}
+
+finish_test
