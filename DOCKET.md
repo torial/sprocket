@@ -768,6 +768,98 @@ occasional deep check.
 
 ---
 
+## 3h. Interleaved segments — the napkin
+
+**Napkin planning 2026-08-05, at Sean's request, after the coroutine probe
+cleared the SubProgram-frame risk.** Not a decision; the shape of one.
+
+Interleaving means emitting parent row P, then P's children, then the next
+parent — one client cursor, bounded-memory streaming, no `.collect()`. The
+engine can drive it (`multiSelectOrderBy` merges two coroutines today). The
+open question was never the engine. **It is what a row's shape changing per
+step does to the C API.**
+
+### The constraint that decides the design
+
+**Today an unaware client is safe by construction, and that is not an
+accident.** A client that never calls `sqlite3_proc_next_resultset()` sees
+segment 0 and stops — `sqlite3_step()` returns `SQLITE_DONE` at the set
+boundary (`bAtSetEnd`). So a legacy client consuming a nesting procedure gets a
+well-formed single result set of constant shape. Everything past segment 0 is
+reached only by asking.
+
+**Interleaving destroys that property unconditionally.** An unaware client would
+receive parent rows and child rows in one sequence with shifting arity, names
+and types.
+
+**Therefore interleaving must be an opt-in per CALL**, exactly as `WITH COUNTS`
+is. Unaware clients never request it and observe today's behavior byte for byte;
+aware clients (procgen-generated) request it and handle per-row dispatch. This
+is not a concession — it is the same pattern the feature already uses twice, and
+it means the risky path cannot be entered by accident.
+
+### How a row says which segment it is
+
+- **A new accessor reading `Vdbe.iProcSet`** — *preferred.* That field already
+  exists and already tracks the current set; interleaving updates it per row
+  instead of per boundary. No wire cost, no extra column, a pure read, and it
+  composes cleanly: `step()` → `current_segment()` → dispatch.
+- **A discriminator column** — works, and the `nHiddenCol` machinery already
+  carries trailing columns the client is not shown. But it costs a column on
+  every row to carry information the statement already holds. Redundant.
+- **Infer from arity** — rejected outright. Two segments of equal width are
+  indistinguishable, and the failure is silent (below).
+
+### The failure mode is silent, which raises the bar
+
+Measured, not assumed: `columnMem()` returns `columnNullValue()` and sets
+`SQLITE_RANGE` for an out-of-range index. So a client holding a stale, wider
+column count and reading a narrower row **gets NULLs — not a crash, not
+garbage.** It reads as "this row has no body," not "you misread the shape."
+
+That is the taxonomy's worst case: a wrong answer wearing a plausible one's
+clothes. It argues for opt-in plus an explicit discriminator, and against
+anything a client could get subtly wrong while appearing to work.
+
+### Rejected: the denormalized join
+
+Repeating parent columns on every child row is shape-stable, streams, and needs
+no API change at all — the classic answer, and worth stating why it is not ours:
+**two sibling nested tables cross-product.** Posts with comments *and* tags
+yields |comments| × |tags| rows per post. That explosion is the reason segments
+exist; adopting denormalization would re-introduce exactly what the feature was
+built to remove. It remains reasonable for the single-nested-table case, and is
+not worth a second code path.
+
+### Open, and honestly unresolved
+
+- **`WITH COUNTS` fights interleaving.** A count is a trailing hidden column on
+  the parent row, which under interleaving arrives *before* its children — so
+  the driver cannot know the count without first draining that parent's
+  children. Buffering one parent's children is bounded (max fan-out, not data
+  size) but real. Alternatives: emit the count as a trailing marker after the
+  children, or make the two modes exclusive. Undecided.
+- **`sqlite3_proc_next_resultset()` has no meaning** when there are no segment
+  boundaries. Probably `SQLITE_MISUSE` in interleaved mode; needs a decision,
+  not a default.
+- **The ordering requirement returns.** A merging design *does* need each level
+  ordered by its parent key — the ancestor-path constraint retracted earlier
+  today. The retraction is correct for the shipped protocol and does not
+  transfer to this one. Any depth-N work must not inherit the retraction blindly.
+
+### Measure before building
+
+- Two body statements compiled with `SRT_Coroutine` and merged — the probe
+  covered one coroutine, not two.
+- Whether `ApplyProcSet` is safe to call per row. It is *already* written for
+  mid-statement shape change (the name array is sized for the widest set so
+  advancing never reallocates), which is encouraging, but per-row was not its
+  design point.
+- What `sqlite3_column_name()` returns mid-interleave for a client that cached
+  the pointer. `SQLITE_TRANSIENT` copies suggest cached pointers go stale.
+
+---
+
 ## 3g. The depth-2 refusal does not prevent depth 2 — it makes it unguarded
 
 **Found 2026-08-05 by trying it against Mosaic, the first schema not designed
