@@ -888,6 +888,59 @@ independent oracle, and nothing here should be read as claiming it does.
   today. The retraction is correct for the shipped protocol and does not
   transfer to this one. Any depth-N work must not inherit the retraction blindly.
 
+### MEASURED 2026-08-06 — the two-coroutine merge already runs inside a proc
+
+**Risk 1 is retired, and it cost no code.** A compound `SELECT ... UNION ALL
+... ORDER BY` in a proc body routes through `multiSelectOrderBy`, which is
+precisely the two-coroutine key merge the interleaving driver needs.
+
+```
+1  Program           1  2  1  program   Call: merged
+2      InitCoroutine 1  17 3            SUBR: next-A
+14       Yield       1  0  0
+17     InitCoroutine 2  52 18           SUBR: next-B
+29       Yield       2  0  0
+32     Noop                              SUBR: out-A
+35   Noop                                SUBR: out-B
+```
+
+Two concurrent coroutines with independent program counters, both **inside the
+`Program` frame**, each with its own output subroutine.
+
+**The output is the positive control, not the opcodes.** With `t1 = 1,3,5` and
+`t2 = 2,4,6`, a real merge yields `1,2,3,4,5,6` and mere concatenation yields
+`1,3,5,2,4,6`. Observed: `1,2,3,4,5,6`. The opcodes prove the mechanism was
+compiled; the interleaved data proves it *ran and merged*.
+
+So every mechanical premise of interleaving is now demonstrated in this fork:
+resumable independent PCs inside a SubProgram frame, two of them concurrent, and
+a key-comparison merge driving alternating output from separately-ordered
+sources. What remains is wiring proc's own parent/child statements into that
+shape — not discovering whether the shape exists.
+
+*Instrument note: a naive `grep -c InitCoroutine` returned 3 against a program
+containing 2, because the probe's own `.print` banner contained the word. The
+opcode-only count is 2. Counting matches of a term that appears in your own
+labels inflates toward the answer you are hoping for.*
+
+### Risks 2 and 3 — reasoned from source, NOT measured
+
+Recorded at a lower confidence than the above, and labelled so no one later
+mistakes reading for evidence.
+
+- **Per-row `ApplyProcSet` looks safe by construction.** It assigns
+  `nResColumn`/`nHiddenCol` and copies names into an array *deliberately sized
+  for the widest set so advancing never reallocates*. No allocation on the path,
+  so calling it per row rather than per boundary should differ only in
+  frequency. Wanted: a measured run, since "written for mid-statement change"
+  was not "written for per-row change".
+- **Cached `sqlite3_column_name()` pointers go stale.** Names are copied with
+  `SQLITE_TRANSIENT` into statement-owned memory that `ApplyProcSet` overwrites.
+  This is already true at segment boundaries today; interleaving makes it true
+  per row, which stretches the documented contract (valid until the statement is
+  finalized or automatically reprepared). Mitigated by the mode being opt-in,
+  but generated clients must read names per row or cache per segment index.
+
 ### Measure before building
 
 - Two body statements compiled with `SRT_Coroutine` and merged — the probe
