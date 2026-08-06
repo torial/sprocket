@@ -194,15 +194,21 @@ do_test 3.4 {
 # ordinary segments would have the client dispatching per row on a stream that
 # is not interleaved -- a wrong answer wearing a working one's clothes.
 #
-do_catchsql_test 4.0 {
-  CALL atlas() WITH INTERLEAVED;
-} {1 {WITH INTERLEAVED is not implemented yet}}
+# (updated 2026-08-06: the rewrite landed, so 4.0 now pins that the option
+# DOES something -- 7 rows out of the atlas fixture; the full contract is 6.x)
+do_test 4.0 {
+  set S [sqlite3_prepare_v2 db {CALL atlas() WITH INTERLEAVED} -1 TAIL]
+  set n 0
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { incr n }
+  sqlite3_finalize $S
+  set n
+} {7}
 
 # Composition parses -- the options are a bitmask, not alternatives -- and the
 # refusal still fires.  This is what proves the comma list works at all.
 do_catchsql_test 4.1 {
   CALL atlas() WITH COUNTS, INTERLEAVED;
-} {1 {WITH INTERLEAVED is not implemented yet}}
+} {1 {WITH COUNTS may not be combined with INTERLEAVED yet}}
 
 # REGRESSION CONTROL: the pre-existing option must still work.  Without this,
 # 4.0 and 4.1 would pass just as well against a change that broke WITH COUNTS
@@ -235,5 +241,106 @@ do_execsql_test 5.2 {
   CREATE PROCEDURE flatshape() RETURNS TABLE(x INTEGER) BEGIN SELECT 1; END;
   PRAGMA proc_nested(flatshape);
 } {}
+
+#--------------------------------------------------------------------
+# 6.x: WITH INTERLEAVED -- the tree rewrite (DOCKET 3h)
+#
+# One discriminated result set: _segment, _key, payload columns padded to the
+# widest arm.  Child payloads are POSITIONAL (result column 2+j is child
+# column j); visible names come from arm 0.
+#
+do_execsql_test 6.0 {
+  CALL atlas() WITH INTERLEAVED;
+} {0 1 1 first {} 1 1 1 10 {} 1 1 1 11 {} 2 1 1 sql 5 0 2 2 second {} 1 2 2 12 {} 2 2 2 zig 7}
+
+# The column-name contract: arm 0 names the compound.
+do_test 6.1 {
+  set S [sqlite3_prepare_v2 db {CALL atlas() WITH INTERLEAVED} -1 TAIL]
+  sqlite3_step $S
+  set r {}
+  for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+    lappend r [sqlite3_column_name $S $i]
+  }
+  sqlite3_finalize $S
+  set r
+} {_segment _key id title _pad2}
+
+# Under interleaving there are no segment boundaries: current_segment is -1
+# (the row's segment is the _segment COLUMN), and next_resultset is misuse.
+do_test 6.2 {
+  set S [sqlite3_prepare_v2 db {CALL atlas() WITH INTERLEAVED} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_proc_current_segment $S] [sqlite3_proc_next_resultset $S]]
+  sqlite3_finalize $S
+  set r
+} {-1 SQLITE_MISUSE}
+
+# Refusals: compositions and shapes the rewrite cannot serve.
+do_catchsql_test 6.3 {
+  CALL atlas() WITH COUNTS, INTERLEAVED;
+} {1 {WITH COUNTS may not be combined with INTERLEAVED yet}}
+do_catchsql_test 6.4 {
+  CALL atlas() RETURNING id WITH INTERLEAVED;
+} {1 {RETURNING may not be combined with INTERLEAVED yet}}
+do_catchsql_test 6.5 {
+  CALL plain() WITH INTERLEAVED;
+} {1 {procedure plain declares no nested table to interleave}}
+do_execsql_test 6.6 {
+  CREATE TABLE t_a(x INTEGER); CREATE TABLE t_b(y INTEGER);
+  CREATE PROCEDURE dkey()
+  RETURNS TABLE(a INTEGER, b INTEGER,
+                xs TABLE(x INTEGER) KEY(x = a),
+                ys TABLE(y INTEGER) KEY(y = b))
+  BEGIN
+    SELECT 1, 2;
+    SELECT x FROM t_a;
+    SELECT y FROM t_b;
+  END;
+} {}
+do_catchsql_test 6.7 {
+  CALL dkey() WITH INTERLEAVED;
+} {1 {nested tables xs and ys of procedure dkey correlate on different parent columns (a vs b) and cannot share one interleaved order}}
+
+# The segmented protocol is untouched by all of the above: the same walk as
+# 1.1, byte-identical, is the regression control for this whole block.
+do_test 6.8 {
+  walk {CALL atlas()}
+} {{4 id title comments tags} {2 post_id cid} {3 post_id tag weight}}
+
+# An author ORDER BY inside a child survives the rewrite (the LIMIT -1
+# anti-flattening).  cmt2 orders comments by cid DESC; within post 1 the
+# comment rows must arrive 11 then 10.
+do_execsql_test 6.9 {
+  CREATE PROCEDURE atlas2()
+  RETURNS TABLE(id INTEGER, title TEXT,
+                comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid FROM comments ORDER BY cid DESC;
+  END;
+} {}
+do_execsql_test 6.10 {
+  CALL atlas2() WITH INTERLEAVED;
+} {0 1 1 first 1 1 1 11 1 1 1 10 0 2 2 second 1 2 2 12}
+
+# 6.11: the regression 6.10 exposed, pinned on the PLAIN path: a child with
+# an author ORDER BY must still produce a real fold.  Before the fix the
+# merge path returned without recording the fold recipe, and the flat client
+# read a phantom column -- observed as 0.0 where the JSON belongs.
+do_execsql_test 6.11 {
+  CALL atlas2();
+} {1 first [{"post_id":1,"cid":10},{"post_id":1,"cid":11}] 2 second [{"post_id":2,"cid":12}]}
+
+# 6.12: and the guards the early return used to skip: LIMIT on an
+# author-ORDERED child must be refused like LIMIT on any other child.
+do_catchsql_test 6.12 {
+  CREATE PROCEDURE badlim()
+  RETURNS TABLE(id INTEGER,
+                comments TABLE(post_id INTEGER, cid INTEGER) KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT post_id, cid FROM comments ORDER BY cid DESC LIMIT 5;
+  END;
+} {1 {the SELECT for nested table comments of procedure badlim may not use LIMIT: its meaning per parent row is undefined}}
 
 finish_test

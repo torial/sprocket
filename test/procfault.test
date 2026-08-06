@@ -93,4 +93,27 @@ do_faultsim_test 3 -faults oom* -prep {
   faultsim_test_result {0 {1 a 2 b 3 lonely}}
 }
 
+
+# CALL WITH INTERLEAVED -- procBuildInterleaved and procInterArm build a
+# compound Select from dup'd arms with renamed columns, injected LIMITs and
+# NULL pads; every constructor in that chain has a failure path that consumes
+# what it was given, and this is the only test that executes them failing.
+do_faultsim_test 4 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql {
+    CREATE PROCEDURE pin()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER)
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid FROM comments;
+    END;
+  }
+} -body {
+  execsql { CALL pin() WITH INTERLEAVED }
+} -test {
+  faultsim_test_result {0 {0 1 1 a 1 1 1 1 1 1 1 2 0 2 2 b 1 2 2 3 0 3 3 lonely}}
+}
+
 finish_test
