@@ -951,6 +951,24 @@ int sqlite3_proc_child_count(sqlite3_stmt *pStmt, int N){
       (sqlite3_value*)&p->pResultRow[p->nResColumn - p->nHiddenCol + N]);
 }
 
+/*
+** The zero-based segment the statement is currently positioned on, or -1 when
+** the statement is not a CALL carrying declared shapes -- see
+** sqlite3_proc_current_segment() in sqlite.h.in.
+**
+** A plain read of state the Vdbe already maintains, so it follows
+** sqlite3_proc_child_count() in not taking the mutex.  iProcSet is written
+** only by sqlite3VdbeApplyProcSet().
+*/
+int sqlite3_proc_current_segment(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( p==0 ) return -1;
+#endif
+  if( p==0 || p->aProcSet==0 ) return -1;
+  return p->iProcSet;
+}
+
 int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){
   Vdbe *p = (Vdbe*)pStmt;
   sqlite3 *db;

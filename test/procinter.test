@@ -130,4 +130,61 @@ do_test 2.1 {
   list [expr {$c0 ne ""}] [expr {$c1 ne ""}]
 } {1 1}
 
+#--------------------------------------------------------------------
+# 3.x: sqlite3_proc_current_segment() -- the discriminator (DOCKET 3h)
+#
+# Inferring the segment from sqlite3_column_count() does not work and fails
+# SILENTLY: two segments may be equally wide, and 2.0 above shows that reading
+# a column the segment lacks yields NULL rather than an error.  This accessor
+# is the only reliable answer, and it is correct in the segmented protocol
+# today -- it does not wait on the merge driver.
+#
+do_test 3.0 {
+  set S [sqlite3_prepare_v2 db {CALL atlas()} -1 TAIL]
+  set r {}
+  while {1} {
+    lappend r [sqlite3_proc_current_segment $S]
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+  set r
+} {0 1 2}
+
+# It must keep reporting the segment while rows are being consumed, not only
+# at a boundary -- that is the property a per-row consumer depends on.
+do_test 3.1 {
+  set S [sqlite3_prepare_v2 db {CALL atlas()} -1 TAIL]
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend r [sqlite3_proc_current_segment $S]
+  }
+  sqlite3_finalize $S
+  set r
+} {0 0}
+
+# NEGATIVE CONTROL.  Without this, 3.0 passes against a function that returns
+# a counter, an accessor wired to the wrong field, or one that never fails.
+# A plain SELECT is not a CALL and must report -1.
+do_test 3.2 {
+  set S [sqlite3_prepare_v2 db {SELECT 1, 2} -1 TAIL]
+  sqlite3_step $S
+  set r [sqlite3_proc_current_segment $S]
+  sqlite3_finalize $S
+  set r
+} {-1}
+
+# A CALL of a procedure that declares NO shapes is also not segmented, so it
+# must report -1 too -- "is a CALL" is not sufficient.
+do_execsql_test 3.3 {
+  CREATE PROCEDURE plain() BEGIN SELECT id FROM posts; END;
+} {}
+do_test 3.4 {
+  set S [sqlite3_prepare_v2 db {CALL plain()} -1 TAIL]
+  sqlite3_step $S
+  set r [sqlite3_proc_current_segment $S]
+  sqlite3_finalize $S
+  set r
+} {-1}
+
 finish_test

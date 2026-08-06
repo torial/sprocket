@@ -5663,6 +5663,29 @@ static int SQLITE_TCLAPI test_norm_sql(
 */
 #ifndef SQLITE_OMIT_PROCEDURE
 /*
+** Usage: sqlite3_proc_current_segment STMT
+**
+** Zero-based index of the segment the statement is positioned on, or -1 if
+** the statement is not a CALL carrying declared shapes.
+*/
+static int SQLITE_TCLAPI test_proc_current_segment(
+  void * clientData,
+  Tcl_Interp *interp,
+  int objc,
+  Tcl_Obj *CONST objv[]
+){
+  sqlite3_stmt *pStmt;
+
+  if( objc!=2 ){
+    Tcl_WrongNumArgs(interp, 1, objv, "STMT");
+    return TCL_ERROR;
+  }
+  if( getStmtPointer(interp, Tcl_GetString(objv[1]), &pStmt) ) return TCL_ERROR;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_proc_current_segment(pStmt)));
+  return TCL_OK;
+}
+
+/*
 ** Usage: sqlite3_proc_child_count STMT N
 **
 ** Children counted for the current parent row, for the N-th nested table.
@@ -9257,6 +9280,7 @@ int Sqlitetest1_Init(Tcl_Interp *interp){
 #ifndef SQLITE_OMIT_PROCEDURE
      { "sqlite3_proc_next_resultset",   test_proc_next_resultset ,0 },
      { "sqlite3_proc_child_count",      test_proc_child_count ,0 },
+     { "sqlite3_proc_current_segment",  test_proc_current_segment ,0 },
 #endif
      { "sqlite3_data_count",            test_data_count    ,0 },
      { "sqlite3_column_type",           test_column_type   ,0 },

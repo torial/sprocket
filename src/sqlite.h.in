@@ -5637,6 +5637,30 @@ int sqlite3_proc_next_resultset(sqlite3_stmt*);
 int sqlite3_proc_child_count(sqlite3_stmt*, int);
 
 /*
+** CAPI3REF: Which Segment The Current Row Belongs To
+** METHOD: sqlite3_stmt
+**
+** ^This interface returns the zero-based index of the result segment the
+** statement is currently positioned on, or -1 if the statement is not a CALL
+** of a procedure that declares its result shapes.
+**
+** A procedure declaring a shape with K nested tables streams 1+K segments: the
+** parent, then one per nested table in declaration order.  ^In the segmented
+** protocol this value changes only when [sqlite3_proc_next_resultset()]
+** advances, so a client that drives the transitions already knows it; the
+** routine exists so that a client which does NOT drive them -- one being handed
+** rows by a layer above it -- can still say which shape a row has.
+**
+** The alternative, inferring the segment from [sqlite3_column_count()], does
+** not work and fails silently: two segments may declare the same number of
+** columns, and reading a column the current segment does not have yields NULL
+** rather than an error.  A wrong answer is therefore indistinguishable from a
+** row with NULLs in it.  ^This routine is the only reliable way to identify
+** the shape of the row in hand.
+*/
+int sqlite3_proc_current_segment(sqlite3_stmt*);
+
+/*
 ** CAPI3REF: Destroy A Prepared Statement Object
 ** DESTRUCTOR: sqlite3_stmt
 **
