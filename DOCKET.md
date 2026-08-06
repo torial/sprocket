@@ -831,17 +831,58 @@ exist; adopting denormalization would re-introduce exactly what the feature was
 built to remove. It remains reasonable for the single-nested-table case, and is
 not worth a second code path.
 
+### RESOLVED 2026-08-05 — `WITH COUNTS` does not fight interleaving
+
+**Settled before proceeding, at Sean's direction: we are past the point where
+iterating on a wire format is cheap, so this gets decided rather than tried.**
+
+**The napkin invented a problem that does not exist.** It assumed the count
+must be derived from the child stream, so that emitting the parent first would
+force the driver to drain that parent's children into memory.
+
+`procAddCountColumn` does nothing of the kind. It duplicates the child SELECT,
+strips its ORDER BY, replaces the projection with `count(*)`, and ANDs in
+`child_key = sqlite_proc_parent.parent_key` — **a correlated scalar subquery on
+the parent's own wrapped SELECT.** The count is computed by the parent's query
+and never touches the child coroutine.
+
+**Proven by an existing passing test, not by reading the codegen.** `proc4c`'s
+`counts` helper steps a `WITH COUNTS` call through **segment 0 only** and reads
+`sqlite3_proc_child_count()` on each parent row, never calling
+`sqlite3_proc_next_resultset()`. 13 tests, 0 errors. If the count depended on
+the child stream those numbers could not be right, so the independence is
+already pinned by the suite that shipped.
+
+**So under interleaving the count is strictly better than it is today.** It
+arrives *before* the children rather than alongside them, which means an aware
+client can pre-size its collection *and* verify at the group boundary as the
+children end. No buffering, no trailing marker, no mode exclusion, and no
+change to `procAddCountColumn`.
+
+**Two corrections to the napkin, recorded rather than quietly dropped:**
+
+- The buffering it proposed is unnecessary.
+- It called that buffering "bounded (max fan-out, not data size)", which was
+  misleading even on its own terms. For skewed data the largest fan-out
+  approaches the dataset — one hot parent with a million children *is* the
+  whole table — so "bounded by max fan-out" is not a memory guarantee. Had the
+  premise been right, the fix would have been worse than advertised.
+
+**The honest limit is unchanged and inherited from POC 3.** The count and the
+rows still derive from the *same predicate*, so they cannot disagree about what
+the predicate means. This catches rows lost in transit, not a wrong correlation.
+Interleaving lengthens "transit" slightly — two independent evaluations within
+one snapshot rather than one stream — but does not turn the check into an
+independent oracle, and nothing here should be read as claiming it does.
+
 ### Open, and honestly unresolved
 
-- **`WITH COUNTS` fights interleaving.** A count is a trailing hidden column on
-  the parent row, which under interleaving arrives *before* its children — so
-  the driver cannot know the count without first draining that parent's
-  children. Buffering one parent's children is bounded (max fan-out, not data
-  size) but real. Alternatives: emit the count as a trailing marker after the
-  children, or make the two modes exclusive. Undecided.
 - **`sqlite3_proc_next_resultset()` has no meaning** when there are no segment
-  boundaries. Probably `SQLITE_MISUSE` in interleaved mode; needs a decision,
-  not a default.
+  boundaries. **DECIDED: `SQLITE_MISUSE` in interleaved mode.** Returning
+  `SQLITE_DONE` would be indistinguishable from "no further set", which is the
+  answer a correct client gets today — so it would let a client that wrongly
+  believes it is in segmented mode run to completion silently. Misuse is the
+  only return that cannot be mistaken for success.
 - **The ordering requirement returns.** A merging design *does* need each level
   ordered by its parent key — the ancestor-path constraint retracted earlier
   today. The retraction is correct for the shipped protocol and does not
