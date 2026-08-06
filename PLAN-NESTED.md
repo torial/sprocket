@@ -987,6 +987,52 @@ the currency; `.collect()` is the consumer's explicit choice.** Lazy loading is
 unrepresentable there by design (G5), which is why the distinction is load-bearing
 rather than stylistic.
 
+### Phase 7 — REVISED AGAIN 2026-08-05: the streams cannot be zipped
+
+**Reading the wire protocol rather than the consumer's architecture document
+changes the deliverable a second time.** The stitcher zips N streams — that is,
+it pulls from them *concurrently*, advancing whichever is behind. **Our segments
+cannot be consumed that way**, and the constraint is explicit in the code:
+
+```c
+}else if( p->bAtSetEnd==0 ){
+  /* Either the statement has not reached the end of the current set, or
+  ** it has finished entirely.  Both are "no further set available". */
+  rc = SQLITE_DONE;
+```
+*(`sqlite3_proc_next_resultset`, `src/vdbeapi.c`)*
+
+**Segment k+1 is unreachable until segment k is exhausted.** One statement, one
+cursor, strictly sequential. A stitcher that holds a parent stream open while
+pulling children deadlocks — it is waiting for rows that cannot arrive until it
+stops waiting.
+
+**So "streams are the currency" does not survive contact with the protocol.**
+The earlier refinement was derived from Zebra's ORM document; the document
+describes what the *stitcher* wants, and this is a fact about what the *server*
+can deliver. The wire protocol wins.
+
+**Corrected deliverable, third time.** The generated function collects each
+segment in wire order and returns a struct of lists — one per segment — plus the
+correlation keys needed to attach them. The caller then stitches in memory,
+where random access is free.
+
+This is worth stating plainly rather than burying: **`.collect()` stops being
+the caller's explicit choice here, because the protocol forecloses it.** That is
+a genuine deviation from Zebra's G5 doctrine (lazy loading unrepresentable, lists
+always explicit), and the honest framing is not "we chose lists" but "a
+sequential multi-set cursor admits no other shape." Three ways out, none free:
+
+- **Buffer server-side per parent** — the fold path, which already exists. It is
+  precisely the trade: one segment, random access, JSON construction cost.
+- **One statement per segment** — restores concurrency and laziness, at N round
+  trips and a lost transactional snapshot. This is the N+1 the feature exists to
+  kill.
+- **Interleave segments on the wire** — parent row, then its children, then the
+  next parent. Would make true streaming possible and is a real protocol
+  redesign, not a phase-7 item. **Worth its own docket entry** — it is the only
+  option that gets both laziness and one round trip.
+
 **What `WITH COUNTS` buys them, concretely.** §6 gives S4 a proc-author contract
 checked by "a cheap key-monotonicity assertion in the stitcher" on debug builds.
 Monotonicity catches a *disordered* stream. It cannot catch a *truncated* one —
