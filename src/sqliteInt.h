@@ -4303,6 +4303,7 @@ struct ProcFold {
   int iDeclPos;             /* 0-based position within the shape */
   int iKeyCol;              /* 1-based key position among the child's columns */
   u8 bNeedsSort;            /* True if the imposed ordering costs a sort */
+  u8 bHandRolled;           /* Child SELECT nests a further level by hand */
 };
 
 struct Proc {

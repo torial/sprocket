@@ -826,7 +826,23 @@ because it is four lines and it works.
 - **Refuse harder.** Reject hand-rolled aggregates in a child `SELECT`. Wrong:
   it forbids legitimate aggregation and would not be enforceable anyway.
 
-**Recommendation: the advisory.** The value of the declared form is that it
+**IMPLEMENTED 2026-08-05 — the advisory.** A `json_group_array` anywhere in a
+child `SELECT`, including inside a correlated subquery, is detected by an
+expression walk at CREATE and logged at prepare on the same channel as the R7
+index advisory:
+
+```
+SQLITE_WARNING: procedure handrolled: nested table kids builds a further level
+by hand; that inner correlation is not checked, not ordered by the engine, and
+not covered by WITH COUNTS
+```
+
+Both directions pinned in `proc6adv` 4.1/4.2 — it fires for a hand-rolled level
+and stays silent for an ordinary nested table, without which it would be a
+function that always logs rather than a detector. Never an error; 4.3 asserts
+the call still returns its rows.
+
+**Original recommendation, for the record:** The value of the declared form is that it
 cannot be got wrong; the value of the hand-rolled form is that it exists. What
 the author is currently denied is *knowing which one they are in*.
 

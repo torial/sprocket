@@ -661,6 +661,44 @@ static int procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
 }
 
 /*
+** DOCKET 3g -- detect a nested level the AUTHOR built by hand.
+**
+** Depth >= 2 is refused at the grammar, but that refusal relocates rather than
+** prevents: an author reaches it in four lines by writing the inner level with
+** the same json_group_array the engine uses for the outer one.  One CALL,
+** correct answer, and every guarantee silently gone -- the inner correlation is
+** unchecked, unordered by the engine, invisible to conformance, uncounted by
+** WITH COUNTS, and a plain TEXT column to procgen.
+**
+** The declared form's value is that it cannot be got wrong.  The hand-rolled
+** form's value is that it exists.  What an author is otherwise denied is
+** knowing which one they are in, so this says so -- advisory, never an error,
+** because the construct is legitimate and sometimes exactly right.
+*/
+static int procHandRolledExpr(Walker *pWalker, Expr *pExpr){
+  if( pExpr->op==TK_FUNCTION
+   && !ExprHasProperty(pExpr, EP_IntValue)
+   && pExpr->u.zToken!=0
+   && sqlite3StrICmp(pExpr->u.zToken, "json_group_array")==0
+  ){
+    pWalker->eCode = 1;
+    return WRC_Abort;
+  }
+  return WRC_Continue;
+}
+static int procDetectHandRolled(Parse *pParse, Select *pSel){
+  Walker w;
+  if( pSel==0 ) return 0;
+  memset(&w, 0, sizeof(w));
+  w.pParse = pParse;
+  w.xExprCallback = procHandRolledExpr;
+  w.xSelectCallback = sqlite3SelectWalkNoop;   /* descend into subqueries */
+  w.eCode = 0;
+  sqlite3WalkSelect(&w, pSel);
+  return w.eCode;
+}
+
+/*
 ** Record -- rather than apply -- one nested table's fold recipe.  See the
 ** ProcFold comment in sqliteInt.h for why this is deferred to CALL.
 */
@@ -679,6 +717,8 @@ static void procRecordFold(ProcConf *p, TriggerStep *pChild, ProcEmit *pE){
   pF->zKeyParent = pE->zKeyParent;
   pF->iDeclPos = pE->iDeclPos;
   pF->iKeyCol = pE->iKeyCol;
+  pF->bHandRolled = (u8)procDetectHandRolled(p->pParse,
+                          pChild ? pChild->pSelect : 0);
   for(pp=&p->pProc->pFolds; *pp; pp=&(*pp)->pNext){}
   *pp = pF;
 }
@@ -2313,6 +2353,13 @@ static void procAdviseIndexes(Proc *pProc){
       "procedure %s: the declared correlation %s.%s requires an ordering that "
       "no index supplies", pProc->zName, pF->zName,
       pF->pNested->a[pF->iKeyCol-1].zName);
+  }
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    if( pF->bHandRolled==0 ) continue;
+    sqlite3_log(SQLITE_WARNING,
+      "procedure %s: nested table %s builds a further level by hand; that "
+      "inner correlation is not checked, not ordered by the engine, and not "
+      "covered by WITH COUNTS", pProc->zName, pF->zName);
   }
 }
 

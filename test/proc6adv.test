@@ -134,6 +134,63 @@ do_test 3.1 {
   set hit
 } {1}
 
+#--------------------------------------------------------------------
+# 4.x: DOCKET 3g -- a hand-rolled inner nesting level is advised, not refused
+#
+# Depth >= 2 is refused at the grammar, but an author reaches it anyway by
+# writing the inner level with json_group_array themselves.  That works, and
+# silently forfeits the correlation check, the imposed ordering, conformance and
+# WITH COUNTS.  The engine cannot stop it and should not -- the construct is
+# legitimate -- but the author is entitled to know which side of the guarantee
+# they are on.
+#
+do_execsql_test 4.0 {
+  CREATE TABLE addr(aid INTEGER PRIMARY KEY, cid INTEGER, tradition TEXT);
+  INSERT INTO addr VALUES(1,1,'LXX'),(2,1,'MT'),(3,2,'Byz');
+  CREATE PROCEDURE handrolled()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(post_id INTEGER, cid INTEGER, addrs TEXT)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT c.post_id, c.cid,
+           (SELECT json_group_array(json_object('t', a.tradition))
+              FROM addr a WHERE a.cid = c.cid)
+      FROM comments c;
+  END;
+} {}
+
+do_test 4.1 {
+  db close
+  sqlite3 db test.db
+  set ::log [list]
+  execsql {CALL handrolled()}
+  set hit 0
+  foreach {code msg} $::log {
+    if {[string match {*handrolled*kids*by hand*} $msg]} { set hit 1 }
+  }
+  set hit
+} {1}
+
+# CONTROL: a procedure that does NOT nest by hand must not draw the advisory,
+# or it is a function that always logs rather than a detector.
+do_test 4.2 {
+  db close
+  sqlite3 db test.db
+  set ::log [list]
+  execsql {CALL pwc()}
+  set hit 0
+  foreach {code msg} $::log {
+    if {[string match {*by hand*} $msg]} { set hit 1 }
+  }
+  set hit
+} {0}
+
+# And it is ADVISORY: the call still returns its rows.
+do_test 4.3 {
+  llength [execsql {CALL handrolled()}]
+} {4}   ;# 2 parents x 2 columns
+
 db close
 sqlite3_shutdown
 test_sqlite3_log
