@@ -6,6 +6,14 @@ long and mostly historical.*
 
 ## NEXT ACTION
 
+**Build the merge driver** — now the ONLY remaining engine piece. The ORM
+milestone was reached 2026-08-06: `procgen --lang zebra` emits typed nested
+structs (child structs + `List(Child)` fields + a stitch keyed by the new
+`PRAGMA proc_nested`) over the `@segments` discriminated stream from the
+zebra-sprocket preamble seam, verified end-to-end against a live database.
+The client shape is the interleaved endstate already, so the merge driver
+changes only the preamble walk, not clients.
+
 **Build the merge driver.** Compile a shape's parent and child body statements
 with `SRT_Coroutine` destinations and drive them from a key merge, then flip
 `WITH INTERLEAVED` from refusal to behavior. Everything it depends on is landed,
@@ -14,6 +22,21 @@ measured and green — this is the only remaining piece.
 Entry points: `procBuildEmits()` and `procLowerChild()` in `src/proc.c`. The
 model to copy is `multiSelectOrderBy()` in `src/select.c` (~line 3580), which
 already merges two coroutines by comparing sort keys.
+
+## Session hygiene (added 2026-08-06 after the model-switch forensics)
+
+A Fable-5 safeguard silently switched a prior session to Opus 5 for six days
+(2026-07-31 → 08-06); the flag reads message-plus-context and the trigger was a
+mundane build command inside a week of accumulated fault-injection vocabulary.
+Two rules for this work:
+
+1. **Keep test prose at upstream-SQLite register** — "fault injection",
+   "negative control", "misuse refusal", "robustness". Avoid
+   "red-team/hostile/attack" density in prose and commit messages. (Do not
+   rename existing files like `prochostile.test` — churn for no gain.)
+2. **The switch prints a visible banner and does NOT self-revert.** If you see
+   "safeguards flagged this message... Switched to", tell Sean and expect a
+   `/model` back. Check `/model` after any suspected trip.
 
 ## The build incantation — get this right first
 
