@@ -846,6 +846,19 @@ the call still returns its rows.
 cannot be got wrong; the value of the hand-rolled form is that it exists. What
 the author is currently denied is *knowing which one they are in*.
 
+**It was hit a second time the same afternoon, by a route this entry did not
+anticipate.** Above, depth 2 was found in a schema *designed* that way. Hours
+later the same wall was hit by *schema evolution*: widening one scalar field
+into a set turned `witness → claims` into `witness → claims → confidences`
+without anyone intending a nested shape at all. That episode is written up as a
+narrative in `C:\Projects\mosaic\sprocket\CASE-STUDY-schema-change.md`.
+
+The lesson worth carrying back here: **the population that hits this limit is
+larger than "schemas with a genuinely nested model."** It includes every schema
+that later widens a scalar into a collection — a routine, well-motivated change
+whose depth cost is invisible at decision time. That argues the first option
+above (support depth ≥ 2 properly) deserves more weight than it was given.
+
 ---
 
 ## 3f. The segment total — the one check per-parent counts cannot make
