@@ -9,8 +9,9 @@ long and mostly historical.*
 **DONE 2026-08-06 — WITH INTERLEAVED shipped** as the tree rewrite (see DOCKET
 3h "IMPLEMENTED"): one discriminated result set, engine-merged, procinter 6.x +
 procfault 1442 green. Remaining: the COUNTS/RETURNING compositions (refused,
-not built) and the zebra-sprocket seam upgrade (its `_fetch_segments` can
-become one `WITH INTERLEAVED` query with no client change).
+not built). The seam upgrade is DONE (zebra-sprocket transport v2,
+2026-08-06): the generated client passed UNCHANGED over the engine's merge,
+with the v1 walk kept as fallback for shapes the engine refuses.
 
 *(Historical next-action below, kept for the reasoning pointers.)*
 
