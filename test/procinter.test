@@ -220,4 +220,20 @@ do_catchsql_test 4.3 {
   CALL atlas() WITH SPRINKLES;
 } {1 {expected COUNTS or INTERLEAVED after WITH, got SPRINKLES}}
 
+#--------------------------------------------------------------------
+# 5.x: PRAGMA proc_nested -- the correlation metadata a generator stitches by
+#
+do_execsql_test 5.0 {
+  PRAGMA proc_nested(atlas);
+} {2 comments post_id id 3 tags post_id id}
+
+# NEGATIVE control: a shapeless proc and a proc with no nesting emit nothing.
+do_execsql_test 5.1 {
+  PRAGMA proc_nested(plain);
+} {}
+do_execsql_test 5.2 {
+  CREATE PROCEDURE flatshape() RETURNS TABLE(x INTEGER) BEGIN SELECT 1; END;
+  PRAGMA proc_nested(flatshape);
+} {}
+
 finish_test

@@ -131,10 +131,9 @@ static const char *bindFn(CType t){
 }
 
 /*
-** Zebra type names.  A NESTED table arrives as JSON text in the folded column,
-** so it maps to str -- the segment path needs sqlite3_proc_next_resultset(),
-** which Zebra cannot reach until its extern question is settled
-** (zebra-language BUG-258: `extern` is in the grammar and the parser rejects it).
+** Zebra type names.  bNested survives for the C emitter's fold column; the
+** Zebra emitter no longer passes it -- a nested table is emitted as
+** List(ChildStruct) stitched from the @segments stream, not as JSON text.
 */
 static const char *zebraTypeName(CType t, int bNested){
   if( bNested ) return "str";
@@ -174,6 +173,17 @@ typedef struct Col {
   char *zName;
   char *zDecl;
 } Col;
+
+/* Find a column by set and name; NULL if absent. */
+static Col *colFind(Col *aCol, int nCol, int iSet, const char *zName){
+  int i;
+  for(i=0; i<nCol; i++){
+    if( aCol[i].iSet==iSet && sqlite3_stricmp(aCol[i].zName, zName)==0 ){
+      return &aCol[i];
+    }
+  }
+  return 0;
+}
 
 int main(int argc, char **argv){
   sqlite3 *db = 0;
@@ -267,30 +277,69 @@ int main(int argc, char **argv){
     sqlite3_finalize(pInfo);
 
     /* ---------------------------------------------------------------------
-    ** ZEBRA EMITTER.  Produces exactly the shape verified by hand in
-    ** zebra-sprocket/target_pwc.zbr before this was written -- a struct per
-    ** result set 1 and a function returning List(T).
+    ** ZEBRA EMITTER.  Typed nested structs over the @segments stream.
     **
-    ** Only set 1 is emitted.  A nested table's own rows live in the segment
-    ** that follows, reachable only through sqlite3_proc_next_resultset(),
-    ** which Zebra has no way to call (zebra-language BUG-258: `extern` is in
-    ** the grammar and rejected by the parser).  So the folded JSON column is
-    ** what a Zebra client can actually consume today, and generating an
-    ** accessor for something uncallable would be worse than generating
-    ** nothing.
+    ** A nested table becomes List(ChildStruct), stitched client-side: the
+    ** query runs once with the "@segments " prefix (the zebra-sprocket
+    ** preamble seam), every row carries a leading _segment discriminator,
+    ** and the KEY correlation -- which no generator can guess -- comes from
+    ** PRAGMA proc_nested.  proc_nested's resultset_index is 1-based (set 0 is
+    ** the parameters) while _segment is 0-based, so the emitted comparison is
+    ** resultset_index-1.
+    **
+    ** Only shape 1 is emitted, as before.  A procedure with no nested tables
+    ** emits a plain CALL with no marker, byte-identical in behavior to the
+    ** previous generator.
     ** --------------------------------------------------------------------- */
     if( strcmp(zLang, "zebra")==0 ){
+      typedef struct Nest { int iSet; char *zCol; char *zKChild; char *zKParent; } Nest;
+      Nest aNest[32];
+      int nNest = 0, iN;
       int nEmitted = 0;
+      sqlite3_stmt *pNest = 0;
+      if( sqlite3_prepare_v2(db,
+            "SELECT resultset_index, \"column\", key_child, key_parent"
+            "  FROM pragma_proc_nested(?1) ORDER BY resultset_index",
+            -1, &pNest, 0)!=SQLITE_OK ){
+        die("prepare proc_nested", db);
+      }
+      sqlite3_bind_text(pNest, 1, zProc, -1, SQLITE_TRANSIENT);
+      while( sqlite3_step(pNest)==SQLITE_ROW && nNest<32 ){
+        aNest[nNest].iSet     = sqlite3_column_int(pNest, 0);
+        aNest[nNest].zCol     = sqlite3_mprintf("%s", sqlite3_column_text(pNest,1));
+        aNest[nNest].zKChild  = sqlite3_mprintf("%s", sqlite3_column_text(pNest,2));
+        aNest[nNest].zKParent = sqlite3_mprintf("%s", sqlite3_column_text(pNest,3));
+        nNest++;
+      }
+      sqlite3_finalize(pNest);
+
       fprintf(out, "# ---- procedure %s ----\n", zProc);
+
+      /* Child structs first: Zebra reads top-down. */
+      for(iN=0; iN<nNest; iN++){
+        fputs("struct ", out); emitIdentCap(zProc); emitIdentCap(aNest[iN].zCol);
+        fputc('\n', out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=aNest[iN].iSet ) continue;
+          fputs("    var ", out); emitIdent(aCol[i].zName);
+          fprintf(out, ": %s\n", zebraTypeName(typeOf(aCol[i].zDecl), 0));
+        }
+        fputc('\n', out);
+      }
+
+      /* Parent struct: scalars as themselves, nested as List(ChildStruct). */
       fputs("struct ", out); emitIdentCap(zProc); fputs("Row\n", out);
       for(i=0; i<nCol; i++){
         int bNested;
         if( aCol[i].iSet!=1 ) continue;
         bNested = (aCol[i].zDecl==0 || aCol[i].zDecl[0]==0);
         fputs("    var ", out); emitIdent(aCol[i].zName);
-        fprintf(out, ": %s", zebraTypeName(typeOf(aCol[i].zDecl), bNested));
-        if( bNested ) fputs("    # nested table, folded to JSON", out);
-        fputc('\n', out);
+        if( bNested ){
+          fputs(": List(", out); emitIdentCap(zProc); emitIdentCap(aCol[i].zName);
+          fputs(")\n", out);
+        }else{
+          fprintf(out, ": %s\n", zebraTypeName(typeOf(aCol[i].zDecl), 0));
+        }
         nEmitted++;
       }
       if( nEmitted==0 ){
@@ -307,9 +356,46 @@ int main(int argc, char **argv){
       fputs("): List(", out); emitIdentCap(zProc); fputs("Row)\n", out);
       fputs("    var out: List(", out); emitIdentCap(zProc);
       fputs("Row) = []\n", out);
-      fprintf(out, "    var rows = d.query(\"CALL %s(", zProc);
+
+      /* zebra-language BUG-260: a parameter whose only use is inside a bind
+      ** list is treated as unused -- the compiler emits a discard AND the
+      ** real use, and Zig rejects the pointless discard.  Each initializer
+      ** below is a visible use of one parameter; the local itself is
+      ** genuinely unused, so its own discard is legitimate.  NaN-safe and
+      ** control-flow-free, unlike an `if p != p` guard.  Delete this block
+      ** from the emitter when BUG-260 is fixed. */
+      if( nParam>0 ){
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=0 ) continue;
+          fputs("    var b260_", out); emitIdent(aCol[i].zName);
+          fprintf(out, ": %s = ", zebraTypeName(typeOf(aCol[i].zDecl), 0));
+          emitIdent(aCol[i].zName);
+          fprintf(out, "   # visible use; zebra-language BUG-260\n");
+        }
+      }
+
+      /* The query.  Nested procs opt into the @segments walk and project the
+      ** fold columns away with RETURNING -- the typed client rebuilds the
+      ** nesting itself, so paying the server-side JSON construction would be
+      ** pure waste. */
+      if( nNest ){
+        fprintf(out, "    var rows = d.query(\"@segments CALL %s(", zProc);
+      }else{
+        fprintf(out, "    var rows = d.query(\"CALL %s(", zProc);
+      }
       for(i=0; i<nParam; i++) fprintf(out, "%s?", i?",":"");
-      fputs(")\"", out);
+      fputs(")", out);
+      if( nNest ){
+        int nSeen = 0;
+        fputs(" RETURNING ", out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=1 ) continue;
+          if( aCol[i].zDecl==0 || aCol[i].zDecl[0]==0 ) continue;
+          if( nSeen++ ) fputs(", ", out);
+          emitIdent(aCol[i].zName);
+        }
+      }
+      fputs("\"", out);
       if( nParam>0 ){
         int nSeen = 0;
         fputs(", [", out);
@@ -321,22 +407,71 @@ int main(int argc, char **argv){
         fputc(']', out);
       }
       fputs(")\n", out);
-      fputs("    for row in rows\n        out.add(", out);
-      emitIdentCap(zProc); fputs("Row(", out);
-      {
-        int nSeen = 0;
-        for(i=0; i<nCol; i++){
-          int bNested;
-          if( aCol[i].iSet!=1 ) continue;
-          bNested = (aCol[i].zDecl==0 || aCol[i].zDecl[0]==0);
-          if( nSeen++ ) fputs(", ", out);
-          emitIdent(aCol[i].zName); fputs(": row.", out);
-          fputs(zebraAccessor(typeOf(aCol[i].zDecl), bNested), out);
-          fprintf(out, "(\"%s\")", aCol[i].zName);
-        }
-      }
-      fputs("))\n    return out\n\n", out);
 
+      fputs("    for row in rows\n", out);
+      if( nNest ){
+        fputs("        if row.asInt(\"_segment\") == 0\n", out);
+      }
+      {
+        const char *zInd = nNest ? "            " : "        ";
+        /* Per nested table: collect this parent row's children by KEY. */
+        for(iN=0; iN<nNest; iN++){
+          Col *pKC = colFind(aCol, nCol, aNest[iN].iSet, aNest[iN].zKChild);
+          Col *pKP = colFind(aCol, nCol, 1, aNest[iN].zKParent);
+          const char *zAccC = pKC ? zebraAccessor(typeOf(pKC->zDecl), 0) : "asInt";
+          const char *zAccP = pKP ? zebraAccessor(typeOf(pKP->zDecl), 0) : "asInt";
+          fprintf(out, "%svar v_", zInd); emitIdent(aNest[iN].zCol);
+          fputs(": List(", out); emitIdentCap(zProc); emitIdentCap(aNest[iN].zCol);
+          fputs(") = []\n", out);
+          fprintf(out, "%sfor c%d in rows\n", zInd, iN);
+          fprintf(out, "%s    if c%d.asInt(\"_segment\") == %d\n",
+                  zInd, iN, aNest[iN].iSet-1);
+          fprintf(out, "%s        if c%d.%s(\"%s\") == row.%s(\"%s\")\n",
+                  zInd, iN, zAccC, aNest[iN].zKChild, zAccP, aNest[iN].zKParent);
+          fprintf(out, "%s            v_", zInd); emitIdent(aNest[iN].zCol);
+          fputs(".add(", out); emitIdentCap(zProc); emitIdentCap(aNest[iN].zCol);
+          fputc('(', out);
+          {
+            int nSeen = 0;
+            for(i=0; i<nCol; i++){
+              if( aCol[i].iSet!=aNest[iN].iSet ) continue;
+              if( nSeen++ ) fputs(", ", out);
+              emitIdent(aCol[i].zName);
+              fprintf(out, ": c%d.%s(\"%s\")", iN,
+                      zebraAccessor(typeOf(aCol[i].zDecl), 0), aCol[i].zName);
+            }
+          }
+          fputs("))\n", out);
+        }
+        /* Construct the parent ONCE, complete -- no mutation of a struct
+        ** already inside a list, whose copy-vs-reference semantics we have
+        ** no contract for. */
+        fprintf(out, "%sout.add(", zInd); emitIdentCap(zProc); fputs("Row(", out);
+        {
+          int nSeen = 0;
+          for(i=0; i<nCol; i++){
+            int bNested;
+            if( aCol[i].iSet!=1 ) continue;
+            bNested = (aCol[i].zDecl==0 || aCol[i].zDecl[0]==0);
+            if( nSeen++ ) fputs(", ", out);
+            emitIdent(aCol[i].zName); fputs(": ", out);
+            if( bNested ){
+              fputs("v_", out); emitIdent(aCol[i].zName);
+            }else{
+              fprintf(out, "row.%s(\"%s\")",
+                      zebraAccessor(typeOf(aCol[i].zDecl), 0), aCol[i].zName);
+            }
+          }
+        }
+        fputs("))\n", out);
+      }
+      fputs("    return out\n\n", out);
+
+      for(iN=0; iN<nNest; iN++){
+        sqlite3_free(aNest[iN].zCol);
+        sqlite3_free(aNest[iN].zKChild);
+        sqlite3_free(aNest[iN].zKParent);
+      }
       for(i=0; i<nCol; i++){ sqlite3_free(aCol[i].zName); sqlite3_free(aCol[i].zDecl); }
       free(aCol);
       continue;

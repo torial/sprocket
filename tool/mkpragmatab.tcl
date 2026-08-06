@@ -292,6 +292,12 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_PROCEDURE)
 
+  NAME: proc_nested
+  FLAG: NeedSchema Result1 SchemaOpt
+  COLS: resultset_index column key_child key_parent
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_PROCEDURE)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

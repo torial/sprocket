@@ -1570,6 +1570,45 @@ void sqlite3Pragma(
     }
   }
   break;
+
+  /*
+  **   PRAGMA [schema.]proc_nested(procedure-name)
+  **
+  ** One row per NESTED TABLE: the segment index its rows stream as, the
+  ** declared column name it hangs from, and both sides of the KEY correlation.
+  ** This is the row a code generator joins against proc_info to stitch child
+  ** segments back under their parents -- proc_info alone shows a nested
+  ** column (empty decltype) and its child set's columns, but not WHICH child
+  ** column matches WHICH parent column, and a generator cannot guess
+  ** KEY(post_id = id).  Segment numbering matches proc_info exactly: it is
+  ** produced by the same walk.
+  */
+  case PragTyp_PROC_NESTED: if( zRight ){
+    Proc *pProc = 0;
+    int ii;
+    pParse->nMem = 4;
+    for(ii=0; ii<db->nDb && pProc==0; ii++){
+      Schema *pSchema = db->aDb[ii].pSchema;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+      pProc = (Proc*)sqlite3HashFind(&pSchema->procHash, zRight);
+    }
+    if( pProc ){
+      ProcShape *pS;
+      int iSet = 1, j;
+      for(pS=pProc->pShapes; pS; pS=pS->pNext){
+        ProcParamList *pC = pS->pCols;
+        iSet++;
+        for(j=0; pC && j<pC->nParam; j++){
+          if( pC->a[j].pNested==0 ) continue;
+          sqlite3VdbeMultiLoad(v, 1, "isss", iSet, pC->a[j].zName,
+                               pC->a[j].zKeyChild, pC->a[j].zKeyParent);
+          iSet++;
+        }
+      }
+    }
+  }
+  break;
 #endif /* SQLITE_OMIT_PROCEDURE */
 
 #ifndef SQLITE_OMIT_INTROSPECTION_PRAGMAS
