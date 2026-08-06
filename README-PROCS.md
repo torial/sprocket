@@ -129,6 +129,13 @@ Introspection (both read the in-memory catalog; no storage change):
 PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments), declared
 PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
+PRAGMA [schema.]proc_nested(name);  -- one row per NESTED TABLE: its segment,
+                                    -- the column it hangs from, key_child,
+                                    -- key_parent.  proc_info shows a nested
+                                    -- column and its child set, but not WHICH
+                                    -- child column matches WHICH parent column
+                                    -- -- and a code generator cannot guess
+                                    -- KEY(post_id = id).
 ```
 
 Multiple sets are delimited explicitly. `sqlite3_step()` reports
@@ -231,6 +238,61 @@ One property is intentionally **not** enforced:
   are not checked against the body. In SQLite a declared type expresses
   affinity and intent rather than a constraint; this follows that model.
 
+## Options at CALL: WITH COUNTS, WITH INTERLEAVED, RETURNING
+
+Options compose as a comma list after `WITH`; none adds a keyword.
+
+**`CALL p(...) WITH COUNTS`** — per-parent child cardinality as integrity
+metadata.  Each parent row carries, per nested table, the number of child
+rows that belong to it, readable through
+`sqlite3_proc_child_count(stmt, N)` (−1 = not requested / unknowable, 0 = a
+real empty set; a reassembler that conflates them cannot tell an empty set
+from a missing answer).  The count is computed by the parent's own query,
+independent of the child stream — it catches children lost in transit, not a
+wrong correlation, which derives from the same predicate and cannot disagree
+with itself.
+
+**`CALL p(...) WITH INTERLEAVED`** — the whole tree as ONE result set,
+merged by the engine in a single pass: each parent row followed by its own
+children, in correlation-key order.
+
+```
+_segment | _key | payload columns (padded to the widest arm)
+    0    |  1   | 1  first          <- parent, value columns
+    1    |  1   | 1  10             <- its comments, positionally
+    2    |  1   | 1  sql   5        <- its tags
+    0    |  2   | 2  second ...
+```
+
+Read `_segment` to know a row's shape; child payloads are positional
+(result column 2+j is child column j) and the visible names come from the
+parent.  There are no segment boundaries: `sqlite3_step()` runs straight
+through, `sqlite3_proc_current_segment()` reports −1 (the discriminator is
+the column), and `sqlite3_proc_next_resultset()` is `SQLITE_MISUSE`.
+Because the merge needs one order, every nested table must correlate on the
+SAME parent column, and multi-result-set procedures are refused — those
+shapes keep the segmented protocol.  Combining with `COUNTS` or `RETURNING`
+is refused (not silently ignored) until built.  Output is ordered by the
+correlation key, not by the body's parent order.
+
+**`CALL p(...) RETURNING col, ...`** — projection: keep only the named
+parent columns.  Its chief use is declining the nested-table fold columns a
+flat client would otherwise pay JSON construction for, when the caller
+plans to consume the child segments directly.
+
+The segment-position C API, for segment-aware clients:
+
+```
+sqlite3_proc_next_resultset(stmt);   -- advance to the next segment
+sqlite3_proc_current_segment(stmt);  -- 0-based segment now positioned on,
+                                     -- -1 if not a shape-declaring CALL.
+                                     -- The reliable discriminator: two
+                                     -- segments may be equally wide, and
+                                     -- reading a column a segment lacks
+                                     -- yields NULL, not an error.
+sqlite3_proc_child_count(stmt, N);   -- WITH COUNTS, on parent rows
+```
+
 ## What it costs — measured, 2026-08-04
 
 Deterministic VDBE step counts, 200 parents x 5 children, data-local:
@@ -309,13 +371,14 @@ mentioning. It is the naive client, not the engine, that falls off a cliff.
 
 ## Known limitations (deliberate, v1)
 
-- **A nested table streams as its own segment, not yet as a column** (branch
-  `nested-shapes`). `CALL` works: the parent segment reports its value columns
-  and each nested table follows as the next segment, ordered by the correlation
-  key. What is missing is the flat client's single wide row — so a stock
-  `sqlite3` CLI sees the parent columns and stops, rather than seeing the
-  nested data as JSON. Segment-aware clients are complete; the invariant is
-  not met until that column lands.
+- **Nested tables are complete on three protocols.**  A flat client (stock
+  `sqlite3` CLI) sees each nested table as a generated JSON column on the
+  parent row; a segment-aware client walks the child segments with
+  `sqlite3_proc_next_resultset()`; and `WITH INTERLEAVED` streams the whole
+  tree as one engine-merged, discriminated result set (see *Options at
+  CALL*).  Depth remains 1 — a nested table may not itself nest; the
+  refusal, why it does not actually prevent depth 2, and the advisory that
+  fires on hand-rolled inner levels are DOCKET 3g.
 - No `OUT`/`INOUT` parameters (result sets cover most cases; planned later).
 - Per-column types of declared shapes are advisory (see above).
 - `sqlite3_proc_next_resultset()` is declared in `sqlite3.h` but is **not**
