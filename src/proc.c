@@ -367,6 +367,172 @@ static void procTokenSet(Token *pTok, const char *z){
 #define PROC_PARENT_ALIAS "sqlite_proc_parent"
 
 /*
+** PLAN-DEPTH phase 3 -- the INNER levels of a recursive flat fold.
+**
+** For a nested member of a nested table (a grandchild and below), build the
+** correlated array expression that goes INSIDE the enclosing json_object:
+**
+**   (SELECT json_group_array(json_object(...))
+**      FROM ( <grandchild's SELECT, columns renamed _f0.._fn> ) AS sqlite_proc_lN
+**     WHERE sqlite_proc_lN._f<key> = <the enclosing table's key expr> )
+**
+** THE ALIAS IS THE POINT.  The enclosing table's key arrives as a copied
+** projected expression; unaliased, a bare column name in it would resolve
+** against the grandchild's own scope first -- conf has a cid, claims has a
+** cid, and `cid = cid` is the tautology this branch has been burned by once
+** already.  Wrapping the grandchild under an alias whose only output names
+** are _f0.._fn means the copied expression CANNOT be captured: the inner
+** scope has no name to capture it with.  (Level 1 solves the same problem
+** from the other side, by aliasing the PARENT; both are the same rule --
+** exactly one scope may own bare names.)
+**
+** pParentKeyRef is consumed (owned) by this function in every outcome.
+*/
+static Expr *procFoldInnerExpr(
+  Parse *pParse,
+  Proc *pProc,
+  ProcFold *pF,             /* the nested table this array presents */
+  int iLevel,               /* 2 for a grandchild, 3 below it, ... */
+  Expr *pParentKeyRef       /* how the enclosing scope's key is referenced */
+){
+  sqlite3 *db = pParse->db;
+  Select *pSub, *pOuter;
+  SrcList *pSrc;
+  ExprList *pArgs = 0;
+  Expr *pObj, *pAgg, *pEq, *pSel;
+  Token tk, tAlias;
+  char zAlias[32], zRef[32];
+  int i, iVal, nVal = 0;
+
+  if( pF->pChild==0 || pF->pChild->pSelect==0 ){
+    sqlite3ExprDelete(db, pParentKeyRef);
+    return 0;
+  }
+  pSub = sqlite3SelectDup(db, pF->pChild->pSelect, 0);
+  if( pSub==0 ){
+    sqlite3ExprDelete(db, pParentKeyRef);
+    return 0;
+  }
+  sqlite3ExprListDelete(db, pSub->pOrderBy);   /* the segment's, not ours */
+  pSub->pOrderBy = 0;
+  for(i=0; i<pF->pNested->nParam; i++){
+    if( pF->pNested->a[i].pNested==0 ) nVal++;
+  }
+  if( pSub->pEList==0 || pSub->pEList->nExpr!=nVal ){
+    sqlite3SelectDelete(db, pSub);
+    sqlite3ExprDelete(db, pParentKeyRef);
+    return 0;
+  }
+  for(i=0; i<nVal; i++){
+    sqlite3_snprintf(sizeof(zRef), zRef, "_f%d", i);
+    sqlite3DbFree(db, pSub->pEList->a[i].zEName);
+    pSub->pEList->a[i].zEName = sqlite3DbStrDup(db, zRef);
+    if( pSub->pEList->a[i].zEName==0 ){
+      sqlite3SelectDelete(db, pSub);
+      sqlite3ExprDelete(db, pParentKeyRef);
+      return 0;
+    }
+    pSub->pEList->a[i].fg.eEName = ENAME_NAME;
+  }
+  sqlite3_snprintf(sizeof(zAlias), zAlias, "sqlite_proc_l%d", iLevel);
+
+  /* json_object members in declaration order, values and nested arrays
+  ** interleaved exactly as declared. */
+  iVal = 0;
+  for(i=0; i<pF->pNested->nParam; i++){
+    ProcParam *pM = &pF->pNested->a[i];
+    Expr *pVal;
+    procTokenSet(&tk, pM->zName);
+    pArgs = sqlite3ExprListAppend(pParse, pArgs,
+              sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
+    if( pM->pNested ){
+      ProcFold *pF2;
+      Expr *pKeyRef = 0;
+      int v = 0, j;
+      for(pF2=pProc->pFolds; pF2; pF2=pF2->pNext){
+        if( pF2->pShapeCols==pF->pNested
+         && sqlite3StrICmp(pF2->zName, pM->zName)==0 ) break;
+      }
+      /* this level's key, by its _f name, for the level below */
+      for(j=0; j<pF->pNested->nParam; j++){
+        if( pF->pNested->a[j].pNested ) continue;
+        if( pF2 && sqlite3StrICmp(pF->pNested->a[j].zName,
+                                  pF2->zKeyParent)==0 ) break;
+        v++;
+      }
+      if( pF2 ){
+        Token tT, tC;
+        sqlite3_snprintf(sizeof(zRef), zRef, "_f%d", v);
+        procTokenSet(&tT, zAlias);
+        procTokenSet(&tC, zRef);
+        pKeyRef = sqlite3PExpr(pParse, TK_DOT,
+                    sqlite3ExprAlloc(db, TK_ID, &tT, 0),
+                    sqlite3ExprAlloc(db, TK_ID, &tC, 0));
+        pVal = procFoldInnerExpr(pParse, pProc, pF2, iLevel+1, pKeyRef);
+      }else{
+        pVal = 0;
+      }
+      if( pVal==0 ){
+        sqlite3ExprListDelete(db, pArgs);
+        sqlite3SelectDelete(db, pSub);
+        sqlite3ExprDelete(db, pParentKeyRef);
+        return 0;
+      }
+    }else{
+      Token tT, tC;
+      sqlite3_snprintf(sizeof(zRef), zRef, "_f%d", iVal);
+      iVal++;
+      procTokenSet(&tT, zAlias);
+      procTokenSet(&tC, zRef);
+      pVal = sqlite3PExpr(pParse, TK_DOT,
+               sqlite3ExprAlloc(db, TK_ID, &tT, 0),
+               sqlite3ExprAlloc(db, TK_ID, &tC, 0));
+      procTokenSet(&tk, "sqlite_proc_jsonval");
+      pVal = sqlite3ExprFunction(pParse,
+               sqlite3ExprListAppend(pParse, 0, pVal), &tk, 0);
+    }
+    pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
+  }
+  procTokenSet(&tk, "json_object");
+  pObj = sqlite3ExprFunction(pParse, pArgs, &tk, 0);
+  procTokenSet(&tk, "json_group_array");
+  pAgg = sqlite3ExprFunction(pParse,
+           sqlite3ExprListAppend(pParse, 0, pObj), &tk, 0);
+
+  {
+    Token tT, tC;
+    sqlite3_snprintf(sizeof(zRef), zRef, "_f%d", pF->iKeyCol-1);
+    procTokenSet(&tT, zAlias);
+    procTokenSet(&tC, zRef);
+    pEq = sqlite3PExpr(pParse, TK_EQ,
+            sqlite3PExpr(pParse, TK_DOT,
+              sqlite3ExprAlloc(db, TK_ID, &tT, 0),
+              sqlite3ExprAlloc(db, TK_ID, &tC, 0)),
+            pParentKeyRef);
+    pParentKeyRef = 0;                      /* consumed */
+  }
+
+  procTokenSet(&tAlias, zAlias);
+  pSrc = sqlite3SrcListAppendFromTerm(pParse, 0, 0, 0, &tAlias, pSub, 0);
+  if( pSrc==0 ){
+    /* pSub already deleted -- see procWrapParent's account. */
+    sqlite3ExprDelete(db, pAgg);
+    sqlite3ExprDelete(db, pEq);
+    return 0;
+  }
+  pOuter = sqlite3SelectNew(pParse,
+             sqlite3ExprListAppend(pParse, 0, pAgg), pSrc, pEq, 0, 0, 0, 0, 0);
+  if( pOuter==0 ) return 0;                 /* SelectNew consumed everything */
+  pSel = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+  if( pSel==0 ){
+    sqlite3SelectDelete(db, pOuter);
+    return 0;
+  }
+  sqlite3PExprAddSelect(pParse, pSel, pOuter);
+  return pSel;
+}
+
+/*
 ** Wrap a parent SELECT so its columns can be referenced under an alias the
 ** inner scope cannot supply:
 **
@@ -449,8 +615,8 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
 ** references: the declaration is the interface, so a body's SELECT need not
 ** spell its columns the way the shape does.
 */
-static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
-                              IdList *pProj){
+static void procAddFoldColumn(Parse *pParse, Proc *pProc, Select *pWrap,
+                              ProcFold *pF, IdList *pProj){
   sqlite3 *db = pParse->db;
   ExprList *pArgs = 0, *pOld, *pPE;
   Expr *pObj, *pAgg, *pSel, *pEq;
@@ -500,7 +666,38 @@ fold_col_err:
   int iVal = 0;
   for(i=0; i<pF->pNested->nParam; i++){
     Expr *pVal;
-    if( pF->pNested->a[i].pNested ) continue;
+    if( pF->pNested->a[i].pNested ){
+      /* PLAN-DEPTH phase 3: the member is itself a nested table -- its
+      ** array is built by the aliased recursion, correlated to THIS level's
+      ** key expression.  Safe to pass the raw copied expression: the inner
+      ** scope's only names are _f*, so it cannot be captured. */
+      ProcFold *pF2;
+      int v = 0, j;
+      for(pF2=pProc->pFolds; pF2; pF2=pF2->pNext){
+        if( pF2->pShapeCols==pF->pNested
+         && sqlite3StrICmp(pF2->zName, pF->pNested->a[i].zName)==0 ) break;
+      }
+      for(j=0; pF2 && j<pF->pNested->nParam; j++){
+        if( pF->pNested->a[j].pNested ) continue;
+        if( sqlite3StrICmp(pF->pNested->a[j].zName, pF2->zKeyParent)==0 ) break;
+        v++;
+      }
+      procTokenSet(&tk, pF->pNested->a[i].zName);
+      pArgs = sqlite3ExprListAppend(pParse, pArgs,
+                sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
+      if( pF2==0 || v>=pOld->nExpr ){
+        sqlite3ExprListDelete(db, pArgs);
+        goto fold_col_err;
+      }
+      pVal = procFoldInnerExpr(pParse, pProc, pF2, 2,
+                     sqlite3ExprDup(db, pOld->a[v].pExpr, 0));
+      if( pVal==0 ){
+        sqlite3ExprListDelete(db, pArgs);
+        goto fold_col_err;
+      }
+      pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
+      continue;
+    }
     procTokenSet(&tk, pF->pNested->a[i].zName);
     pArgs = sqlite3ExprListAppend(pParse, pArgs,
               sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
@@ -662,7 +859,7 @@ static int procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
       if( procWrapParent(pParse, ppSel, pF->pShapeCols, pProj) ) return 0;
       bWrapped = 1;
     }
-    if( bKeep ) procAddFoldColumn(pParse, *ppSel, pF, pProj);
+    if( bKeep ) procAddFoldColumn(pParse, pProc, *ppSel, pF, pProj);
   }
 
   /* Pass 2, kept separate so the counts land AFTER every visible column

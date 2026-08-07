@@ -145,4 +145,53 @@ do_execsql_test 2.6 {
   SELECT nresultsets FROM pragma_proc_list WHERE name='flat1';
 } {2}
 
+#--------------------------------------------------------------------
+# 3.x: the recursive flat fold (PLAN-DEPTH phase 3)
+#
+# A flat client at depth 2 gets the WHOLE tree in one row: each claim object
+# carries its own confidences array, built by the aliased inner recursion --
+# the alias is what stops the inner correlation resolving cid against conf
+# itself (the id = id tautology, prevented structurally).
+#
+do_execsql_test 3.0 {
+  CALL wc();
+} {1 B {[{"cid":10,"wid":1,"subject":"omits","confidences":[{"cid":10,"aspect":"text","confidence":"high"},{"cid":10,"aspect":"codic","confidence":"low"}]},{"cid":11,"wid":1,"subject":"reads","confidences":[]}]} 2 S {[{"cid":12,"wid":2,"subject":"omits","confidences":[{"cid":12,"aspect":"text","confidence":"high"}]}]}}
+
+# The claims SEGMENT carries the same complete inner fold: a segment-aware
+# client that stops one level down still sees the grandchildren as JSON.
+do_test 3.1 {
+  set S [sqlite3_prepare_v2 db {CALL wc()} -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_proc_next_resultset $S
+  sqlite3_step $S
+  set j [sqlite3_column_text $S 3]
+  sqlite3_finalize $S
+  set j
+} {[{"cid":10,"aspect":"text","confidence":"high"},{"cid":10,"aspect":"codic","confidence":"low"}]}
+
+# NEGATIVE control: claim 11 has no confidences, and its inner array is [],
+# not NULL and not absent -- an empty set must be distinguishable from a
+# missing answer at every level, same rule as the counts.
+do_test 3.2 {
+  set S [sqlite3_prepare_v2 db {CALL wc()} -1 TAIL]
+  sqlite3_step $S
+  set claims [sqlite3_column_text $S 2]
+  sqlite3_finalize $S
+  db one {SELECT json_extract($claims, '$[1].confidences')}
+} {[]}
+
+#--------------------------------------------------------------------
+# 4.x: WITH COUNTS at depth -- carried entirely by the descriptor recursion
+# and per-step fold application; no depth-specific code exists for it.
+#
+do_test 4.0 {
+  set S [sqlite3_prepare_v2 db {CALL wc() WITH COUNTS} -1 TAIL]
+  set r {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { lappend r w[sqlite3_proc_child_count $S 0] }
+  sqlite3_proc_next_resultset $S
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} { lappend r c[sqlite3_proc_child_count $S 0] }
+  sqlite3_finalize $S
+  set r
+} {w2 w1 c2 c0 c1}
+
 finish_test

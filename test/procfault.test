@@ -116,4 +116,31 @@ do_faultsim_test 4 -faults oom* -prep {
   faultsim_test_result {0 {0 1 1 a 1 1 1 1 1 1 1 2 0 2 2 b 1 2 2 3 0 3 3 lonely}}
 }
 
+
+# Depth 2 (PLAN-DEPTH phase 3) -- procFoldInnerExpr builds the aliased inner
+# array recursively; its error paths consume what they were given, and only
+# an injected allocation failure ever executes them.
+do_faultsim_test 5 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql {
+    CREATE TABLE conf(post_id INTEGER, aspect TEXT);
+    INSERT INTO conf VALUES(1,'x'),(1,'y'),(2,'z');
+    CREATE PROCEDURE pd()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER,
+                                   marks TABLE(post_id INTEGER, aspect TEXT)
+                                     KEY(post_id = post_id))
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid FROM comments;
+      SELECT post_id, aspect FROM conf;
+    END;
+  }
+} -body {
+  execsql { CALL pd() }
+} -test {
+  faultsim_test_result {0 {1 a {[{"post_id":1,"cid":1,"marks":[{"post_id":1,"aspect":"x"},{"post_id":1,"aspect":"y"}]},{"post_id":1,"cid":2,"marks":[{"post_id":1,"aspect":"x"},{"post_id":1,"aspect":"y"}]}]} 2 b {[{"post_id":2,"cid":3,"marks":[{"post_id":2,"aspect":"z"}]}]} 3 lonely {[]}}}
+}
+
 finish_test
