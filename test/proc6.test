@@ -179,7 +179,12 @@ do_catchsql_test 3.3 {
                                  grand TABLE(g INTEGER) KEY(g = post_id))
                     KEY(post_id = id))
   BEGIN SELECT 1; END;
-} {1 {nested tables may not themselves nest: grand}}
+} {1 {procedure b3 streams 1 result set but declares 3}}
+# (updated for PLAN-DEPTH: depth >= 2 is now ACCEPTED, so this fixture --
+# whose body was written to never run -- fails conformance instead.  The new
+# message is the better pin: it proves the deep declaration was accepted,
+# expanded to three segments, and checked.  Depth-2 behavior proper lives in
+# procdeep.test.)
 
 # A shape that is nothing but nested tables has no column to correlate on.
 do_catchsql_test 3.4 {

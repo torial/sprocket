@@ -2956,6 +2956,59 @@ void sqlite3VdbeApplyProcSet(Vdbe *p, int iSet){
 ** A no-op (leaving legacy behavior in place) if the procedure declares
 ** no shapes.
 */
+/*
+** PLAN-DEPTH: the descriptor treatment is UNIFORM at every level.  Each
+** segment reports ALL of its declared columns -- value and nested alike,
+** because procApplyFolds puts a generated fold column at each nested
+** position of ANY segment that nests, root or not -- plus its own hidden
+** count columns under WITH COUNTS.  pProj applies only at the true root
+** (depth >= 2 with RETURNING is refused at CALL), so recursion passes 0.
+** Pre-order, matching every other walk.
+*/
+static void vdbeProcShapeSize(ProcParamList *pC, IdList *pProj, int bCounts,
+                              int *pnSet, int *pmaxCol){
+  int i, nKeep = 0;
+  (*pnSet)++;
+  for(i=0; i<pC->nParam; i++){
+    if( sqlite3ProcProjKeeps(pProj, pC->a[i].zName) ) nKeep++;
+    if( bCounts && pC->a[i].pNested ) nKeep++;       /* its hidden count */
+  }
+  if( nKeep>*pmaxCol ) *pmaxCol = nKeep;
+  for(i=0; i<pC->nParam; i++){
+    if( pC->a[i].pNested ){
+      vdbeProcShapeSize(pC->a[i].pNested, 0, bCounts, pnSet, pmaxCol);
+    }
+  }
+}
+static int vdbeProcShapeFill(Vdbe *p, sqlite3 *db, ProcParamList *pC,
+                             IdList *pProj, int bCounts, int *pi){
+  VdbeProcSet *pDest = &p->aProcSet[(*pi)++];
+  int j, k = 0, nKeep = 0, nHid = 0;
+  for(j=0; j<pC->nParam; j++){
+    if( sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) nKeep++;
+    if( bCounts && pC->a[j].pNested ) nHid++;
+  }
+  /* nCol counts what OP_ResultRow EMITS -- visible columns plus this
+  ** shape's trailing count columns -- because vdbe.c asserts the two
+  ** agree.  nHidden is how many of those the client is not shown. */
+  pDest->nCol = (u16)(nKeep + nHid);
+  pDest->nHidden = (u16)nHid;
+  pDest->azName = sqlite3DbMallocZero(db, (nKeep+nHid+1)*sizeof(char*));
+  pDest->azType = sqlite3DbMallocZero(db, (nKeep+nHid+1)*sizeof(char*));
+  if( pDest->azName==0 || pDest->azType==0 ) return 1;
+  for(j=0; j<pC->nParam; j++){
+    if( !sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) continue;
+    pDest->azName[k] = sqlite3DbStrDup(db, pC->a[j].zName);
+    pDest->azType[k] = sqlite3DbStrDup(db, pC->a[j].zType);
+    k++;
+  }
+  for(j=0; j<pC->nParam; j++){
+    if( pC->a[j].pNested==0 ) continue;
+    if( vdbeProcShapeFill(p, db, pC->a[j].pNested, 0, bCounts, pi) ) return 1;
+  }
+  return 0;
+}
+
 void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes, IdList *pProj,
                               int bCounts){
   sqlite3 *db = p->db;
@@ -2973,28 +3026,8 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes, IdList *pProj,
   ** reassembler) consumes.  The flat client's single wide row is layered on
   ** top of it. */
   for(pS=pShapes; pS; pS=pS->pNext){
-    ProcParamList *pC = pS->pCols;
-    int nVal = 0;
-    if( pC==0 ) return;                      /* RETURNS NOTHING */
-    for(i=0; i<pC->nParam; i++){
-      if( pC->a[i].pNested ){
-        nSet++;
-        if( pC->a[i].pNested->nParam>maxCol ) maxCol = pC->a[i].pNested->nParam;
-      }else{
-        nVal++;
-      }
-    }
-    /* The parent descriptor reports ALL declared columns, including the nested
-    ** ones: phase 5b puts a generated correlated subquery in the parent SELECT
-    ** at each nested position, so the row genuinely has that many registers. */
-    { int nKeep = 0;
-      for(i=0; i<pC->nParam; i++){
-        if( sqlite3ProcProjKeeps(pProj, pC->a[i].zName) ) nKeep++;
-        if( bCounts && pC->a[i].pNested ) nKeep++;   /* its hidden count */
-      }
-      if( nKeep>maxCol ) maxCol = nKeep;
-    }
-    nSet++;
+    if( pS->pCols==0 ) return;               /* RETURNS NOTHING */
+    vdbeProcShapeSize(pS->pCols, pProj, bCounts, &nSet, &maxCol);
   }
   if( nSet==0 || maxCol==0 ) return;
   if( nSet>255 ) return;                     /* Far beyond any real use */
@@ -3004,54 +3037,7 @@ void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes, IdList *pProj,
   p->nProcSet = (u8)nSet;
   i = 0;
   for(pS=pShapes; pS; pS=pS->pNext){
-    ProcParamList *pC = pS->pCols;
-    VdbeProcSet *pDest = &p->aProcSet[i++];
-    int j;
-    { int nKeep = 0, k = 0;
-      for(j=0; j<pC->nParam; j++){
-        if( sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) nKeep++;
-      }
-      /* nCol counts what OP_ResultRow EMITS -- visible columns plus this
-      ** shape's trailing count columns -- because vdbe.c asserts the two
-      ** agree.  nHidden is how many of those the client is not shown.
-      **
-      ** Derived per shape rather than handed in: the count belongs to the
-      ** shape (one per nested table it declares), not to the statement. */
-      int nHid = 0;
-      if( bCounts ){
-        for(j=0; j<pC->nParam; j++){
-          if( pC->a[j].pNested ) nHid++;
-        }
-      }
-      pDest->nCol = (u16)(nKeep + nHid);
-      pDest->nHidden = (u16)nHid;
-      pDest->azName = sqlite3DbMallocZero(db, (nKeep+nHid+1)*sizeof(char*));
-      pDest->azType = sqlite3DbMallocZero(db, (nKeep+nHid+1)*sizeof(char*));
-      if( pDest->azName==0 || pDest->azType==0 ) return;
-      for(j=0; j<pC->nParam; j++){
-        if( !sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) continue;
-        pDest->azName[k] = sqlite3DbStrDup(db, pC->a[j].zName);
-        pDest->azType[k] = sqlite3DbStrDup(db, pC->a[j].zType);
-        k++;
-      }
-    }
-    /* Then one segment per nested table, in declaration order -- the order
-    ** the body's SELECTs must follow, which conformance already enforced. */
-    for(j=0; j<pC->nParam; j++){
-      ProcParamList *pN = pC->a[j].pNested;
-      VdbeProcSet *pKid;
-      int m;
-      if( pN==0 ) continue;
-      pKid = &p->aProcSet[i++];
-      pKid->nCol = (u16)pN->nParam;
-      pKid->azName = sqlite3DbMallocZero(db, pN->nParam*sizeof(char*));
-      pKid->azType = sqlite3DbMallocZero(db, pN->nParam*sizeof(char*));
-      if( pKid->azName==0 || pKid->azType==0 ) return;
-      for(m=0; m<pN->nParam; m++){
-        pKid->azName[m] = sqlite3DbStrDup(db, pN->a[m].zName);
-        pKid->azType[m] = sqlite3DbStrDup(db, pN->a[m].zType);
-      }
-    }
+    if( vdbeProcShapeFill(p, db, pS->pCols, pProj, bCounts, &i) ) return;
   }
   assert( i==nSet );
   sqlite3VdbeSetNumCols(p, maxCol);

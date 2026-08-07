@@ -408,6 +408,35 @@ static int tableSkipIntegrityCheck(const Table *pTab, const Table *pObjTab){
   }
 }
 
+#ifndef SQLITE_OMIT_PROCEDURE
+/* PLAN-DEPTH: shared pre-order emitters for proc_info / proc_nested. */
+static void pragmaProcInfoLevel(Vdbe *v, ProcParamList *pC, int iSelf,
+                                int *piNext){
+  int j;
+  for(j=0; j<pC->nParam; j++){
+    sqlite3VdbeMultiLoad(v, 1, "iiss", iSelf, j, pC->a[j].zName,
+                         pC->a[j].zType);
+  }
+  for(j=0; j<pC->nParam; j++){
+    int iChild;
+    if( pC->a[j].pNested==0 ) continue;
+    iChild = (*piNext)++;
+    pragmaProcInfoLevel(v, pC->a[j].pNested, iChild, piNext);
+  }
+}
+static void pragmaProcNestedLevel(Vdbe *v, ProcParamList *pC, int *piNext){
+  int j;
+  for(j=0; j<pC->nParam; j++){
+    int iChild;
+    if( pC->a[j].pNested==0 ) continue;
+    iChild = (*piNext)++;
+    sqlite3VdbeMultiLoad(v, 1, "isss", iChild, pC->a[j].zName,
+                         pC->a[j].zKeyChild, pC->a[j].zKeyParent);
+    pragmaProcNestedLevel(v, pC->a[j].pNested, piNext);
+  }
+}
+#endif /* SQLITE_OMIT_PROCEDURE */
+
 /*
 ** Process a pragma statement. 
 **
@@ -1522,6 +1551,8 @@ void sqlite3Pragma(
   ** only; a RETURNS NOTHING procedure likewise (it has no shapes).
   */
   case PragTyp_PROC_INFO: if( zRight ){
+    /* (helper defined below the switch would not be visible; see file-scope
+    ** pragmaProcInfoLevel/pragmaProcNestedLevel above this function) */
     Proc *pProc = 0;
     int ii;
     pParse->nMem = 4;
@@ -1549,24 +1580,15 @@ void sqlite3Pragma(
       ** A nested column appears in its parent set with an EMPTY decltype,
       ** which is how a client tells "this is a nested table" from a scalar.
       ** Its columns are then the next set. */
+      /* PLAN-DEPTH: recurse, PRE-ORDER -- the numbering every other walk
+      ** (procBuildEmits, SetProcShapes, proc_nested) agrees on. */
       for(pS=pProc->pShapes; pS; pS=pS->pNext){
-        ProcParamList *pC = pS->pCols;
-        int k;
-        for(j=0; pC && j<pC->nParam; j++){
-          sqlite3VdbeMultiLoad(v, 1, "iiss", iSet, j, pC->a[j].zName,
-                               pC->a[j].zType);
-        }
-        iSet++;
-        for(j=0; pC && j<pC->nParam; j++){
-          ProcParamList *pN = pC->a[j].pNested;
-          if( pN==0 ) continue;
-          for(k=0; k<pN->nParam; k++){
-            sqlite3VdbeMultiLoad(v, 1, "iiss", iSet, k, pN->a[k].zName,
-                                 pN->a[k].zType);
-          }
-          iSet++;
-        }
+        int iSelf;
+        if( pS->pCols==0 ) continue;
+        iSelf = iSet++;
+        pragmaProcInfoLevel(v, pS->pCols, iSelf, &iSet);
       }
+      (void)j;
     }
   }
   break;
@@ -1595,17 +1617,14 @@ void sqlite3Pragma(
     }
     if( pProc ){
       ProcShape *pS;
-      int iSet = 1, j;
+      int iSet = 1;
       for(pS=pProc->pShapes; pS; pS=pS->pNext){
-        ProcParamList *pC = pS->pCols;
-        iSet++;
-        for(j=0; pC && j<pC->nParam; j++){
-          if( pC->a[j].pNested==0 ) continue;
-          sqlite3VdbeMultiLoad(v, 1, "isss", iSet, pC->a[j].zName,
-                               pC->a[j].zKeyChild, pC->a[j].zKeyParent);
-          iSet++;
-        }
+        int iSelf;
+        if( pS->pCols==0 ) continue;
+        iSelf = iSet++;
+        pragmaProcNestedLevel(v, pS->pCols, &iSet);
       }
+      (void)pS;
     }
   }
   break;

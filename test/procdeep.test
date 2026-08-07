@@ -1,0 +1,148 @@
+# 2026-08-06
+#
+# Depth >= 2 nested result shapes (PLAN-DEPTH.md).  Written RED FIRST: 1.0
+# fails on the depth refusal until sqlite3ProcNestedAppend stops rejecting,
+# and 2.x fail until the walks recurse.
+#
+# Fixture is the Mosaic shape in miniature: witness -> claims -> confidences.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix procdeep
+
+do_execsql_test 0.0 {
+  CREATE TABLE witness(wid INTEGER PRIMARY KEY, siglum TEXT);
+  CREATE TABLE claim(cid INTEGER PRIMARY KEY, wid INTEGER, subject TEXT);
+  CREATE TABLE conf(cid INTEGER, aspect TEXT, confidence TEXT);
+  INSERT INTO witness VALUES(1,'B'),(2,'S');
+  INSERT INTO claim VALUES(10,1,'omits'),(11,1,'reads'),(12,2,'omits');
+  INSERT INTO conf VALUES(10,'text','high'),(10,'codic','low'),(12,'text','high');
+} {}
+
+# Magnitudes stated before anything is compared.
+do_execsql_test 0.1 {
+  SELECT (SELECT count(*) FROM witness),
+         (SELECT count(*) FROM claim),
+         (SELECT count(*) FROM conf);
+} {2 3 3}
+
+#--------------------------------------------------------------------
+# 1.x: CREATE accepts depth 2 and refuses the shapes it must refuse
+#
+do_execsql_test 1.0 {
+  CREATE PROCEDURE wc()
+  RETURNS TABLE(wid INTEGER, siglum TEXT,
+                claims TABLE(cid INTEGER, wid INTEGER, subject TEXT,
+                             confidences TABLE(cid INTEGER, aspect TEXT,
+                                               confidence TEXT)
+                               KEY(cid = cid))
+                  KEY(wid = wid))
+  BEGIN
+    SELECT wid, siglum FROM witness;
+    SELECT cid, wid, subject FROM claim;
+    SELECT cid, aspect, confidence FROM conf;
+  END;
+} {}
+
+# A grandchild's KEY resolves against the table that CONTAINS it -- claims --
+# never against an ancestor beyond it.  siglum is a witness column only.
+do_catchsql_test 1.1 {
+  CREATE PROCEDURE bad1()
+  RETURNS TABLE(wid INTEGER, siglum TEXT,
+                claims TABLE(cid INTEGER,
+                             confidences TABLE(cid INTEGER, aspect TEXT)
+                               KEY(cid = siglum))
+                  KEY(cid = wid))
+  BEGIN
+    SELECT wid, siglum FROM witness;
+    SELECT cid FROM claim;
+    SELECT cid, aspect FROM conf;
+  END;
+} {1 {nested table confidences of procedure bad1 correlates on siglum, which is not a column of the result set that contains it}}
+
+# Depth 3: no cap -- the machinery is recursive either way.
+do_execsql_test 1.2 {
+  CREATE PROCEDURE d3()
+  RETURNS TABLE(a INTEGER,
+                l1 TABLE(b INTEGER,
+                         l2 TABLE(c INTEGER,
+                                  l3 TABLE(d INTEGER) KEY(d = c))
+                           KEY(c = b))
+                  KEY(b = a))
+  BEGIN
+    SELECT 1;
+    SELECT 1;
+    SELECT 1;
+    SELECT 1;
+  END;
+} {}
+
+#--------------------------------------------------------------------
+# 2.x: introspection and the segment walk recurse, pre-order
+#
+do_execsql_test 2.0 {
+  SELECT nresultsets FROM pragma_proc_list WHERE name='wc';
+} {3}
+
+do_execsql_test 2.1 {
+  SELECT resultset_index, position, name FROM pragma_proc_info('wc')
+   WHERE resultset_index > 0 ORDER BY resultset_index, position;
+} {1 0 wid 1 1 siglum 1 2 claims 2 0 cid 2 1 wid 2 2 subject 2 3 confidences 3 0 cid 3 1 aspect 3 2 confidence}
+
+do_execsql_test 2.2 {
+  PRAGMA proc_nested(wc);
+} {2 claims wid wid 3 confidences cid cid}
+
+# The walk: arity and names per segment.  The parent descriptor reports ALL
+# declared columns including nested positions (phase 5b puts a generated
+# column there); same rule one level down for claims.
+proc walk {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  set out {}
+  while {1} {
+    set seg [list [sqlite3_column_count $S]]
+    for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+      lappend seg [sqlite3_column_name $S $i]
+    }
+    set n 0
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} { incr n }
+    lappend seg rows=$n
+    lappend out $seg
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+  return $out
+}
+
+do_test 2.3 {
+  walk {CALL wc()}
+} {{3 wid siglum claims rows=2} {4 cid wid subject confidences rows=3} {3 cid aspect confidence rows=3}}
+
+# Byte-identical on a second walk: reused buffers or stale pointers drift.
+do_test 2.4 {
+  expr {[walk {CALL wc()}] eq [walk {CALL wc()}]}
+} {1}
+
+# current_segment recurses with the walk.
+do_test 2.5 {
+  set S [sqlite3_prepare_v2 db {CALL wc()} -1 TAIL]
+  set r {}
+  while {1} {
+    lappend r [sqlite3_proc_current_segment $S]
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+  set r
+} {0 1 2}
+
+# NEGATIVE CONTROL: a depth-1 proc through the same pragmas, unchanged.
+do_execsql_test 2.6 {
+  CREATE PROCEDURE flat1()
+  RETURNS TABLE(id INTEGER,
+                kids TABLE(pid INTEGER) KEY(pid = id))
+  BEGIN SELECT wid FROM witness; SELECT cid FROM claim; END;
+  SELECT nresultsets FROM pragma_proc_list WHERE name='flat1';
+} {2}
+
+finish_test

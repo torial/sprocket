@@ -56,11 +56,9 @@ ProcParamList *sqlite3ProcNestedAppend(
   if( zChild==0 ) goto nested_err;
 
   for(i=0; i<pChild->nParam; i++){
-    if( pChild->a[i].pNested ){
-      sqlite3ErrorMsg(pParse, "nested tables may not themselves nest: %s",
-                      pChild->a[i].zName);
-      goto nested_err;
-    }
+    /* PLAN-DEPTH: nesting recurses.  The KEY must name a VALUE column of the
+    ** child -- a nested table is not a value and cannot correlate. */
+    if( pChild->a[i].pNested ) continue;
     if( sqlite3StrICmp(pChild->a[i].zName, zChild)==0 ) bFound = 1;
   }
   if( !bFound ){
@@ -471,9 +469,21 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
   ** metadata/register mismatch that produced a fabricated value the first time
   ** this feature was measured.  Conformance guarantees the arity, so this is
   ** unreachable; assert rather than degrade. */
-  assert( pOld!=0 && pOld->nExpr>=pF->pNested->nParam
-          && pF->iKeyCol<=pOld->nExpr );
-  if( pOld==0 || pOld->nExpr<pF->pNested->nParam || pF->iKeyCol>pOld->nExpr ){
+  /* PLAN-DEPTH: a nesting child's SELECT streams only its VALUE columns;
+  ** the declared list also carries its nested tables, which have no
+  ** correspondent here.  Compare against the value count. */
+  {
+    int nVal = 0;
+    for(i=0; i<pF->pNested->nParam; i++){
+      if( pF->pNested->a[i].pNested==0 ) nVal++;
+    }
+    assert( pOld!=0 && pOld->nExpr>=nVal && pF->iKeyCol<=pOld->nExpr );
+    if( pOld==0 || pOld->nExpr<nVal || pF->iKeyCol>pOld->nExpr ){
+      goto fold_col_err;
+    }
+  }
+  if( 0 ){
+fold_col_err:
     pSub->pEList = 0;
     sqlite3SelectDelete(db, pSub);
     sqlite3ExprListDelete(db, pOld);
@@ -481,16 +491,25 @@ static void procAddFoldColumn(Parse *pParse, Select *pWrap, ProcFold *pF,
     return;
   }
 
+  /* Value columns only, with the ordinal tracked separately: pOld's
+  ** positions are the SELECT's, which has no slots for nested members.
+  ** The inner level's array is phase 3 (PLAN-DEPTH test 3.x) -- building
+  ** it inline would correlate the grandchild against its own scope, the
+  ** id = id tautology the parent alias exists to prevent. */
+  {
+  int iVal = 0;
   for(i=0; i<pF->pNested->nParam; i++){
     Expr *pVal;
+    if( pF->pNested->a[i].pNested ) continue;
     procTokenSet(&tk, pF->pNested->a[i].zName);
     pArgs = sqlite3ExprListAppend(pParse, pArgs,
               sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
-    pVal = sqlite3ExprDup(db, pOld->a[i].pExpr, 0);
+    pVal = sqlite3ExprDup(db, pOld->a[iVal++].pExpr, 0);
     procTokenSet(&tk, "sqlite_proc_jsonval");
     pVal = sqlite3ExprFunction(pParse,
              sqlite3ExprListAppend(pParse, 0, pVal), &tk, 0);
     pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
+  }
   }
   procTokenSet(&tk, "json_object");
   pObj = sqlite3ExprFunction(pParse, pArgs, &tk, 0);
@@ -1159,6 +1178,14 @@ static int procCheckList(
         if( p->aEmit[i].zNested && procLowerChild(p, pStep, &p->aEmit[i]) ){
           break;
         }
+        /* PLAN-DEPTH: a nested table that itself nests is the PARENT of the
+        ** segments that follow it (pre-order).  Its own fold was recorded
+        ** just above, against the step of the table containing it; from here
+        ** on, ITS step is what descendants' folds hang from. */
+        if( p->aEmit[i].zNested && p->aEmit[i].nNested>0 ){
+          p->pParentStep = pStep;
+          p->bWrapped = 0;
+        }
         i++;
         break;
       }
@@ -1232,17 +1259,44 @@ static int procCheckList(
 ** PRAGMA proc_list.nresultsets reports; it equals the number of declared
 ** shapes for every procedure that does not nest.
 */
-int sqlite3ProcSegmentCount(Proc *pProc){
-  ProcShape *pS;
-  int n = 0, i;
-  for(pS=pProc->pShapes; pS; pS=pS->pNext){
-    if( pS->pCols==0 ) continue;
-    n++;
-    for(i=0; i<pS->pCols->nParam; i++){
-      if( pS->pCols->a[i].pNested ) n++;
-    }
+static int procSegCountLevel(ProcParamList *pCols){
+  int n = 1, i;
+  for(i=0; i<pCols->nParam; i++){
+    if( pCols->a[i].pNested ) n += procSegCountLevel(pCols->a[i].pNested);
   }
   return n;
+}
+int sqlite3ProcSegmentCount(Proc *pProc){
+  ProcShape *pS;
+  int n = 0;
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    n += procSegCountLevel(pS->pCols);
+  }
+  return n;
+}
+/* Deepest nesting level of any shape: 0 = no nesting, 1 = children only,
+** 2 = grandchildren, ...  Used to refuse compositions v1 keeps shallow. */
+static int procShapeDepthLevel(ProcParamList *pCols){
+  int d = 0, i;
+  for(i=0; i<pCols->nParam; i++){
+    if( pCols->a[i].pNested ){
+      int dk = 1 + procShapeDepthLevel(pCols->a[i].pNested);
+      if( dk>d ) d = dk;
+    }
+  }
+  return d;
+}
+static int procShapeDepth(Proc *pProc){
+  ProcShape *pS;
+  int d = 0;
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    int dk;
+    if( pS->pCols==0 ) continue;
+    dk = procShapeDepthLevel(pS->pCols);
+    if( dk>d ) d = dk;
+  }
+  return d;
 }
 
 /*
@@ -1256,6 +1310,7 @@ int sqlite3ProcSegmentCount(Proc *pProc){
 ** after its nested table would be rejected wrongly.  By this point the shape
 ** is complete.
 */
+static int procEmitLevel(Parse*, Proc*, ProcConf*, ProcParamList*, int, int*);
 static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
   sqlite3 *db = pParse->db;
   ProcShape *pS;
@@ -1269,70 +1324,102 @@ static int procBuildEmits(Parse *pParse, Proc *pProc, ProcConf *pConf){
 
   n = 0;
   for(pS=pProc->pShapes; pS; pS=pS->pNext){
-    ProcParamList *pCols = pS->pCols;
-    int iParent, nScalar = 0, nNested = 0;
-    if( pCols==0 ) continue;
+    int iParent;
+    if( pS->pCols==0 ) continue;
     iParent = n++;
-    for(i=0; i<pCols->nParam; i++){
-      if( pCols->a[i].pNested ) nNested++; else nScalar++;
-    }
-    /* nScalar is what README-PROCS.md calls a VALUE COLUMN -- a column that
-    ** carries a value directly, as opposed to a nested table.  The user-facing
-    ** identity is columns = value columns + nested tables. */
-    pConf->aEmit[iParent].nCol = nScalar;
-    pConf->aEmit[iParent].nNested = nNested;
-    /* Diagnosed before the key check below, which would otherwise report the
-    ** parent column as missing and send the author looking for the wrong
-    ** mistake. */
-    if( nScalar==0 ){
-      sqlite3ErrorMsg(pParse,
-        "result set of procedure %s declares only nested tables; a result "
-        "set must have at least one column of its own to correlate on",
-        pProc->zName);
-      return 1;
-    }
-    for(i=0; i<pCols->nParam; i++){
-      ProcParam *pCol = &pCols->a[i];
-      if( pCol->pNested==0 ) continue;
-      /* The parent side of the correlation must name a scalar column of this
-      ** same shape -- it is the value the child rows are matched against, and
-      ** a name that resolves to nothing would only surface at CALL. */
-      {
-        int nSeen = 0;
-        for(j=0; j<pCols->nParam; j++){
-          if( pCols->a[j].pNested ) continue;
-          nSeen++;
-          if( sqlite3StrICmp(pCols->a[j].zName, pCol->zKeyParent)==0 ){
-            pConf->aEmit[n].iParentKeyCol = nSeen;
-            break;
-          }
-        }
-      }
-      if( pConf->aEmit[n].iParentKeyCol==0 ){
-        sqlite3ErrorMsg(pParse,
-          "nested table %s of procedure %s correlates on %s, which is not a "
-          "column of the result set that contains it",
-          pCol->zName, pProc->zName, pCol->zKeyParent);
-        return 1;
-      }
-      pConf->aEmit[n].nCol = pCol->pNested->nParam;
-      pConf->aEmit[n].zNested = pCol->zName;
-      pConf->aEmit[n].iDeclPos = i;
-      pConf->aEmit[n].pNested = pCol->pNested;
-      pConf->aEmit[n].pShapeCols = pCols;
-      pConf->aEmit[n].zKeyParent = pCol->zKeyParent;
-      /* Recorded as an ordinal rather than a name because the declaration is
-      ** the interface: a body's SELECT need not spell its columns the way the
-      ** shape does, so "ORDER BY 2" is right where "ORDER BY post_id" would
-      ** depend on a coincidence. */
-      for(j=0; j<pCol->pNested->nParam; j++){
-        if( sqlite3StrICmp(pCol->pNested->a[j].zName, pCol->zKeyChild)==0 ){
-          pConf->aEmit[n].iKeyCol = j+1;
+    if( procEmitLevel(pParse, pProc, pConf, pS->pCols, iParent, &n) ) return 1;
+  }
+  return 0;
+}
+
+/*
+** PLAN-DEPTH: fill aEmit[iSelf] from pCols, then one emit per nested table
+** in PRE-ORDER -- a nested table's own descendants take the numbers right
+** after it, before its next sibling.  Every walk that numbers segments
+** (proc_info, proc_nested, SetProcShapes, this one) must agree on that
+** order; the conformance walk consumes the array sequentially, so the body's
+** SELECTs follow it too.
+**
+** iKeyCol is 1-based among the child's VALUE columns -- the ordinal the
+** child's SELECT actually has, which a count over all declared columns
+** (including nested ones) would misalign the moment a value column is
+** declared after a nested sibling.
+*/
+static int procEmitLevel(Parse *pParse, Proc *pProc, ProcConf *pConf,
+                         ProcParamList *pCols, int iSelf, int *pn){
+  int i, j, nScalar = 0, nNested = 0;
+
+  for(i=0; i<pCols->nParam; i++){
+    if( pCols->a[i].pNested ) nNested++; else nScalar++;
+  }
+  /* nScalar is what README-PROCS.md calls a VALUE COLUMN -- a column that
+  ** carries a value directly, as opposed to a nested table.  The user-facing
+  ** identity is columns = value columns + nested tables. */
+  pConf->aEmit[iSelf].nCol = nScalar;
+  pConf->aEmit[iSelf].nNested = nNested;
+  if( nScalar==0 ){
+    sqlite3ErrorMsg(pParse,
+      "result set of procedure %s declares only nested tables; a result "
+      "set must have at least one column of its own to correlate on",
+      pProc->zName);
+    return 1;
+  }
+  for(i=0; i<pCols->nParam; i++){
+    ProcParam *pCol = &pCols->a[i];
+    int iChild;
+    if( pCol->pNested==0 ) continue;
+    iChild = (*pn)++;
+    /* The parent side of the correlation must name a scalar column of the
+    ** IMMEDIATELY containing table -- never an ancestor beyond it. */
+    {
+      int nSeen = 0;
+      for(j=0; j<pCols->nParam; j++){
+        if( pCols->a[j].pNested ) continue;
+        nSeen++;
+        if( sqlite3StrICmp(pCols->a[j].zName, pCol->zKeyParent)==0 ){
+          pConf->aEmit[iChild].iParentKeyCol = nSeen;
           break;
         }
       }
-      assert( pConf->aEmit[n].iKeyCol>0 );  /* phase 1 validated the name */
-      n++;
+    }
+    if( pConf->aEmit[iChild].iParentKeyCol==0 ){
+      sqlite3ErrorMsg(pParse,
+        "nested table %s of procedure %s correlates on %s, which is not a "
+        "column of the result set that contains it",
+        pCol->zName, pProc->zName, pCol->zKeyParent);
+      return 1;
+    }
+    pConf->aEmit[iChild].zNested = pCol->zName;
+    pConf->aEmit[iChild].iDeclPos = i;
+    pConf->aEmit[iChild].pNested = pCol->pNested;
+    pConf->aEmit[iChild].pShapeCols = pCols;
+    pConf->aEmit[iChild].zKeyParent = pCol->zKeyParent;
+    /* Recorded as an ordinal rather than a name because the declaration is
+    ** the interface: a body's SELECT need not spell its columns the way the
+    ** shape does, so "ORDER BY 2" is right where "ORDER BY post_id" would
+    ** depend on a coincidence. */
+    {
+      int nVal = 0;
+      for(j=0; j<pCol->pNested->nParam; j++){
+        if( pCol->pNested->a[j].pNested ) continue;
+        nVal++;
+        if( sqlite3StrICmp(pCol->pNested->a[j].zName, pCol->zKeyChild)==0 ){
+          pConf->aEmit[iChild].iKeyCol = nVal;
+          break;
+        }
+      }
+    }
+    if( pConf->aEmit[iChild].iKeyCol==0 ){
+      sqlite3ErrorMsg(pParse,
+        "KEY of nested table %s of procedure %s names %s, which is not a "
+        "value column of that table",
+        pCol->zName, pProc->zName, pCol->zKeyChild);
+      return 1;
+    }
+    /* Recurse: this child's own emit values (nCol/nNested) and its
+    ** descendants' emits, before any sibling of this child. */
+    if( procEmitLevel(pParse, pProc, pConf, pCol->pNested, iChild, pn) ){
+      return 1;
     }
   }
   return 0;
@@ -2851,6 +2938,19 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
   if( (bCounts & PROC_OPT_COUNTS)!=0 && pProc->pFolds==0 ){
     sqlite3ErrorMsg(pParse,
       "procedure %s declares no nested table to count", pProc->zName);
+    goto call_cleanup;
+  }
+  /* PLAN-DEPTH v1: projection names only root columns and the interleave
+  ** merge has only one order, so both stop at one level of nesting.  Refused
+  ** with the reason, not silently mis-served. */
+  if( pProj && procShapeDepth(pProc)>1 ){
+    sqlite3ErrorMsg(pParse, "RETURNING is not supported for a procedure "
+      "whose nesting exceeds one level yet");
+    goto call_cleanup;
+  }
+  if( (bCounts & PROC_OPT_INTERLEAVED)!=0 && procShapeDepth(pProc)>1 ){
+    sqlite3ErrorMsg(pParse, "INTERLEAVED is not supported past one level of "
+      "nesting: a grandchild orders by its parent's key, not the root's");
     goto call_cleanup;
   }
   if( (bCounts & PROC_OPT_INTERLEAVED)!=0 ){
