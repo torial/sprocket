@@ -357,23 +357,6 @@ int main(int argc, char **argv){
       fputs("    var out: List(", out); emitIdentCap(zProc);
       fputs("Row) = []\n", out);
 
-      /* zebra-language BUG-260: a parameter whose only use is inside a bind
-      ** list is treated as unused -- the compiler emits a discard AND the
-      ** real use, and Zig rejects the pointless discard.  Each initializer
-      ** below is a visible use of one parameter; the local itself is
-      ** genuinely unused, so its own discard is legitimate.  NaN-safe and
-      ** control-flow-free, unlike an `if p != p` guard.  Delete this block
-      ** from the emitter when BUG-260 is fixed. */
-      if( nParam>0 ){
-        for(i=0; i<nCol; i++){
-          if( aCol[i].iSet!=0 ) continue;
-          fputs("    var b260_", out); emitIdent(aCol[i].zName);
-          fprintf(out, ": %s = ", zebraTypeName(typeOf(aCol[i].zDecl), 0));
-          emitIdent(aCol[i].zName);
-          fprintf(out, "   # visible use; zebra-language BUG-260\n");
-        }
-      }
-
       /* The query.  Nested procs opt into the @segments walk and project the
       ** fold columns away with RETURNING -- the typed client rebuilds the
       ** nesting itself, so paying the server-side JSON construction would be
