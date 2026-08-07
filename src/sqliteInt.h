@@ -4303,6 +4303,10 @@ struct ProcFold {
   int iDeclPos;             /* 0-based position within the shape */
   int iKeyCol;              /* 1-based key position among the child's columns */
   u8 bNeedsSort;            /* True if the imposed ordering costs a sort */
+  u8 bSortKnown;            /* True once bNeedsSort has been measured -- a
+                            ** zero that was never computed must not read as
+                            ** "no sort" (UNGIT principle 6: unknown is a
+                            ** value, not a default) */
   u8 bHandRolled;           /* Child SELECT nests a further level by hand */
 };
 
@@ -5470,6 +5474,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*, int);
   int sqlite3ProcProjKeeps(IdList*,const char*);
   int sqlite3ProcCallOption(Parse*,Token*);
+  const char *sqlite3ProcFoldKeyName(ProcFold*);
 /* Options on a CALL, a bitmask so they compose rather than multiply the
 ** grammar.  PROC_OPT_INTERLEAVED is accepted by the parser and REFUSED at
 ** CALL until the merge driver lands -- a flag that parses and silently does

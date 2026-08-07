@@ -1,0 +1,96 @@
+# 2026-08-06
+#
+# PRAGMA proc_check -- advisories as rows (UNGIT scar #1).  sqlite3_log is a
+# channel the stock CLI cannot display; a warning the default tool hides is
+# documentation instead of surface.  This pragma is the surface.
+#
+# The three-state story is the whole argument:
+#   1. before any CALL is prepared, the index answer is UNKNOWN -- and says
+#      so, because a zero nobody computed must not read as clean;
+#   2. after a CALL, the missing index is an advisory row;
+#   3. after CREATE INDEX and a fresh CALL, the row is GONE -- the check
+#      tracks reality, not history.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix proccheck
+
+do_execsql_test 0.0 {
+  CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT);
+  CREATE TABLE comments(post_id INTEGER, cid INTEGER);
+  INSERT INTO posts VALUES(1,'a'),(2,'b');
+  INSERT INTO comments VALUES(1,10),(1,11),(2,12);
+  CREATE PROCEDURE pwc()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid FROM comments;
+  END;
+} {}
+
+# State 1: nothing measured yet.
+do_execsql_test 1.0 {
+  PRAGMA proc_check(pwc);
+} {index comments {unknown until a CALL has been prepared on this connection; prepare one and re-run}}
+
+# State 2: a CALL has compiled; there is no index on comments(post_id).
+do_test 1.1 {
+  execsql {CALL pwc()}
+  execsql {PRAGMA proc_check(pwc)}
+} {index comments {the declared correlation comments.post_id requires an ordering that no index supplies; every CALL sorts this segment}}
+
+# State 3: the index exists; the schema change expires the compiled body, the
+# next CALL remeasures, and the advisory is gone.
+do_test 1.2 {
+  execsql {CREATE INDEX c_key ON comments(post_id)}
+  execsql {CALL pwc()}
+  execsql {PRAGMA proc_check(pwc)}
+} {}
+
+# A hand-rolled inner level reports through the same surface -- the row a
+# CLI user could never see in the log.
+do_execsql_test 2.0 {
+  CREATE TABLE addr(aid INTEGER PRIMARY KEY, cid INTEGER, t TEXT);
+  CREATE PROCEDURE hand()
+    RETURNS TABLE(id INTEGER,
+                  kids TABLE(post_id INTEGER, cid INTEGER, addrs TEXT)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT c.post_id, c.cid,
+           (SELECT json_group_array(json_object('t', a.t))
+              FROM addr a WHERE a.cid = c.cid)
+      FROM comments c;
+  END;
+  SELECT kind, subject FROM pragma_proc_check('hand');
+} {handrolled kids index kids}
+
+# NEGATIVE controls: a shapeless procedure and a missing name emit nothing --
+# and a depth-2 DECLARED procedure emits no handrolled row (procdeep 5.x pins
+# the log side; this pins the pragma side).
+do_execsql_test 3.0 {
+  CREATE PROCEDURE plain() BEGIN SELECT 1; END;
+  SELECT count(*) FROM pragma_proc_check('plain');
+} {0}
+do_execsql_test 3.1 {
+  SELECT count(*) FROM pragma_proc_check('no_such_proc');
+} {0}
+do_execsql_test 3.2 {
+  CREATE TABLE k3(cid INTEGER, aspect TEXT);
+  CREATE PROCEDURE deep3()
+    RETURNS TABLE(id INTEGER,
+                  claims TABLE(cid INTEGER, id INTEGER,
+                               confs TABLE(cid INTEGER, aspect TEXT)
+                                 KEY(cid = cid))
+                    KEY(id = id))
+  BEGIN
+    SELECT id FROM posts;
+    SELECT cid, post_id FROM comments;
+    SELECT cid, aspect FROM k3;
+  END;
+  SELECT count(*) FROM pragma_proc_check('deep3') WHERE kind='handrolled';
+} {0}
+
+finish_test

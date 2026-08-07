@@ -129,6 +129,11 @@ Introspection (both read the in-memory catalog; no storage change):
 PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments), declared
 PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
+PRAGMA [schema.]proc_check(name);   -- every advisory as ROWS: kind
+                                    -- ('handrolled' | 'index'), subject,
+                                    -- message.  The log channel made
+                                    -- queryable; an unmeasured answer says
+                                    -- "unknown until ...", never silence.
 PRAGMA [schema.]proc_nested(name);  -- one row per NESTED TABLE: its segment,
                                     -- the column it hangs from, key_child,
                                     -- key_parent.  proc_info shows a nested

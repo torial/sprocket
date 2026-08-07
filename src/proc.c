@@ -2891,6 +2891,24 @@ static void procNoteChildSort(Vdbe *v, int iStart, Proc *pProc,
     }
   }
   pF->bNeedsSort = (u8)bSort;
+  pF->bSortKnown = 1;
+}
+
+/*
+** The declared name of a fold's correlation key.  iKeyCol is an ordinal
+** among VALUE columns (PLAN-DEPTH), so indexing a[iKeyCol-1] directly is
+** wrong the moment a nested sibling precedes the key -- which is exactly how
+** procAdviseIndexes was indexing it until proc_check was built and the
+** shared helper was written.
+*/
+const char *sqlite3ProcFoldKeyName(ProcFold *pF){
+  int i, nVal = 0;
+  for(i=0; i<pF->pNested->nParam; i++){
+    if( pF->pNested->a[i].pNested ) continue;
+    nVal++;
+    if( nVal==pF->iKeyCol ) return pF->pNested->a[i].zName;
+  }
+  return "?";
 }
 
 /*
@@ -2906,8 +2924,7 @@ static void procAdviseIndexes(Proc *pProc){
     if( pF->bNeedsSort==0 ) continue;
     sqlite3_log(SQLITE_WARNING,
       "procedure %s: the declared correlation %s.%s requires an ordering that "
-      "no index supplies", pProc->zName, pF->zName,
-      pF->pNested->a[pF->iKeyCol-1].zName);
+      "no index supplies", pProc->zName, pF->zName, sqlite3ProcFoldKeyName(pF));
   }
   for(pF=pProc->pFolds; pF; pF=pF->pNext){
     if( pF->bHandRolled==0 ) continue;

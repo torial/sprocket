@@ -1594,6 +1594,57 @@ void sqlite3Pragma(
   break;
 
   /*
+  **   PRAGMA [schema.]proc_check(procedure-name)
+  **
+  ** Every advisory the engine knows about a procedure, as ROWS -- because
+  ** sqlite3_log is a channel the stock CLI cannot display, and a warning the
+  ** default tool hides is documentation instead of surface (UNGIT scar #1).
+  ** One row per finding: kind ('handrolled' | 'index'), the nested table it
+  ** concerns, and the same message the log carries.  An index answer that
+  ** has not been measured yet says so explicitly ('unknown until ...')
+  ** rather than reading as clean: a zero nobody computed is not a zero.
+  */
+  case PragTyp_PROC_CHECK: if( zRight ){
+    Proc *pProc = 0;
+    int ii;
+    pParse->nMem = 3;
+    for(ii=0; ii<db->nDb && pProc==0; ii++){
+      Schema *pSchema = db->aDb[ii].pSchema;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+      pProc = (Proc*)sqlite3HashFind(&pSchema->procHash, zRight);
+    }
+    if( pProc ){
+      ProcFold *pF;
+      for(pF=pProc->pFolds; pF; pF=pF->pNext){
+        if( pF->bHandRolled ){
+          char *z = sqlite3_mprintf("nested table %s builds a further level "
+            "by hand; that inner correlation is not checked, not ordered by "
+            "the engine, and not covered by WITH COUNTS", pF->zName);
+          if( z ){
+            sqlite3VdbeMultiLoad(v, 1, "sss", "handrolled", pF->zName, z);
+            sqlite3_free(z);
+          }
+        }
+        if( !pF->bSortKnown ){
+          sqlite3VdbeMultiLoad(v, 1, "sss", "index", pF->zName,
+            "unknown until a CALL has been prepared on this connection; "
+            "prepare one and re-run");
+        }else if( pF->bNeedsSort ){
+          char *z = sqlite3_mprintf("the declared correlation %s.%s requires "
+            "an ordering that no index supplies; every CALL sorts this "
+            "segment", pF->zName, sqlite3ProcFoldKeyName(pF));
+          if( z ){
+            sqlite3VdbeMultiLoad(v, 1, "sss", "index", pF->zName, z);
+            sqlite3_free(z);
+          }
+        }
+      }
+    }
+  }
+  break;
+
+  /*
   **   PRAGMA [schema.]proc_nested(procedure-name)
   **
   ** One row per NESTED TABLE: the segment index its rows stream as, the
