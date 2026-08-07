@@ -194,4 +194,66 @@ do_test 4.0 {
   set r
 } {w2 w1 c2 c0 c1}
 
+#--------------------------------------------------------------------
+# 5.x: the 3g advisory and the DECLARED deep form (PLAN-DEPTH test 6)
+#
+# The advisory exists for hand-rolled inner levels.  The declared form now
+# reaches the same depth with every guarantee intact, so it must NOT fire --
+# and the hand-rolled form still must, or the detector died in the change.
+#
+test_sqlite3_log [list lappend ::deeplog]
+do_test 5.0 {
+  db close
+  sqlite3 db :memory:
+  db eval {
+    CREATE TABLE w2(wid INTEGER PRIMARY KEY);
+    CREATE TABLE c2(cid INTEGER PRIMARY KEY, wid INTEGER);
+    CREATE TABLE k2(cid INTEGER, aspect TEXT);
+    CREATE PROCEDURE declared2()
+      RETURNS TABLE(wid INTEGER,
+                    claims TABLE(cid INTEGER, wid INTEGER,
+                                 confs TABLE(cid INTEGER, aspect TEXT)
+                                   KEY(cid = cid))
+                      KEY(wid = wid))
+    BEGIN
+      SELECT wid FROM w2;
+      SELECT cid, wid FROM c2;
+      SELECT cid, aspect FROM k2;
+    END;
+  }
+  set ::deeplog [list]
+  db eval {CALL declared2()}
+  set hit 0
+  foreach {code msg} $::deeplog {
+    if {[string match {*by hand*} $msg]} { set hit 1 }
+  }
+  set hit
+} {0}
+
+# POSITIVE control in the same session: the hand-rolled form still fires.
+# Without this, 5.0 passes just as well against a detector that died.
+do_test 5.1 {
+  db eval {
+    CREATE PROCEDURE hand2()
+      RETURNS TABLE(wid INTEGER,
+                    claims TABLE(cid INTEGER, wid INTEGER, confs TEXT)
+                      KEY(wid = wid))
+    BEGIN
+      SELECT wid FROM w2;
+      SELECT c.cid, c.wid,
+             (SELECT json_group_array(json_object('a', k.aspect))
+                FROM k2 k WHERE k.cid = c.cid)
+        FROM c2 c;
+    END;
+  }
+  set ::deeplog [list]
+  db eval {CALL hand2()}
+  set hit 0
+  foreach {code msg} $::deeplog {
+    if {[string match {*by hand*} $msg]} { set hit 1 }
+  }
+  set hit
+} {1}
+test_sqlite3_log
+
 finish_test
