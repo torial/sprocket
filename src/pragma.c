@@ -1640,6 +1640,31 @@ void sqlite3Pragma(
           }
         }
       }
+      /* The cache tier: silent when cached (fine needs no row), a named
+      ** reason when the body compiles per statement, and an explicit
+      ** "unknown" before any plain CALL has compiled. */
+      switch( pProc->eCachePlan ){
+        case PROC_CACHE_OK: break;
+        case PROC_CACHE_UNKNOWN:
+          sqlite3VdbeMultiLoad(v, 1, "sss", "cache", pProc->zName,
+            "unknown until a CALL has been prepared on this connection; "
+            "prepare one and re-run");
+          break;
+        default: {
+          static const char *azWhy[] = { 0, 0,
+            "the procedure lives in the TEMP schema",
+            "the database uses shared-cache mode",
+            "the body touches an AUTOINCREMENT table",
+            "the body fires a trigger or CALLs another procedure" };
+          char *z = sqlite3_mprintf("compiles per prepared statement: %s",
+                      azWhy[pProc->eCachePlan]);
+          if( z ){
+            sqlite3VdbeMultiLoad(v, 1, "sss", "cache", pProc->zName, z);
+            sqlite3_free(z);
+          }
+          break;
+        }
+      }
     }
   }
   break;

@@ -33,7 +33,7 @@ do_execsql_test 0.0 {
 # State 1: nothing measured yet.
 do_execsql_test 1.0 {
   PRAGMA proc_check(pwc);
-} {index comments {unknown until a CALL has been prepared on this connection; prepare one and re-run}}
+} {index comments {unknown until a CALL has been prepared on this connection; prepare one and re-run} cache pwc {unknown until a CALL has been prepared on this connection; prepare one and re-run}}
 
 # State 2: a CALL has compiled; there is no index on comments(post_id).
 do_test 1.1 {
@@ -65,14 +65,20 @@ do_execsql_test 2.0 {
       FROM comments c;
   END;
   SELECT kind, subject FROM pragma_proc_check('hand');
-} {handrolled kids index kids}
+} {handrolled kids index kids cache hand}
 
 # NEGATIVE controls: a shapeless procedure and a missing name emit nothing --
 # and a depth-2 DECLARED procedure emits no handrolled row (procdeep 5.x pins
 # the log side; this pins the pragma side).
+# The cache tier has its own three-state: unknown before a CALL, silent when
+# cached (fine needs no row), a named reason when disqualified (4.x below).
 do_execsql_test 3.0 {
   CREATE PROCEDURE plain() BEGIN SELECT 1; END;
   SELECT count(*) FROM pragma_proc_check('plain');
+} {1}
+do_test 3.0b {
+  execsql {CALL plain()}
+  execsql {SELECT count(*) FROM pragma_proc_check('plain')}
 } {0}
 do_execsql_test 3.1 {
   SELECT count(*) FROM pragma_proc_check('no_such_proc');
@@ -92,5 +98,23 @@ do_execsql_test 3.2 {
   END;
   SELECT count(*) FROM pragma_proc_check('deep3') WHERE kind='handrolled';
 } {0}
+
+#--------------------------------------------------------------------
+# 4.x: the cache tier's DISQUALIFIED state names its reason -- the invisible
+# performance cliff (UNGIT scar #4) made a row.
+do_test 4.0 {
+  execsql {
+    CREATE PROCEDURE inner_p() RETURNS NOTHING BEGIN
+      INSERT INTO posts VALUES(99,'x');
+      DELETE FROM posts WHERE id=99;
+    END;
+    CREATE PROCEDURE outer_p() BEGIN
+      CALL inner_p();
+      SELECT count(*) FROM posts;
+    END;
+  }
+  execsql {CALL outer_p()}
+  execsql {PRAGMA proc_check(outer_p)}
+} {cache outer_p {compiles per prepared statement: the body fires a trigger or CALLs another procedure}}
 
 finish_test

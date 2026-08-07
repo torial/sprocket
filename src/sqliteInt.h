@@ -4320,7 +4320,19 @@ struct Proc {
   u8 eRet;                  /* One of the PROC_RET_* values */
   u8 bDefiner;              /* True for SECURITY DEFINER: body is not
                             ** authorized.  Default 0 = SECURITY INVOKER. */
+  u8 eCachePlan;            /* PROC_CACHE_*: why the compiled body is or is
+                            ** not shared across statements.  UNKNOWN until a
+                            ** plain CALL has compiled -- surfaced by PRAGMA
+                            ** proc_check, where an uncomputed answer must
+                            ** say so rather than read as fine (UNGIT #6). */
 };
+
+#define PROC_CACHE_UNKNOWN  0   /* No plain CALL compiled yet */
+#define PROC_CACHE_OK       1   /* Cached: prepares skip body compilation */
+#define PROC_CACHE_TEMP     2   /* TEMP-schema procedure */
+#define PROC_CACHE_SHARED   3   /* Shared-cache database */
+#define PROC_CACHE_AUTOINC  4   /* Body touches an AUTOINCREMENT table */
+#define PROC_CACHE_SUBPROG  5   /* Body fires a trigger or CALLs a procedure */
 
 /*
 ** One entry in the per-connection cache of compiled procedure bodies

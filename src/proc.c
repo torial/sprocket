@@ -2781,12 +2781,28 @@ static void procCachePopulate(
   int i;
 
   assert( pParse->pToplevel==0 );
-  if( iDb<0 || iDb==1 ) return;
-  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSharable(db->aDb[iDb].pBt) ) return;
-  if( (void*)pParse->pAinc!=pAincBefore ) return;
+  /* Each refusal RECORDS ITS REASON on the Proc before returning, so PRAGMA
+  ** proc_check can answer "why does this procedure compile per statement?"
+  ** -- an invisible performance tier is UNGIT scar #4, and the reason was
+  ** already known right here; it was just thrown away. */
+  if( iDb<0 || iDb==1 ){
+    pProc->eCachePlan = PROC_CACHE_TEMP;
+    return;
+  }
+  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSharable(db->aDb[iDb].pBt) ){
+    pProc->eCachePlan = PROC_CACHE_SHARED;
+    return;
+  }
+  if( (void*)pParse->pAinc!=pAincBefore ){
+    pProc->eCachePlan = PROC_CACHE_AUTOINC;
+    return;
+  }
   if( pProg==0 || pProg->aOp==0 ) return;
   for(i=0; i<pProg->nOp; i++){
-    if( pProg->aOp[i].p4type==P4_SUBPROGRAM ) return;
+    if( pProg->aOp[i].p4type==P4_SUBPROGRAM ){
+      pProc->eCachePlan = PROC_CACHE_SUBPROG;
+      return;
+    }
   }
 
   /* Replace any existing (now stale) entry for this procedure */
@@ -2819,6 +2835,7 @@ static void procCachePopulate(
   }
   pE->pNext = db->pProcCache;
   db->pProcCache = pE;
+  pProc->eCachePlan = PROC_CACHE_OK;
 }
 
 /*
