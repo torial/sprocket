@@ -996,6 +996,16 @@ EXPLAIN error-surfacing asymmetry observed on the pre-fix ordinal -- the same
 resolution failure was loud under EXPLAIN and silent at CALL, which deserves
 an entry of its own if it reproduces on a deliberately broken input.
 
+### CLOSED 2026-08-08 -- RETURNING x INTERLEAVED is refused BY DESIGN, permanently
+
+RETURNING exists to decline fold columns a flat client would otherwise pay
+for.  INTERLEAVED computes no folds, so there is nothing to project away:
+the composition has no purpose, and building it would be surface without
+meaning.  The refusal message stands as the permanent behavior.  (bugbook
+BUG-5, closed wontfix.)  COUNTS x INTERLEAVED remains genuinely buildable --
+the count is a parent-arm column and would arrive before the children -- and
+waits for a consumer to exist (bugbook BUG-4).
+
 ### The implementation fork, probed 2026-08-06 — rewrite vs driver
 
 Planning the codegen exposed two materially different implementations, so the
