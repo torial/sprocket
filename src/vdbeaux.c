@@ -3009,6 +3009,59 @@ static int vdbeProcShapeFill(Vdbe *p, sqlite3 *db, ProcParamList *pC,
   return 0;
 }
 
+/*
+** UNGIT scar #3: attach per-segment descriptors for an INTERLEAVED call --
+** value columns only (the disjoint payload carries no fold or count
+** columns), each with its slice offset into the row.  Never applied to the
+** statement header; this is purely the lookup table behind the
+** sqlite3_proc_column_* / sqlite3_proc_row_* read family, whose name
+** pointers are therefore stable for the statement's whole life.
+** Depth >= 2 is refused at CALL for interleave, so one level is walked.
+*/
+void sqlite3VdbeSetProcInterleave(Vdbe *p, Proc *pProc){
+  sqlite3 *db = p->db;
+  ProcParamList *pC = pProc->pShapes->pCols;
+  ProcFold *pF;
+  int nSet = 1, i, iSet, iOff;
+
+  for(pF=pProc->pFolds; pF; pF=pF->pNext) nSet++;
+  if( nSet>255 ) return;
+  p->aProcSet = sqlite3DbMallocZero(db, nSet*sizeof(VdbeProcSet));
+  if( p->aProcSet==0 ) return;
+  p->nProcSet = (u8)nSet;
+  p->bProcInter = 1;
+
+  iOff = 2;                                  /* after _segment, _key */
+  for(iSet=0; iSet<nSet; iSet++){
+    VdbeProcSet *pDest = &p->aProcSet[iSet];
+    int nVal = 0, k = 0;
+    ProcParamList *pList;
+    if( iSet==0 ){
+      pList = pC;
+      for(i=0; i<pList->nParam; i++){
+        if( pList->a[i].pNested==0 ) nVal++;
+      }
+    }else{
+      ProcFold *pWalk = pProc->pFolds;
+      for(i=1; i<iSet; i++) pWalk = pWalk->pNext;
+      pList = pWalk->pNested;
+      nVal = pList->nParam;
+    }
+    pDest->nCol = (u16)nVal;
+    pDest->iRowOff = (u16)iOff;
+    pDest->azName = sqlite3DbMallocZero(db, (nVal+1)*sizeof(char*));
+    pDest->azType = sqlite3DbMallocZero(db, (nVal+1)*sizeof(char*));
+    if( pDest->azName==0 || pDest->azType==0 ) return;
+    for(i=0; i<pList->nParam; i++){
+      if( iSet==0 && pList->a[i].pNested ) continue;
+      pDest->azName[k] = sqlite3DbStrDup(db, pList->a[i].zName);
+      pDest->azType[k] = sqlite3DbStrDup(db, pList->a[i].zType);
+      k++;
+    }
+    iOff += nVal;
+  }
+}
+
 void sqlite3VdbeSetProcShapes(Vdbe *p, ProcShape *pShapes, IdList *pProj,
                               int bCounts){
   sqlite3 *db = p->db;

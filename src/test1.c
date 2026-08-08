@@ -5663,6 +5663,52 @@ static int SQLITE_TCLAPI test_norm_sql(
 */
 #ifndef SQLITE_OMIT_PROCEDURE
 /*
+** Usage: sqlite3_proc_family STMT SUBCMD ARGS...
+**   segment_count | column_count SEG | column_name SEG COL |
+**   column_decltype SEG COL | row_value COL
+** Out-of-range answers surface as {} rather than an error, mirroring the
+** C API's 0-not-fabricated rule.
+*/
+static int SQLITE_TCLAPI test_proc_family(
+  void * clientData,
+  Tcl_Interp *interp,
+  int objc,
+  Tcl_Obj *CONST objv[]
+){
+  sqlite3_stmt *pStmt;
+  const char *zSub;
+  int a1 = 0, a2 = 0;
+
+  if( objc<3 ){
+    Tcl_WrongNumArgs(interp, 1, objv, "STMT SUBCMD ?ARGS?");
+    return TCL_ERROR;
+  }
+  if( getStmtPointer(interp, Tcl_GetString(objv[1]), &pStmt) ) return TCL_ERROR;
+  zSub = Tcl_GetString(objv[2]);
+  if( objc>3 && Tcl_GetIntFromObj(interp, objv[3], &a1) ) return TCL_ERROR;
+  if( objc>4 && Tcl_GetIntFromObj(interp, objv[4], &a2) ) return TCL_ERROR;
+  if( strcmp(zSub, "segment_count")==0 ){
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_proc_segment_count(pStmt)));
+  }else if( strcmp(zSub, "column_count")==0 ){
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_proc_column_count(pStmt, a1)));
+  }else if( strcmp(zSub, "column_name")==0 ){
+    const char *z = sqlite3_proc_column_name(pStmt, a1, a2);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(z ? z : "", -1));
+  }else if( strcmp(zSub, "column_decltype")==0 ){
+    const char *z = sqlite3_proc_column_decltype(pStmt, a1, a2);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(z ? z : "", -1));
+  }else if( strcmp(zSub, "row_value")==0 ){
+    sqlite3_value *pV = sqlite3_proc_row_value(pStmt, a1);
+    const char *z = pV ? (const char*)sqlite3_value_text(pV) : 0;
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(z ? z : "", -1));
+  }else{
+    Tcl_AppendResult(interp, "unknown subcommand", 0);
+    return TCL_ERROR;
+  }
+  return TCL_OK;
+}
+
+/*
 ** Usage: sqlite3_proc_current_segment STMT
 **
 ** Zero-based index of the segment the statement is positioned on, or -1 if
@@ -9281,6 +9327,7 @@ int Sqlitetest1_Init(Tcl_Interp *interp){
      { "sqlite3_proc_next_resultset",   test_proc_next_resultset ,0 },
      { "sqlite3_proc_child_count",      test_proc_child_count ,0 },
      { "sqlite3_proc_current_segment",  test_proc_current_segment ,0 },
+     { "sqlite3_proc_family",           test_proc_family ,0 },
 #endif
      { "sqlite3_data_count",            test_data_count    ,0 },
      { "sqlite3_column_type",           test_column_type   ,0 },

@@ -966,7 +966,59 @@ int sqlite3_proc_current_segment(sqlite3_stmt *pStmt){
   if( p==0 ) return -1;
 #endif
   if( p==0 || p->aProcSet==0 ) return -1;
+  if( p->bProcInter ){
+    /* Interleaved: the _segment column is the truth, per row. */
+    if( p->pResultRow==0 ) return -1;
+    return sqlite3_value_int((sqlite3_value*)&p->pResultRow[0]);
+  }
   return p->iProcSet;
+}
+
+/*
+** The sqlite3_proc_* READ FAMILY (UNGIT scar #3): per-segment metadata and
+** per-row values, unconstrained by the standard surface's one-header-per-
+** statement shape.  All are plain reads of descriptors built at prepare;
+** name/decltype pointers are stable until finalize.
+*/
+int sqlite3_proc_segment_count(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 || p->aProcSet==0 ) return 0;
+  return p->nProcSet;
+}
+int sqlite3_proc_column_count(sqlite3_stmt *pStmt, int iSeg){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 || p->aProcSet==0 || iSeg<0 || iSeg>=p->nProcSet ) return 0;
+  return p->aProcSet[iSeg].nCol - p->aProcSet[iSeg].nHidden;
+}
+const char *sqlite3_proc_column_name(sqlite3_stmt *pStmt, int iSeg, int iCol){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 || p->aProcSet==0 || iSeg<0 || iSeg>=p->nProcSet ) return 0;
+  if( iCol<0 || iCol>=p->aProcSet[iSeg].nCol - p->aProcSet[iSeg].nHidden ){
+    return 0;
+  }
+  return p->aProcSet[iSeg].azName[iCol];
+}
+const char *sqlite3_proc_column_decltype(sqlite3_stmt *pStmt, int iSeg,
+                                         int iCol){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 || p->aProcSet==0 || iSeg<0 || iSeg>=p->nProcSet ) return 0;
+  if( iCol<0 || iCol>=p->aProcSet[iSeg].nCol - p->aProcSet[iSeg].nHidden ){
+    return 0;
+  }
+  return p->aProcSet[iSeg].azType[iCol];
+}
+sqlite3_value *sqlite3_proc_row_value(sqlite3_stmt *pStmt, int iCol){
+  Vdbe *p = (Vdbe*)pStmt;
+  int iSeg;
+  if( p==0 || p->aProcSet==0 || p->pResultRow==0 || iCol<0 ) return 0;
+  if( p->bProcInter ){
+    iSeg = sqlite3_value_int((sqlite3_value*)&p->pResultRow[0]);
+    if( iSeg<0 || iSeg>=p->nProcSet ) return 0;
+    if( iCol>=p->aProcSet[iSeg].nCol ) return 0;
+    return (sqlite3_value*)&p->pResultRow[p->aProcSet[iSeg].iRowOff + iCol];
+  }
+  if( iCol>=p->nResColumn - p->nHiddenCol ) return 0;
+  return (sqlite3_value*)&p->pResultRow[iCol];
 }
 
 int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){
@@ -976,7 +1028,8 @@ int sqlite3_proc_next_resultset(sqlite3_stmt *pStmt){
   if( p==0 ) return SQLITE_MISUSE_BKPT;
   db = p->db;
   sqlite3_mutex_enter(db->mutex);
-  if( p->aProcSet==0 ){
+  if( p->aProcSet==0 || p->bProcInter ){
+    /* Interleaved mode has no boundaries to advance over. */
     rc = SQLITE_MISUSE_BKPT;
   }else if( p->bAtSetEnd==0 ){
     /* Either the statement has not reached the end of the current set, or

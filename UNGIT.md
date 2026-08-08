@@ -33,8 +33,8 @@ whose daily experience teaches learned helplessness.*
 |---|---|---|---|
 | 1 | Advisories go to `sqlite3_log`, which the stock CLI cannot display | our most protective warnings reach a channel the default tool hides; documentation instead of surface | **PRAGMA proc_check(name)** — advisories as SELECT-able rows (built 2026-08-06) |
 | 2 | `@segments` magic string in the zebra seam | a mode selected by incantation inside another language | dies when zebra BUG-271 (unknown methods stamped void) is fixed; becomes a real `query_segments` method |
-| 3 | `WITH INTERLEAVED` child payloads are positional (`_pad2` columns, parent names over child values) | fine for generated code, hostile to a human at a console | acceptable while opt-in + procgen-owned; if humans start typing it, revisit (per-segment names need the metadata channel the one-result-set design traded away — a real tension, not an oversight) |
-| 4 | Silent performance tiers (body-cache disqualification; fold computed whether or not read) | invisible cost cliffs train helplessness | surface through proc_check as rows ("does not cache because ..."); fold cost already documented at the site and declinable via RETURNING |
+| 3 | ~~`WITH INTERLEAVED` child payloads were positional~~ | **REMOVED 2026-08-07**, two ways at once: the DISJOINT layout (payload = concatenation of slices, one header honest for every row, `SELECT *` correct in any tool) and the `sqlite3_proc_*` read family (per-segment metadata with statement-lifetime pointer stability, per-row values mapped by the row's own segment). The "one header per statement" constraint belonged to the standard API, not to us — Sean's reframe. |
+| 4 | ~~Silent performance tiers~~ | **REMOVED 2026-08-06**: cache disqualification reasons surface through proc_check as rows; fold cost documented at the site and declinable via RETURNING |
 
 ## The test for every new surface
 

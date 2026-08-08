@@ -439,6 +439,7 @@ struct VdbeProcSet {
   u16 nHidden;            /* Trailing columns that are engine bookkeeping */
   char **azName;          /* Column names */
   char **azType;          /* Declared types; entries may be NULL */
+  u16 iRowOff;            /* Interleaved: payload slice start (2+offset) */
 };
 #endif
 struct ScanStatus {
@@ -518,6 +519,8 @@ struct Vdbe {
   u8 iProcSet;            /* Set currently being delivered */
   u16 nHiddenCol;         /* Trailing result columns not shown to clients */
   u8 bAtSetEnd;           /* True when paused at a result-set boundary */
+  u8 bProcInter;          /* WITH INTERLEAVED: aProcSet is a lookup table
+                          ** for the proc_* read family, never applied */
 #endif
   u8 errorAction;         /* Recovery action to do in case of an error */
   u8 minWriteFileFormat;  /* Minimum file format for writable database files */

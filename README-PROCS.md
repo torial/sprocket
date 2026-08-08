@@ -262,16 +262,19 @@ merged by the engine in a single pass: each parent row followed by its own
 children, in correlation-key order.
 
 ```
-_segment | _key | payload columns (padded to the widest arm)
-    0    |  1   | 1  first          <- parent, value columns
-    1    |  1   | 1  10             <- its comments, positionally
-    2    |  1   | 1  sql   5        <- its tags
-    0    |  2   | 2  second ...
+_segment | _key | id  title | post_id cid | post_id tag  weight
+    0    |  1   | 1   first |             |                       <- parent
+    1    |  1   |           | 1       10  |                       <- its comment
+    2    |  1   |           |             | 1       sql  5        <- its tag
+    0    |  2   | 2   second ...
 ```
 
-Read `_segment` to know a row's shape; child payloads are positional
-(result column 2+j is child column j) and the visible names come from the
-parent.  There are no segment boundaries: `sqlite3_step()` runs straight
+The payload is DISJOINT: parent columns, then each nested table's columns,
+each row filling only its own slice and NULL elsewhere -- so the single
+header is honest for every row at once, and a plain `SELECT *` in any tool
+reads correctly with no positional arithmetic.  (A NULL costs one
+serial-type byte; honesty is nearly free.)  Read `_segment` to know a row's
+shape, or skip the arithmetic entirely with the read family below.  There are no segment boundaries: `sqlite3_step()` runs straight
 through, `sqlite3_proc_current_segment()` reports −1 (the discriminator is
 the column), and `sqlite3_proc_next_resultset()` is `SQLITE_MISUSE`.
 Because the merge needs one order, every nested table must correlate on the
@@ -296,6 +299,16 @@ sqlite3_proc_current_segment(stmt);  -- 0-based segment now positioned on,
                                      -- reading a column a segment lacks
                                      -- yields NULL, not an error.
 sqlite3_proc_child_count(stmt, N);   -- WITH COUNTS, on parent rows
+
+sqlite3_proc_segment_count(stmt);          -- segments this statement carries
+sqlite3_proc_column_count(stmt, iSeg);     -- arity of segment iSeg
+sqlite3_proc_column_name(stmt, iSeg, iCol);     -- STABLE until finalize
+sqlite3_proc_column_decltype(stmt, iSeg, iCol); -- (unlike column_name)
+sqlite3_proc_row_value(stmt, iCol);  -- current row's value, mapped per the
+                                     -- row's OWN segment; under INTERLEAVED
+                                     -- the slice offsets are applied
+                                     -- internally.  Out of range returns 0,
+                                     -- never a fabricated answer.
 ```
 
 ## What it costs — measured, 2026-08-04

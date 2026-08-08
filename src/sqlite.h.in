@@ -5661,6 +5661,32 @@ int sqlite3_proc_child_count(sqlite3_stmt*, int);
 int sqlite3_proc_current_segment(sqlite3_stmt*);
 
 /*
+** CAPI3REF: Per-Segment Metadata And Per-Row Values
+** METHOD: sqlite3_stmt
+**
+** The proc read family.  A statement over a shape-declaring CALL holds ALL
+** of its segments' metadata at once; the standard column interfaces can
+** only present one segment at a time because they carry one header per
+** statement.  These routines are not so constrained.
+**
+** ^sqlite3_proc_segment_count() returns how many segments the statement
+** carries (0 if it is not a shape-declaring CALL).  ^The _column_ routines
+** describe segment iSeg without moving the cursor; the returned pointers
+** are stable until the statement is finalized -- unlike
+** sqlite3_column_name(), whose value is invalidated by the next metadata
+** switch.  ^sqlite3_proc_row_value() returns the current row's iCol-th
+** value MAPPED PER ITS OWN SEGMENT: under WITH INTERLEAVED the row's
+** _segment column selects the mapping and the disjoint slice offsets are
+** applied internally, so a consumer never does positional arithmetic.
+** Out-of-range arguments return 0 rather than a fabricated answer.
+*/
+int sqlite3_proc_segment_count(sqlite3_stmt*);
+int sqlite3_proc_column_count(sqlite3_stmt*, int iSeg);
+const char *sqlite3_proc_column_name(sqlite3_stmt*, int iSeg, int iCol);
+const char *sqlite3_proc_column_decltype(sqlite3_stmt*, int iSeg, int iCol);
+sqlite3_value *sqlite3_proc_row_value(sqlite3_stmt*, int iCol);
+
+/*
 ** CAPI3REF: Destroy A Prepared Statement Object
 ** DESTRUCTOR: sqlite3_stmt
 **

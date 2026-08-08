@@ -251,7 +251,7 @@ do_execsql_test 5.2 {
 #
 do_execsql_test 6.0 {
   CALL atlas() WITH INTERLEAVED;
-} {0 1 1 first {} 1 1 1 10 {} 1 1 1 11 {} 2 1 1 sql 5 0 2 2 second {} 1 2 2 12 {} 2 2 2 zig 7}
+} {0 1 1 first {} {} {} {} {} 1 1 {} {} 1 10 {} {} {} 1 1 {} {} 1 11 {} {} {} 2 1 {} {} {} {} 1 sql 5 0 2 2 second {} {} {} {} {} 1 2 {} {} 2 12 {} {} {} 2 2 {} {} {} {} 2 zig 7}
 
 # The column-name contract: arm 0 names the compound.
 do_test 6.1 {
@@ -263,7 +263,7 @@ do_test 6.1 {
   }
   sqlite3_finalize $S
   set r
-} {_segment _key id title _pad2}
+} {_segment _key id title post_id cid post_id tag weight}
 
 # Under interleaving there are no segment boundaries: current_segment is -1
 # (the row's segment is the _segment COLUMN), and next_resultset is misuse.
@@ -273,7 +273,7 @@ do_test 6.2 {
   set r [list [sqlite3_proc_current_segment $S] [sqlite3_proc_next_resultset $S]]
   sqlite3_finalize $S
   set r
-} {-1 SQLITE_MISUSE}
+} {0 SQLITE_MISUSE}
 
 # Refusals: compositions and shapes the rewrite cannot serve.
 do_catchsql_test 6.3 {
@@ -321,7 +321,7 @@ do_execsql_test 6.9 {
 } {}
 do_execsql_test 6.10 {
   CALL atlas2() WITH INTERLEAVED;
-} {0 1 1 first 1 1 1 11 1 1 1 10 0 2 2 second 1 2 2 12}
+} {0 1 1 first {} {} 1 1 {} {} 1 11 1 1 {} {} 1 10 0 2 2 second {} {} 1 2 {} {} 2 12}
 
 # 6.11: the regression 6.10 exposed, pinned on the PLAIN path: a child with
 # an author ORDER BY must still produce a real fold.  Before the fix the
@@ -342,5 +342,42 @@ do_catchsql_test 6.12 {
     SELECT post_id, cid FROM comments ORDER BY cid DESC LIMIT 5;
   END;
 } {1 {the SELECT for nested table comments of procedure badlim may not use LIMIT: its meaning per parent row is undefined}}
+
+#--------------------------------------------------------------------
+# 7.x: the sqlite3_proc_* READ FAMILY (UNGIT scar #3 companion)
+#
+# Per-segment metadata without moving the cursor, per-row values mapped by
+# the row's own segment.  NOTE the deliberate asymmetry: SEGMENTED
+# descriptors describe the wire (all declared columns, folds included);
+# INTERLEAVED descriptors describe the disjoint payload (value columns
+# only), because that is what each protocol actually carries.
+#
+do_test 7.0 {
+  set S [sqlite3_prepare_v2 db {CALL atlas()} -1 TAIL]
+  set r [list [sqlite3_proc_family $S segment_count]               [sqlite3_proc_family $S column_count 0]               [sqlite3_proc_family $S column_name 0 2]               [sqlite3_proc_family $S column_count 1]               [sqlite3_proc_family $S column_name 1 1]               [sqlite3_proc_family $S column_name 2 2]               [sqlite3_proc_family $S column_decltype 2 2]]
+  sqlite3_finalize $S
+  set r
+} {3 4 comments 2 cid weight INTEGER}
+
+do_test 7.1 {
+  set S [sqlite3_prepare_v2 db {CALL atlas() WITH INTERLEAVED} -1 TAIL]
+  set r [list [sqlite3_proc_family $S segment_count]               [sqlite3_proc_family $S column_count 0]               [sqlite3_proc_family $S column_name 0 1]               [sqlite3_proc_family $S column_name 1 0]               [sqlite3_proc_family $S column_name 2 2]]
+  sqlite3_step $S            ;# parent row (1, first)
+  lappend r [sqlite3_proc_current_segment $S]             [sqlite3_proc_family $S row_value 0]             [sqlite3_proc_family $S row_value 1]             [sqlite3_proc_family $S row_value 5]
+  sqlite3_step $S            ;# first comment row (1, 10)
+  lappend r [sqlite3_proc_current_segment $S]             [sqlite3_proc_family $S row_value 0]             [sqlite3_proc_family $S row_value 1]
+  sqlite3_finalize $S
+  set r
+} {3 2 title post_id weight 0 1 first {} 1 1 10}
+
+# NEGATIVE control: the family reports 0/{} off a plain SELECT, never a
+# fabricated answer.
+do_test 7.2 {
+  set S [sqlite3_prepare_v2 db {SELECT 1,2} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_proc_family $S segment_count]               [sqlite3_proc_family $S column_name 0 0]               [sqlite3_proc_family $S row_value 0]]
+  sqlite3_finalize $S
+  set r
+} {0 {} {}}
 
 finish_test

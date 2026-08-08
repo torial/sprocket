@@ -936,10 +936,11 @@ static Select *procInterArm(
   Parse *pParse,
   Select *pDup,
   int iSeg,
-  int iKey,
-  int nPay,
-  int W,
-  ProcParamList *pNames
+  int iKey,                 /* 0-based key position within THIS arm's slice */
+  int nPay,                 /* this arm's own column count */
+  int iOff,                 /* where its slice starts in the total payload */
+  int W,                    /* total payload width: the SUM of all arities */
+  const char **azName       /* W slot names, arm 0 only; NULL for the rest */
 ){
   sqlite3 *db = pParse->db;
   ExprList *pOuter = 0;
@@ -948,13 +949,10 @@ static Select *procInterArm(
   Expr *pE;
   Token tName, tAlias;
   char zBuf[32];
-  int j, iVal;
+  int j;
 
   if( pDup==0 ) return 0;
   if( pDup->pEList==0 || pDup->pEList->nExpr!=nPay ){
-    /* Conformance pinned the arity at CREATE; anything else here is an OOM
-    ** artifact or a logic error, and building on it would mis-position the
-    ** key. */
     sqlite3SelectDelete(db, pDup);
     return 0;
   }
@@ -969,9 +967,6 @@ static Select *procInterArm(
     pDup->pEList->a[j].fg.eEName = ENAME_NAME;
   }
   if( pDup->pLimit==0 ){
-    /* LIMIT -1: no numeric effect, but the flattener will not absorb a
-    ** subquery that carries a LIMIT, and flattening is what discards the
-    ** inner ORDER BY. */
     procTokenSet(&tName, "-1");
     pE = sqlite3ExprAlloc(db, TK_INTEGER, &tName, 0);
     if( pE==0 ){
@@ -985,10 +980,12 @@ static Select *procInterArm(
     }
   }
 
-  /* Outer projection: _segment, _key, payload refs, NULL pads.  On any
-  ** append failure mallocFailed is set and later appends are no-ops that
-  ** delete their argument, so chaining with one final check is safe. */
-  procTokenSet(&tName, "0");
+  /* UNGIT scar #3: the DISJOINT layout.  Every arm spans the full payload
+  ** width; it fills its own slice and leaves NULL everywhere else.  One
+  ** header is then honest for every row at once -- the human's SELECT *
+  ** reads correctly with no tooling, and the seam's rename layer plus
+  ** procgen's positional mapping lose their jobs.  The price is a wider
+  ** row that is mostly NULL, and a NULL costs one serial-type byte. */
   sqlite3_snprintf(sizeof(zBuf), zBuf, "%d", iSeg);
   procTokenSet(&tName, zBuf);
   pOuter = sqlite3ExprListAppend(pParse, 0,
@@ -1001,24 +998,17 @@ static Select *procInterArm(
   procTokenSet(&tName, "_key");
   sqlite3ExprListSetName(pParse, pOuter, &tName, 0);
 
-  iVal = 0;
-  for(j=0; j<nPay; j++){
-    sqlite3_snprintf(sizeof(zBuf), zBuf, "_i%d", j);
-    pOuter = sqlite3ExprListAppend(pParse, pOuter, sqlite3Expr(db, TK_ID, zBuf));
-    if( pNames ){
-      while( iVal<pNames->nParam && pNames->a[iVal].pNested ) iVal++;
-      if( iVal<pNames->nParam ){
-        procTokenSet(&tName, pNames->a[iVal].zName);
-        sqlite3ExprListSetName(pParse, pOuter, &tName, 0);
-        iVal++;
-      }
+  for(j=0; j<W; j++){
+    if( j>=iOff && j<iOff+nPay ){
+      sqlite3_snprintf(sizeof(zBuf), zBuf, "_i%d", j-iOff);
+      pOuter = sqlite3ExprListAppend(pParse, pOuter,
+                  sqlite3Expr(db, TK_ID, zBuf));
+    }else{
+      pOuter = sqlite3ExprListAppend(pParse, pOuter,
+                  sqlite3Expr(db, TK_NULL, 0));
     }
-  }
-  for(j=nPay; j<W; j++){
-    pOuter = sqlite3ExprListAppend(pParse, pOuter, sqlite3Expr(db, TK_NULL, 0));
-    if( pNames ){
-      sqlite3_snprintf(sizeof(zBuf), zBuf, "_pad%d", j);
-      procTokenSet(&tName, zBuf);
+    if( azName && azName[j] ){
+      procTokenSet(&tName, azName[j]);
       sqlite3ExprListSetName(pParse, pOuter, &tName, 0);
     }
   }
@@ -1028,18 +1018,14 @@ static Select *procInterArm(
     return 0;
   }
 
-  /* No alias: mirror the parser's own anonymous-subquery idiom (a
-  ** zero-length token, not a null pointer). */
   tAlias.z = 0;
   tAlias.n = 0;
   pSrc = sqlite3SrcListAppendFromTerm(pParse, 0, 0, 0, &tAlias, pDup, 0);
   if( pSrc==0 ){
-    /* pDup is already deleted on this path -- see procWrapParent. */
     sqlite3ExprListDelete(db, pOuter);
     return 0;
   }
   pArm = sqlite3SelectNew(pParse, pOuter, pSrc, 0, 0, 0, 0, 0, 0);
-  /* On failure SelectNew consumed both pOuter and pSrc (which owns pDup). */
   return pArm;
 }
 
@@ -1049,11 +1035,9 @@ static Select *procBuildInterleaved(Parse *pParse, Proc *pProc,
   ProcFold *pF;
   ProcParamList *pCols = pProc->pShapes->pCols;
   Select *pCompound, *pArm;
-  int nParentPay = 0, W, iSeg, iKeyPar = -1, j;
+  const char **azName;
+  int nParentPay = 0, W, iSeg, iKeyPar = -1, j, iOff;
 
-  /* The parent payload is the shape's VALUE columns; find the key among
-  ** them.  Its presence was checked at CREATE (procBuildEmits), so a miss
-  ** here is defensive only. */
   for(j=0; j<pCols->nParam; j++){
     if( pCols->a[j].pNested ) continue;
     if( sqlite3StrICmp(pCols->a[j].zName, pProc->pFolds->zKeyParent)==0 ){
@@ -1066,17 +1050,33 @@ static Select *procBuildInterleaved(Parse *pParse, Proc *pProc,
                     pProc->zName);
     return 0;
   }
+  /* Total payload width and the slot-name table for arm 0.  Children are
+  ** all-value under INTERLEAVED (depth >= 2 is refused), so each child's
+  ** slice is simply its declared list. */
   W = nParentPay;
-  for(pF=pProc->pFolds; pF; pF=pF->pNext){
-    if( pF->pNested->nParam>W ) W = pF->pNested->nParam;
+  for(pF=pProc->pFolds; pF; pF=pF->pNext) W += pF->pNested->nParam;
+  azName = (const char**)sqlite3DbMallocZero(db, W*sizeof(char*));
+  if( azName==0 ) return 0;
+  iOff = 0;
+  for(j=0; j<pCols->nParam; j++){
+    if( pCols->a[j].pNested ) continue;
+    azName[iOff++] = pCols->a[j].zName;
   }
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    for(j=0; j<pF->pNested->nParam; j++){
+      azName[iOff++] = pF->pNested->a[j].zName;
+    }
+  }
+  assert( iOff==W );
 
   pCompound = procInterArm(pParse, sqlite3SelectDup(db, pStep->pSelect, 0),
-                           0, iKeyPar, nParentPay, W, pCols);
+                           0, iKeyPar, nParentPay, 0, W, azName);
+  sqlite3DbFree(db, azName);           /* SetName copied what it needed */
   iSeg = 1;
+  iOff = nParentPay;
   for(pF=pProc->pFolds; pF && pCompound; pF=pF->pNext, iSeg++){
     pArm = procInterArm(pParse, sqlite3SelectDup(db, pF->pChild->pSelect, 0),
-                        iSeg, pF->iKeyCol-1, pF->pNested->nParam, W, 0);
+                        iSeg, pF->iKeyCol-1, pF->pNested->nParam, iOff, W, 0);
     if( pArm==0 ){
       sqlite3SelectDelete(db, pCompound);
       return 0;
@@ -1084,10 +1084,10 @@ static Select *procBuildInterleaved(Parse *pParse, Proc *pProc,
     pArm->op = TK_ALL;
     pArm->pPrior = pCompound;
     pCompound = pArm;
+    iOff += pF->pNested->nParam;
   }
   if( pCompound==0 ) return 0;
 
-  /* Back-links and SF_Compound, exactly as parserDoubleLinkSelect does. */
   {
     Select *pNextSel = 0, *pLoop = pCompound;
     while( pLoop ){
@@ -1098,15 +1098,11 @@ static Select *procBuildInterleaved(Parse *pParse, Proc *pProc,
     }
   }
 
-  /* ORDER BY 2 -- the key, and ONLY the key: the tiebreak between arms is
-  ** the arm order itself (left first), which the probe pinned; adding a
-  ** _segment term here would buy nothing and cost a temp b-tree.
-  **
-  ** The ordinal is built with EP_IntValue set EXPLICITLY.  A token-built
-  ** integer is not reliably recognized by the compound ORDER BY resolver --
-  ** the same lesson phase 3 learned about constructed tokens, relearned
-  ** here: the term fell through to name-matching and "did not match any
-  ** column", visibly under EXPLAIN and silently at CALL. */
+  /* ORDER BY 2 -- the key, and ONLY the key: ties between arms resolve to
+  ** the left arm, so a parent precedes its own children for free.  The
+  ** ordinal carries EP_IntValue EXPLICITLY -- a token-built integer is not
+  ** reliably recognized by the compound resolver (the phase-3 constructed-
+  ** token lesson, relearned once already on this very function). */
   {
     Expr *pOrd = sqlite3ExprAlloc(db, TK_INTEGER, 0, 0);
     if( pOrd ){
@@ -3293,6 +3289,16 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
   ** NULL so sqlite3_proc_current_segment() reports -1 (the row's segment is
   ** the _segment COLUMN here), and sqlite3_proc_next_resultset() returns
   ** MISUSE -- there are no boundaries to advance over. */
+  if( pParse->pToplevel==0 && pProc->eRet!=PROC_RET_UNDECLARED
+   && (bCounts & PROC_OPT_INTERLEAVED)!=0 ){
+    /* UNGIT scar #3 companion: the per-segment descriptors ARE attached
+    ** under interleave -- as a lookup table for the sqlite3_proc_* read
+    ** family, never applied to the statement header, which keeps the
+    ** compound's own honest disjoint names.  bProcInter marks the mode:
+    ** next_resultset() stays MISUSE, and current_segment() turns row-driven
+    ** (the _segment column is the truth). */
+    sqlite3VdbeSetProcInterleave(pParse->pVdbe, pProc);
+  }
   if( pParse->pToplevel==0 && pProc->eRet!=PROC_RET_UNDECLARED
    && (bCounts & PROC_OPT_INTERLEAVED)==0 ){
     Vdbe *vTop = pParse->pVdbe;

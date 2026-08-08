@@ -5484,6 +5484,7 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   void sqlite3ProcCacheFlush(sqlite3*);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
   void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*, int);
+void sqlite3VdbeSetProcInterleave(Vdbe*, Proc*);
   int sqlite3ProcProjKeeps(IdList*,const char*);
   int sqlite3ProcCallOption(Parse*,Token*);
   const char *sqlite3ProcFoldKeyName(ProcFold*);
