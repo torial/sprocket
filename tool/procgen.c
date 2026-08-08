@@ -361,7 +361,14 @@ int main(int argc, char **argv){
       ** fold columns away with RETURNING -- the typed client rebuilds the
       ** nesting itself, so paying the server-side JSON construction would be
       ** pure waste. */
-      if( nNest ){
+      if( nNest && nParam==0 ){
+        /* UNGIT scar #2, half struck: with zebra BUG-271 fixed, no-param
+        ** nested procs use the REAL method.  Param'd ones keep the marker:
+        ** a bind-list argument to a resolver-deferred method arrives as
+        ** Zebra's own List, not []const _SqliteParam -- reported upstream;
+        ** the marker dies for good when call args are uniform. */
+        fprintf(out, "    var rows = d.query_segments(\"CALL %s(", zProc);
+      }else if( nNest ){
         fprintf(out, "    var rows = d.query(\"@segments CALL %s(", zProc);
       }else{
         fprintf(out, "    var rows = d.query(\"CALL %s(", zProc);
