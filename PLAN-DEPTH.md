@@ -1,5 +1,12 @@
 # PLAN-DEPTH — nested tables past one level
 
+**COMPLETE 2026-08-08.** Every phase landed: grammar through descriptors
+(procdeep 19/19), recursive folds, counts for free, advisory pinned both
+ways, procfault 2256 — and the tooling line closed last: procgen recurses,
+the Mosaic typed client reproduces the case study's arithmetic (9/20/21),
+and depth-1 outputs stayed byte-identical throughout. Residue lives in
+bugbook (BUG-10: zebra contextual keywords).
+
 *Drafted 2026-08-06, before implementation, while veryquick gates the
 stored-procs merge. Assumes no memory of prior sessions. Read HANDOFF-3h.md
 first for build mechanics and suite baselines.*
