@@ -6,6 +6,10 @@ would they feel* git*?  This file is the standing checklist for every future
 surface.  git is the reference pathology: a tool whose core model is sound and
 whose daily experience teaches learned helplessness.*
 
+*Generalized 2026-08-07 for all projects: the wiki page
+`pages/concepts/concept_ungit-principle.md` -- one sentence, three tests,
+two corollaries.  This file remains the sqlite-specific instance.*
+
 ## Principles already load-bearing here (keep them so)
 
 1. **Refusals name the reason and the fix.**  "nested tables xs and ys
