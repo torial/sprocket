@@ -544,17 +544,19 @@ int main(int argc, char **argv){
       fputs("    var out: List(", out); emitIdentCap(zProc);
       fputs("Row) = []\n", out);
 
-      /* The query.  No-param nested procs use the real query_segments
-      ** method (UNGIT scar #2's open half only affects param'd procs, which
-      ** keep the marker until deferred-call bind lists are uniform).
-      ** RETURNING projects the fold columns away -- but only at depth 1:
-      ** past one level the engine refuses the composition, so deep clients
-      ** carry the fold columns and simply never read them (the cost is
-      ** noted here because it is paid here). */
+      /* The query.  Nested procs use the REAL query_segments method -- the
+      ** no-param form for none, the _p form for params.  The "@segments "
+      ** marker string is gone (UNGIT scar #2 closed 2026-08-08): Opus's fix
+      ** to deferred-call bind-list lowering means a param'd deferred method
+      ** builds its []_SqliteParam exactly like the known query() path, so the
+      ** incantation is no longer needed.  RETURNING projects the fold columns
+      ** away -- but only at depth 1: past one level the engine refuses the
+      ** composition, so deep clients carry the fold columns and never read
+      ** them (the cost is paid here, hence noted here). */
       if( nNest && nParam==0 ){
         fprintf(out, "    var rows = d.query_segments(\"CALL %s(", zProc);
       }else if( nNest ){
-        fprintf(out, "    var rows = d.query(\"@segments CALL %s(", zProc);
+        fprintf(out, "    var rows = d.query_segments_p(\"CALL %s(", zProc);
       }else{
         fprintf(out, "    var rows = d.query(\"CALL %s(", zProc);
       }
