@@ -116,6 +116,37 @@ do_faultsim_test 4 -faults oom* -prep {
   faultsim_test_result {0 {0 1 1 a {} {} 1 1 {} {} 1 1 1 1 {} {} 1 2 0 2 2 b {} {} 1 2 {} {} 2 3 0 3 3 lonely {} {}}}
 }
 
+# The CACHE-HIT paths under OOM -- PLAN-PROJECTION P3.  The -prep warms the
+# per-connection cache OUTSIDE the fault window (default body AND projected
+# body, each under its signature); the -body then prepares both again, so
+# the injected failures land in the hit machinery itself: the signature
+# canonicalization, the lookup, the ProcPrg wrapper, the SubProgram attach,
+# and (in debug builds, where table locks are recorded) the lock replay.
+# The projected spelling is REORDERED on purpose: canonicalization must
+# route it to the warmed entry even while allocations fail around it.
+# Body SQL differs from -prep by spelling/whitespace so the TCL statement
+# cache cannot satisfy it without a fresh prepare.
+do_faultsim_test 5 -faults oom* -prep {
+  faultsim_restore_and_reopen
+  execsql {
+    CREATE PROCEDURE pwc()
+      RETURNS TABLE(id INTEGER, title TEXT,
+                    comments TABLE(post_id INTEGER, cid INTEGER, body BLOB)
+                      KEY(post_id = id))
+    BEGIN
+      SELECT id, title FROM posts;
+      SELECT post_id, cid, body FROM comments;
+    END;
+  }
+  execsql { CALL pwc() }
+  execsql { CALL pwc() RETURNING id, title }
+} -body {
+  execsql { CALL pwc()  }
+  execsql { CALL pwc() RETURNING title, id }
+} -test {
+  faultsim_test_result {0 {1 a 2 b 3 lonely}}
+}
+
 
 # Depth 2 (PLAN-DEPTH phase 3) -- procFoldInnerExpr builds the aliased inner
 # array recursively; its error paths consume what they were given, and only

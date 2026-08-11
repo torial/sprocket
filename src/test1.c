@@ -5781,6 +5781,56 @@ static int SQLITE_TCLAPI test_proc_next_resultset(
   Tcl_SetResult(interp, (char *)t1ErrorName(rc), TCL_STATIC);
   return TCL_OK;
 }
+
+/*
+** Usage: sqlite3_proc_cache_list DB
+**
+** One {name projection hits} triple per compiled-body cache entry on the
+** connection, oldest last (the cache prepends).  The projection is the
+** canonical signature with newlines flattened to commas, or "-" for the
+** default body.  This is the instrument the planted cache-key tests read:
+** a MISS is a new triple appearing, a HIT is a count going up, and neither
+** is inferable from the SQL surface -- indistinguishability from a fresh
+** compile is the cache working.
+*/
+static int SQLITE_TCLAPI test_proc_cache_list(
+  void * clientData,
+  Tcl_Interp *interp,
+  int objc,
+  Tcl_Obj *CONST objv[]
+){
+  sqlite3 *db;
+  ProcCacheEntry *pE;
+  Tcl_Obj *pRes;
+
+  if( objc!=2 ){
+    Tcl_WrongNumArgs(interp, 1, objv, "DB");
+    return TCL_ERROR;
+  }
+  if( getDbPointer(interp, Tcl_GetString(objv[1]), &db) ) return TCL_ERROR;
+  pRes = Tcl_NewListObj(0, 0);
+  for(pE=db->pProcCache; pE; pE=pE->pNext){
+    Tcl_Obj *pTriple = Tcl_NewListObj(0, 0);
+    Tcl_ListObjAppendElement(interp, pTriple,
+        Tcl_NewStringObj(pE->zProc, -1));
+    if( pE->zProj ){
+      char *zFlat = sqlite3_mprintf("%s", pE->zProj);
+      if( zFlat ){
+        int i;
+        for(i=0; zFlat[i]; i++) if( zFlat[i]=='\n' ) zFlat[i] = ',';
+        if( i>0 && zFlat[i-1]==',' ) zFlat[i-1] = 0;
+        Tcl_ListObjAppendElement(interp, pTriple, Tcl_NewStringObj(zFlat,-1));
+        sqlite3_free(zFlat);
+      }
+    }else{
+      Tcl_ListObjAppendElement(interp, pTriple, Tcl_NewStringObj("-", 1));
+    }
+    Tcl_ListObjAppendElement(interp, pTriple, Tcl_NewIntObj(pE->nHit));
+    Tcl_ListObjAppendElement(interp, pRes, pTriple);
+  }
+  Tcl_SetObjResult(interp, pRes);
+  return TCL_OK;
+}
 #endif /* SQLITE_OMIT_PROCEDURE */
 
 static int SQLITE_TCLAPI test_column_count(
@@ -9328,6 +9378,7 @@ int Sqlitetest1_Init(Tcl_Interp *interp){
      { "sqlite3_proc_child_count",      test_proc_child_count ,0 },
      { "sqlite3_proc_current_segment",  test_proc_current_segment ,0 },
      { "sqlite3_proc_family",           test_proc_family ,0 },
+     { "sqlite3_proc_cache_list",       test_proc_cache_list ,0 },
 #endif
      { "sqlite3_data_count",            test_data_count    ,0 },
      { "sqlite3_column_type",           test_column_type   ,0 },

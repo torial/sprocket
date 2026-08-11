@@ -2730,6 +2730,7 @@ static void procCacheEntryFree(sqlite3 *db, ProcCacheEntry *pE){
   }
 #endif
   sqlite3DbFree(db, pE->zProc);
+  sqlite3DbFree(db, pE->zProj);
   sqlite3DbFree(db, pE);
 }
 
@@ -2749,11 +2750,49 @@ void sqlite3ProcCacheFlush(sqlite3 *db){
 }
 
 /*
-** Look for a valid cached compiled body for pProc.  A hit requires the
-** same database slot, the same Schema (pointer identity), an unchanged
-** schema cookie, and a name match.
+** Canonical signature of a RETURNING projection over pProc's declared
+** shapes: the DECLARED spelling of every kept column, in declaration
+** order, one per line.  Two RETURNING lists that keep the same columns
+** produce the same signature however they are spelled or ordered --
+** RETURNING selects columns, it does not reorder them (proc3c 2.2) -- so
+** the cache keys on the projection's MEANING rather than its text.
+**
+** The projection has already been validated (procCheckProjection): every
+** name resolves, no duplicates.  Returns NULL on OOM with mallocFailed
+** set; the caller treats that call as uncacheable, never as the default
+** body -- a fallback VALUE on a path that feeds a comparison is how a
+** cache serves the wrong compilation.
 */
-static ProcCacheEntry *procCacheFind(Parse *pParse, Proc *pProc){
+static char *procProjSignature(sqlite3 *db, Proc *pProc, IdList *pProj){
+  ProcShape *pS;
+  sqlite3_str acc;
+  int i, j;
+  assert( pProj!=0 );
+  sqlite3StrAccumInit(&acc, db, 0, 0, db->aLimit[SQLITE_LIMIT_LENGTH]);
+  for(pS=pProc->pShapes; pS; pS=pS->pNext){
+    if( pS->pCols==0 ) continue;
+    for(i=0; i<pS->pCols->nParam; i++){
+      const char *zCol = pS->pCols->a[i].zName;
+      for(j=0; j<pProj->nId; j++){
+        if( sqlite3StrICmp(pProj->a[j].zName, zCol)==0 ){
+          sqlite3_str_appendall(&acc, zCol);
+          sqlite3_str_append(&acc, "\n", 1);
+          break;
+        }
+      }
+    }
+  }
+  return sqlite3StrAccumFinish(&acc);
+}
+
+/*
+** Look for a valid cached compiled body for pProc under projection
+** signature zProj (NULL for the default body).  A hit requires the same
+** database slot, the same Schema (pointer identity), an unchanged schema
+** cookie, a name match, and the same projection signature.
+*/
+static ProcCacheEntry *procCacheFind(Parse *pParse, Proc *pProc,
+                                     const char *zProj){
   sqlite3 *db = pParse->db;
   int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
   ProcCacheEntry *pE;
@@ -2771,6 +2810,8 @@ static ProcCacheEntry *procCacheFind(Parse *pParse, Proc *pProc){
      && pE->pSchema==pProc->pSchema
      && pE->cookie==(u32)pProc->pSchema->schema_cookie
      && sqlite3StrICmp(pE->zProc, pProc->zName)==0
+     && ((zProj==0 && pE->zProj==0)
+          || (zProj!=0 && pE->zProj!=0 && strcmp(zProj, pE->zProj)==0))
     ){
       return pE;
     }
@@ -2799,7 +2840,9 @@ static void procCachePopulate(
   Proc *pProc,          /* The procedure that was compiled */
   ProcPrg *pPrg,        /* Its compiled body */
   void *pAincBefore,    /* Value of pParse->pAinc before compilation */
-  int nLockBefore       /* Value of pParse->nTableLock before compilation */
+  int nLockBefore,      /* Value of pParse->nTableLock before compilation */
+  const char *zProj     /* Projection signature, or NULL for the default
+                        ** body.  Borrowed; this function copies it. */
 ){
   sqlite3 *db = pParse->db;
   int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
@@ -2836,9 +2879,15 @@ static void procCachePopulate(
     }
   }
 
-  /* Replace any existing (now stale) entry for this procedure */
+  /* Replace any existing (now stale) entry for this same (procedure,
+  ** projection).  Entries for OTHER projections of the same procedure
+  ** stay: they are distinct compiled bodies, which is the whole point of
+  ** the key (DOCKET 3c P3). */
   for(pp=&db->pProcCache; (pE=*pp)!=0; pp=&pE->pNext){
-    if( pE->iDb==iDb && sqlite3StrICmp(pE->zProc, pProc->zName)==0 ){
+    if( pE->iDb==iDb && sqlite3StrICmp(pE->zProc, pProc->zName)==0
+     && ((zProj==0 && pE->zProj==0)
+          || (zProj!=0 && pE->zProj!=0 && strcmp(zProj, pE->zProj)==0))
+    ){
       *pp = pE->pNext;
       procCacheEntryFree(db, pE);
       break;
@@ -2851,6 +2900,14 @@ static void procCachePopulate(
   if( pE->zProc==0 ){
     sqlite3DbFree(db, pE);
     return;
+  }
+  if( zProj ){
+    pE->zProj = sqlite3DbStrDup(db, zProj);
+    if( pE->zProj==0 ){
+      sqlite3DbFree(db, pE->zProc);
+      sqlite3DbFree(db, pE);
+      return;
+    }
   }
   pE->iDb = iDb;
   pE->pSchema = pProc->pSchema;
@@ -3285,21 +3342,38 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
   pTop = sqlite3ParseToplevel(pParse);
   for(pPrg=pTop->pProcPrg; pPrg && pPrg->pProc!=pProc; pPrg=pPrg->pNext){}
   if( pPrg==0 ){
-    /* The cache is keyed by procedure, so a projected body must not enter it
-    ** or two projections would share one compiled program.  Bypassing is
-    ** correct today; keying by (procedure, projection) is the optimisation. */
-    ProcCacheEntry *pE = (pProj || bCounts) ? 0 : procCacheFind(pParse, pProc);
+    /* The cache keys on (procedure, projection) -- DOCKET 3c P3.  Two
+    ** projections of one procedure are DIFFERENT compiled programs, and a
+    ** cache that ignored the projection would silently serve one to the
+    ** other's caller.  bCounts still bypasses: COUNTS and INTERLEAVED
+    ** bodies compile per statement until a consumer earns them a key.
+    **
+    ** A signature OOM leaves zSig NULL with mallocFailed set; the guard
+    ** below then bypasses the cache for this call rather than letting a
+    ** projected CALL masquerade as the default body. */
+    char *zSig = 0;
+    ProcCacheEntry *pE;
+    if( pProj && bCounts==0 ){
+      zSig = procProjSignature(db, pProc, pProj);
+    }
+    pE = (bCounts || (pProj && zSig==0))
+            ? 0 : procCacheFind(pParse, pProc, zSig);
     if( pE ){
+      pE->nHit++;
       /* Cache hit: reuse the compiled body, replaying the toplevel
       ** bookkeeping that compiling it would have performed. */
       pPrg = sqlite3DbMallocZero(db, sizeof(ProcPrg));
-      if( pPrg==0 ) goto call_cleanup;
+      if( pPrg==0 ){
+        sqlite3DbFree(db, zSig);
+        goto call_cleanup;
+      }
       pPrg->pNext = pTop->pProcPrg;
       pTop->pProcPrg = pPrg;
       pPrg->pProc = pProc;
       pPrg->pProgram = pE->pProg;
       pPrg->nResCol = pE->nResCol;
       if( sqlite3VdbeAttachSubProgram(pTop->pVdbe, pE->pProg) ){
+        sqlite3DbFree(db, zSig);
         goto call_cleanup;
       }
       if( pTop->nMaxArg<pE->nMaxArg ) pTop->nMaxArg = pE->nMaxArg;
@@ -3346,11 +3420,19 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       nLockBefore = pTop->nTableLock;
 #endif
       pPrg = codeProcBody(pParse, pProc, pProj, bCounts);
-      if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
-      if( pParse->pToplevel==0 && pProj==0 && bCounts==0 ){
-        procCachePopulate(pParse, pProc, pPrg, pAincBefore, nLockBefore);
+      if( pPrg==0 || pParse->nErr || db->mallocFailed ){
+        sqlite3DbFree(db, zSig);
+        goto call_cleanup;
+      }
+      /* Projected bodies now populate too, under their signature.  The
+      ** zSig!=0 leg keeps a signature OOM from filing a projected body
+      ** under the default key. */
+      if( pParse->pToplevel==0 && bCounts==0 && (pProj==0 || zSig!=0) ){
+        procCachePopulate(pParse, pProc, pPrg, pAincBefore, nLockBefore,
+                          zSig);
       }
     }
+    sqlite3DbFree(db, zSig);
   }
 
   /* Advisory comes AFTER the body is acquired: a fresh compile is what

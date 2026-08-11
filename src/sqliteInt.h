@@ -4365,6 +4365,11 @@ struct ProcCacheEntry {
   ProcCacheEntry *pNext;    /* Next entry in sqlite3.pProcCache */
   Schema *pSchema;          /* Identity check only -- never dereferenced */
   char *zProc;              /* Procedure name */
+  char *zProj;              /* Canonical projection signature, or NULL for
+                            ** the default (unprojected) body -- DOCKET 3c
+                            ** P3: the cache keys on (procedure, projection) */
+  int nHit;                 /* Times this entry was served -- the planted
+                            ** cache tests read this, nothing else does */
   int iDb;                  /* Database holding the procedure */
   u32 cookie;               /* Schema cookie when the body was compiled */
   SubProgram *pProg;        /* The compiled body (holds one nRef) */

@@ -143,4 +143,99 @@ do_catchsql_test 5.2 {
   CALL pwc() RETURNING comments;
 } {1 {RETURNING must keep the column nested table comments correlates on: id}}
 
+#--------------------------------------------------------------------
+# 6.x: THE CACHE RE-KEY (PLAN-PROJECTION P3) -- the cache keys on
+# (procedure, projection), and BOTH legs are planted: a differing
+# projection must MISS (its own compiled body), a matching one must HIT
+# (a cache that never hits is also broken).  sqlite3_proc_cache_list is
+# the instrument: correct results are indistinguishable from a fresh
+# compile at the SQL surface, which is the cache working -- so 4.x alone
+# would pass against the old always-bypass behavior, and these would not.
+#
+# A fresh connection gives a clean per-connection cache.  tally() must be
+# registered on it BEFORE any CALL: pwc's body uses it, and registering a
+# function flushes the cache anyway.
+#
+proc prep_and_drain {conn sql} {
+  set S [sqlite3_prepare_v2 $conn $sql -1 TAIL]
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+  sqlite3_finalize $S
+}
+do_test 6.0 {
+  sqlite3 db3 test.db
+  db3 function tally tally_cb
+  prep_and_drain db3 {CALL pwc()}
+  prep_and_drain db3 {CALL pwc()}
+  lsort [sqlite3_proc_cache_list db3]
+} {{pwc - 1}}
+
+# The projected body files under its own signature, and hits on re-prepare.
+do_test 6.1 {
+  prep_and_drain db3 {CALL pwc() RETURNING id, title}
+  prep_and_drain db3 {CALL pwc() RETURNING id, title}
+  lsort [sqlite3_proc_cache_list db3]
+} {{pwc - 1} {pwc id,title 1}}
+
+# THE PLANTED COLLISION: both bodies served from the cache, alive at once,
+# on one connection.  The hit counts are the receipt that the colliding
+# statements actually CAME from the cache; the column counts are the
+# receipt that each got its own body.
+do_test 6.2 {
+  set A [sqlite3_prepare_v2 db3 {CALL pwc()} -1 T1]
+  set B [sqlite3_prepare_v2 db3 {CALL pwc() RETURNING id, title} -1 T2]
+  set r [list [sqlite3_column_count $A] [sqlite3_column_count $B] \
+              [lsort [sqlite3_proc_cache_list db3]]]
+  sqlite3_finalize $A
+  sqlite3_finalize $B
+  set r
+} {3 2 {{pwc - 2} {pwc id,title 2}}}
+
+# The key is the projection's MEANING, not its text: a reordered spelling
+# hits the same entry rather than filing a third body.
+do_test 6.3 {
+  prep_and_drain db3 {CALL pwc() RETURNING title, id}
+  lsort [sqlite3_proc_cache_list db3]
+} {{pwc - 2} {pwc id,title 3}}
+
+# Two connections: caches are per-connection by design, and a procedure
+# re-lowered from the schema on a fresh connection must produce the same
+# canonical body -- compared through the full default fold output.
+do_test 6.5 {
+  sqlite3 db4 test.db
+  db4 function tally tally_cb
+  set r3 [db3 eval {CALL pwc()}]
+  set r4 [db4 eval {CALL pwc()}]
+  set c4 [lsort [sqlite3_proc_cache_list db4]]
+  list [expr {$r3 eq $r4}] $c4
+} {1 {{pwc - 0}}}
+
+# Cookie invalidation survives the re-key: a schema change from ANOTHER
+# connection strands both of db3's entries; the projected body recompiles
+# under its signature, REPLACING the stale same-signature entry (fresh
+# count), while the untouched default entry keeps its history (its count
+# is 3, not 2: 6.5's db3 eval was itself a prepare, and a hit).
+do_test 6.7 {
+  db4 eval {CREATE TABLE cookie_bump(x)}
+  prep_and_drain db3 {CALL pwc() RETURNING id, title}
+  prep_and_drain db3 {CALL pwc() RETURNING id, title}
+  lsort [sqlite3_proc_cache_list db3]
+} {{pwc - 3} {pwc id,title 1}}
+db4 close
+
+#--------------------------------------------------------------------
+# 7.x: the PLAN, not just the count (PLAN-PROJECTION P2 gate).  The scan
+# tallies in 3.x could go quiet for reasons other than the fold being
+# gone; the opcode listing cannot.  7.0 is the positive control: the
+# default body must SHOW the fold's aggregate, or 7.1's absence proves
+# nothing.
+do_test 7.0 {
+  set ex [execsql {EXPLAIN CALL pwc()}]
+  regexp {json_group_array} $ex
+} {1}
+do_test 7.1 {
+  set ex [execsql {EXPLAIN CALL pwc() RETURNING id, title}]
+  regexp {json_group_array} $ex
+} {0}
+db3 close
+
 finish_test
