@@ -390,12 +390,14 @@ void sqlite3BtreeClearCache(Btree*);
   void sqlite3BtreeEnter(Btree*);
   void sqlite3BtreeEnterAll(sqlite3*);
   int sqlite3BtreeSharable(Btree*);
+  int sqlite3BtreeSchemaShared(Btree*);
   void sqlite3BtreeEnterCursor(BtCursor*);
   int sqlite3BtreeConnectionCount(Btree*);
 #else
-# define sqlite3BtreeEnter(X) 
+# define sqlite3BtreeEnter(X)
 # define sqlite3BtreeEnterAll(X)
 # define sqlite3BtreeSharable(X) 0
+# define sqlite3BtreeSchemaShared(X) 0
 # define sqlite3BtreeEnterCursor(X)
 # define sqlite3BtreeConnectionCount(X) 1
 #endif

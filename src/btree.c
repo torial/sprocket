@@ -2641,6 +2641,9 @@ int sqlite3BtreeOpen(
           }
           p->pBt = pBt;
           pBt->nRef++;
+          /* This open reached the BtShared through a genuine shared-cache
+          ** request, whatever its creator's reason for being on the list */
+          pBt->btsFlags |= BTS_SHARED_REQ;
           break;
         }
       }
@@ -2741,6 +2744,7 @@ int sqlite3BtreeOpen(
     /* Add the new BtShared object to the linked list sharable BtShareds.
     */
     pBt->nRef = 1;
+    if( vfsFlags & SQLITE_OPEN_SHAREDCACHE ) pBt->btsFlags |= BTS_SHARED_REQ;
     if( p->sharable ){
       MUTEX_LOGIC( sqlite3_mutex *mutexShared; )
       MUTEX_LOGIC( mutexShared = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);)
@@ -11585,5 +11589,23 @@ int sqlite3BtreeSharable(Btree *p){
 int sqlite3BtreeConnectionCount(Btree *p){
   testcase( p->sharable );
   return p->pBt->nRef;
+}
+
+/*
+** Return true if the Btree's schema may genuinely come to be shared with
+** another database connection: shared cache was requested for this database
+** file by some connection (so a later shared-cache open can find and join
+** its BtShared), or more than one connection already owns it.
+**
+** Distinct from sqlite3BtreeSharable(), which SQLITE_DEBUG builds set for
+** EVERY persistent database to exercise the locking code -- an instrument
+** answering a locking question, not an ownership one.  Callers deciding
+** whether a Schema object is private to this connection (the procedure
+** body cache) need the ownership answer, or debug builds silently disable
+** the tier they were built to check.
+*/
+int sqlite3BtreeSchemaShared(Btree *p){
+  return p->sharable
+      && ( (p->pBt->btsFlags & BTS_SHARED_REQ)!=0 || p->pBt->nRef>1 );
 }
 #endif

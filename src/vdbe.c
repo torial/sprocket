@@ -8905,9 +8905,16 @@ case OP_Function: {            /* group */
   /* If this function is inside of a trigger, the register array in aMem[]
   ** might change from one evaluation to the next.  The next block of code
   ** checks to see if the register array has changed, and if so it
-  ** reinitializes the relevant parts of the sqlite3_context object */
+  ** reinitializes the relevant parts of the sqlite3_context object.
+  **
+  ** The pVdbe leg exists for this fork's procedure body cache: a cached
+  ** SubProgram -- and therefore this very sqlite3_context -- is shared
+  ** across statements, and two statements' register arrays can coincide
+  ** on the same heap address.  pOut comparison alone then keeps the
+  ** PREVIOUS statement's argv pointers: stale reads in release, this
+  ** opcode's own assert in debug. */
   pOut = &aMem[pOp->p3];
-  if( pCtx->pOut != pOut ){
+  if( pCtx->pOut != pOut || pCtx->pVdbe != p ){
     pCtx->pVdbe = p;
     pCtx->pOut = pOut;
     pCtx->enc = encoding;

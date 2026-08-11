@@ -96,6 +96,30 @@ void sqlite3TableLock(
 }
 
 /*
+** Read back one recorded lock (0<=i<pParse->nTableLock, pParse a toplevel).
+** Used by the procedure body cache, which must REPLAY a body's lock list
+** when the compiled body is reused without recompiling (proc.c) -- a
+** cached body otherwise opens its cursors with no lock bookkeeping at all,
+** which asserts on any sharable btree.
+*/
+void sqlite3TableLockGet(
+  Parse *pParse,
+  int i,
+  int *piDb,
+  Pgno *piTab,
+  u8 *pIsWrite,
+  const char **pzName
+){
+  TableLock *p;
+  assert( i>=0 && i<pParse->nTableLock );
+  p = &pParse->aTableLock[i];
+  *piDb = p->iDb;
+  *piTab = p->iTab;
+  *pIsWrite = p->isWriteLock;
+  *pzName = p->zLockName;
+}
+
+/*
 ** Code an OP_TableLock instruction for each table locked by the
 ** statement (configured by calls to sqlite3TableLock()).
 */
@@ -107,8 +131,12 @@ static void codeTableLocks(Parse *pParse){
   for(i=0; i<pParse->nTableLock; i++){
     TableLock *p = &pParse->aTableLock[i];
     int p1 = p->iDb;
+    /* TRANSIENT, not STATIC: a lock replayed from the procedure body cache
+    ** names a string owned by a cache entry that can be freed (replaced,
+    ** flushed) while this statement is still alive.  The copy costs a few
+    ** bytes per lock and removes the lifetime coupling for every origin. */
     sqlite3VdbeAddOp4(pVdbe, OP_TableLock, p1, p->iTab, p->isWriteLock,
-                      p->zLockName, P4_STATIC);
+                      p->zLockName, P4_TRANSIENT);
   }
 }
 #else

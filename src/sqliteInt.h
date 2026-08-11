@@ -4335,6 +4335,23 @@ struct Proc {
 #define PROC_CACHE_SUBPROG  5   /* Body fires a trigger or CALLs a procedure */
 
 /*
+** One table lock a compiled procedure body requires, recorded so that a
+** cache hit can REPLAY the lock bookkeeping that compiling the body would
+** have performed (build.c:sqlite3TableLock accumulates on the toplevel
+** Parse, which a cache hit never runs).  Only ever populated on sharable
+** btrees, since sqlite3TableLock records nothing otherwise.
+*/
+#ifndef SQLITE_OMIT_SHARED_CACHE
+typedef struct ProcCacheLock ProcCacheLock;
+struct ProcCacheLock {
+  int iDb;               /* Database holding the table */
+  Pgno iTab;             /* Root page of the table */
+  u8 isWriteLock;        /* True for a write lock */
+  char *zLockName;       /* Owned copy of the table name */
+};
+#endif
+
+/*
 ** One entry in the per-connection cache of compiled procedure bodies
 ** (sqlite3.pProcCache).  The cache lives on the connection, not on the
 ** Proc, so that every byte of it is allocated and freed against the
@@ -4354,6 +4371,10 @@ struct ProcCacheEntry {
   char **azColName;         /* nResCol cached column names, or NULL */
   int nResCol;              /* Result columns; -1 if the body emits none */
   int nMaxArg;              /* Toplevel nMaxArg needed by the body */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  ProcCacheLock *aLock;     /* Table locks to replay on a hit, or NULL */
+  int nLock;                /* Number of entries in aLock */
+#endif
   u8 flags;                 /* PROCCACHE_* flags */
 };
 #define PROCCACHE_WRITES    0x01  /* Body writes its database */
@@ -5822,6 +5843,7 @@ void sqlite3AutoLoadExtensions(sqlite3*);
 
 #ifndef SQLITE_OMIT_SHARED_CACHE
   void sqlite3TableLock(Parse *, int, Pgno, u8, const char *);
+  void sqlite3TableLockGet(Parse*,int,int*,Pgno*,u8*,const char**);
 #else
   #define sqlite3TableLock(v,w,x,y,z)
 #endif

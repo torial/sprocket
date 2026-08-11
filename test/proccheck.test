@@ -117,4 +117,27 @@ do_test 4.0 {
   execsql {PRAGMA proc_check(outer_p)}
 } {cache outer_p {compiles per prepared statement: the body fires a trigger or CALLs another procedure}}
 
+#--------------------------------------------------------------------
+# 5.x: the GENUINE shared-cache refusal.  SQLITE_DEBUG builds mark every
+# persistent database sharable to exercise the locking code, which once made
+# this whole tier refuse everything under debug (2026-08-11); the cache now
+# distinguishes that marker from a real shared-cache request.  This is the
+# negative control for that distinction: a connection that really asks for
+# shared cache must still be refused, in BOTH build regimes.
+#
+# LAST IN THE FILE on purpose: in a debug build the shared open joins the
+# main connection's BtShared, and the requested-shared mark stays until every
+# connection to the file closes -- tests after this point would see the
+# refusal too.
+do_test 5.0 {
+  set scSave [sqlite3_enable_shared_cache 1]
+  sqlite3 dbS test.db
+  dbS eval {CREATE PROCEDURE sc_probe() BEGIN SELECT count(*) FROM posts; END;}
+  dbS eval {CALL sc_probe()}
+  set r [dbS eval {PRAGMA proc_check(sc_probe)}]
+  dbS close
+  sqlite3_enable_shared_cache $scSave
+  set r
+} {cache sc_probe {compiles per prepared statement: the database uses shared-cache mode}}
+
 finish_test

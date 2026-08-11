@@ -471,6 +471,11 @@ struct BtShared {
 #define BTS_NO_WAL           0x0020   /* Do not open write-ahead-log files */
 #define BTS_EXCLUSIVE        0x0040   /* pWriter has an exclusive lock */
 #define BTS_PENDING          0x0080   /* Waiting for read-locks to clear */
+#define BTS_SHARED_REQ       0x0100   /* Shared cache was genuinely requested
+                                      ** (SQLITE_OPEN_SHAREDCACHE) by some
+                                      ** connection -- NOT set by the
+                                      ** SQLITE_DEBUG mark-everything-sharable
+                                      ** locking exerciser */
 
 /*
 ** An instance of the following structure is used to hold information

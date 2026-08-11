@@ -967,8 +967,21 @@ static Select *procInterArm(
     pDup->pEList->a[j].fg.eEName = ENAME_NAME;
   }
   if( pDup->pLimit==0 ){
-    procTokenSet(&tName, "-1");
-    pE = sqlite3ExprAlloc(db, TK_INTEGER, &tName, 0);
+    /* TK_UMINUS of an EP_IntValue 1, the exact shape the parser builds for
+    ** a literal "LIMIT -1".  Two invariant asserts constrain constructed
+    ** integers here: a token-built TK_INTEGER whose text parses as int32
+    ** trips sqlite3ExprIsInteger (upstream moved the conversion out of
+    ** sqlite3ExprAlloc, tag-20240227), and EP_IntValue itself must be
+    ** non-negative (sqlite3ExprDeleteNN) -- negative literals are always
+    ** spelled as unary minus over a positive one. */
+    pE = sqlite3ExprAlloc(db, TK_INTEGER, 0, 0);
+    if( pE==0 ){
+      sqlite3SelectDelete(db, pDup);
+      return 0;
+    }
+    pE->flags |= EP_IntValue;
+    pE->u.iValue = 1;
+    pE = sqlite3PExpr(pParse, TK_UMINUS, pE, 0);
     if( pE==0 ){
       sqlite3SelectDelete(db, pDup);
       return 0;
@@ -986,10 +999,12 @@ static Select *procInterArm(
   ** reads correctly with no tooling, and the seam's rename layer plus
   ** procgen's positional mapping lose their jobs.  The price is a wider
   ** row that is mostly NULL, and a NULL costs one serial-type byte. */
-  sqlite3_snprintf(sizeof(zBuf), zBuf, "%d", iSeg);
-  procTokenSet(&tName, zBuf);
-  pOuter = sqlite3ExprListAppend(pParse, 0,
-              sqlite3ExprAlloc(db, TK_INTEGER, &tName, 0));
+  pE = sqlite3ExprAlloc(db, TK_INTEGER, 0, 0);
+  if( pE ){
+    pE->flags |= EP_IntValue;    /* see the LIMIT node above */
+    pE->u.iValue = iSeg;
+  }
+  pOuter = sqlite3ExprListAppend(pParse, 0, pE);
   procTokenSet(&tName, "_segment");
   sqlite3ExprListSetName(pParse, pOuter, &tName, 0);
 
@@ -2707,6 +2722,13 @@ static void procCacheEntryFree(sqlite3 *db, ProcCacheEntry *pE){
     for(i=0; i<pE->nResCol; i++) sqlite3DbFree(db, pE->azColName[i]);
     sqlite3DbFree(db, pE->azColName);
   }
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  if( pE->aLock ){
+    int i;
+    for(i=0; i<pE->nLock; i++) sqlite3DbFree(db, pE->aLock[i].zLockName);
+    sqlite3DbFree(db, pE->aLock);
+  }
+#endif
   sqlite3DbFree(db, pE->zProc);
   sqlite3DbFree(db, pE);
 }
@@ -2736,6 +2758,14 @@ static ProcCacheEntry *procCacheFind(Parse *pParse, Proc *pProc){
   int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
   ProcCacheEntry *pE;
   if( iDb==1 ) return 0;   /* TEMP procedures are never cached */
+  /* Sharing can BEGIN after an entry was populated: a SQLITE_DEBUG build
+  ** lists every persistent BtShared, so a later genuine shared-cache open
+  ** can join a database that was private when its bodies were cached.
+  ** Serving those entries once the schema is genuinely shared would be
+  ** the exact hazard the populate-time refusal exists to prevent. */
+  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSchemaShared(db->aDb[iDb].pBt) ){
+    return 0;
+  }
   for(pE=db->pProcCache; pE; pE=pE->pNext){
     if( pE->iDb==iDb
      && pE->pSchema==pProc->pSchema
@@ -2768,7 +2798,8 @@ static void procCachePopulate(
   Parse *pParse,        /* The (toplevel) parse of the CALL statement */
   Proc *pProc,          /* The procedure that was compiled */
   ProcPrg *pPrg,        /* Its compiled body */
-  void *pAincBefore     /* Value of pParse->pAinc before compilation */
+  void *pAincBefore,    /* Value of pParse->pAinc before compilation */
+  int nLockBefore       /* Value of pParse->nTableLock before compilation */
 ){
   sqlite3 *db = pParse->db;
   int iDb = sqlite3SchemaToIndex(db, pProc->pSchema);
@@ -2785,7 +2816,11 @@ static void procCachePopulate(
     pProc->eCachePlan = PROC_CACHE_TEMP;
     return;
   }
-  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSharable(db->aDb[iDb].pBt) ){
+  /* SchemaShared, not Sharable: SQLITE_DEBUG builds mark every persistent
+  ** database sharable to exercise the locking code, and the broader test
+  ** made this whole tier inert in exactly the builds that carry asserts
+  ** (found 2026-08-11 when proccheck went 4/11 red under DEBUG=3). */
+  if( db->aDb[iDb].pBt==0 || sqlite3BtreeSchemaShared(db->aDb[iDb].pBt) ){
     pProc->eCachePlan = PROC_CACHE_SHARED;
     return;
   }
@@ -2829,6 +2864,36 @@ static void procCachePopulate(
   if( pE->nResCol>0 && pParse->pVdbe ){
     pE->azColName = sqlite3VdbeCaptureColumnNames(pParse->pVdbe, pE->nResCol);
   }
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  /* Snapshot the table locks the body's compilation recorded, so a cache
+  ** hit can replay them.  Empty on a non-sharable btree, where
+  ** sqlite3TableLock records nothing -- so release builds store nothing
+  ** here and the replay is a no-op. */
+  if( pParse->nTableLock>nLockBefore ){
+    int n = pParse->nTableLock - nLockBefore;
+    int i;
+    pE->aLock = sqlite3DbMallocZero(db, n*sizeof(ProcCacheLock));
+    if( pE->aLock==0 ){
+      procCacheEntryFree(db, pE);
+      return;
+    }
+    for(i=0; i<n; i++){
+      const char *zName = 0;
+      sqlite3TableLockGet(pParse, nLockBefore+i, &pE->aLock[i].iDb,
+                          &pE->aLock[i].iTab, &pE->aLock[i].isWriteLock,
+                          &zName);
+      pE->aLock[i].zLockName = sqlite3DbStrDup(db, zName);
+      if( zName && pE->aLock[i].zLockName==0 ){
+        pE->nLock = i;
+        procCacheEntryFree(db, pE);
+        return;
+      }
+    }
+    pE->nLock = n;
+  }
+#else
+  UNUSED_PARAMETER(nLockBefore);
+#endif
   pE->pNext = db->pProcCache;
   db->pProcCache = pE;
   pProc->eCachePlan = PROC_CACHE_OK;
@@ -3245,6 +3310,22 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       if( pE->flags & PROCCACHE_MAYABORT ){
         sqlite3MayAbort(pParse);
       }
+#ifndef SQLITE_OMIT_SHARED_CACHE
+      /* Replay the body's table-lock bookkeeping.  Compiling the body would
+      ** have accumulated these on the toplevel Parse for FinishCoding to
+      ** emit as OP_TableLock; a reused body must do the same or its cursors
+      ** open with no locks at all on a sharable btree.  Empty except in
+      ** shared-cache mode's near-misses and SQLITE_DEBUG builds, which mark
+      ** every btree sharable and so found this hole the day the cache first
+      ** populated under an assert-carrying build. */
+      {
+        int iL;
+        for(iL=0; iL<pE->nLock; iL++){
+          sqlite3TableLock(pParse, pE->aLock[iL].iDb, pE->aLock[iL].iTab,
+                           pE->aLock[iL].isWriteLock, pE->aLock[iL].zLockName);
+        }
+      }
+#endif
       if( pParse->pToplevel==0 && pE->nResCol>0 ){
         int k;
         sqlite3VdbeSetNumCols(v, pE->nResCol);
@@ -3260,10 +3341,14 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       }
     }else{
       void *pAincBefore = (void*)pTop->pAinc;
+      int nLockBefore = 0;
+#ifndef SQLITE_OMIT_SHARED_CACHE
+      nLockBefore = pTop->nTableLock;
+#endif
       pPrg = codeProcBody(pParse, pProc, pProj, bCounts);
       if( pPrg==0 || pParse->nErr || db->mallocFailed ) goto call_cleanup;
       if( pParse->pToplevel==0 && pProj==0 && bCounts==0 ){
-        procCachePopulate(pParse, pProc, pPrg, pAincBefore);
+        procCachePopulate(pParse, pProc, pPrg, pAincBefore, nLockBefore);
       }
     }
   }
