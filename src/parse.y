@@ -519,6 +519,30 @@ cmd ::= DROP VIEW ifexists(E) fullname(X). {
 }
 %endif  SQLITE_OMIT_VIEW
 
+//////////////// The CREATE MATERIALIZED VIEW statement (fork) //////////////
+//
+// MATERIALIZED and the WITH MAINTENANCE option words cost zero keywords:
+// they are ordinary identifiers checked by text in the reduce actions, the
+// same pattern as the CALL statement's WITH COUNTS options (see optlist /
+// sqlite3ProcCallOption below).  No other rule permits an identifier in
+// these positions, so the grammar attaches without conflicts -- a claim
+// verified by reading parse.out, not by lemon's exit status.
+//
+%ifndef SQLITE_OMIT_VIEW
+cmd ::= createkw(B) temp(T) nm(M) VIEW ifnotexists(E) nm(Y) dbnm(Z)
+        mvmaint(MM) AS select(S). {
+  sqlite3CreateMView(pParse, &B, &M, &Y, &Z, MM, S, T, E);
+}
+%type mvmaint {int}
+mvmaint(A) ::= . { A = MVIEW_MAINT_UNSPEC; }
+mvmaint(A) ::= WITH nm(X) nm(Y). {
+  A = sqlite3MViewMaintOption(pParse, &X, &Y);
+}
+cmd ::= DROP nm(M) VIEW ifexists(E) fullname(X). {
+  sqlite3DropMView(pParse, &M, X, E);
+}
+%endif  SQLITE_OMIT_VIEW
+
 //////////////////////// The SELECT statement /////////////////////////////////
 //
 cmd ::= select(X).  {

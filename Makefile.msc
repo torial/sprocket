@@ -1293,7 +1293,7 @@ LIBOBJS0 = vdbe.lo parse.lo alter.lo analyze.lo attach.lo auth.lo \
          icu.lo insert.lo json.lo legacy.lo loadext.lo \
          main.lo malloc.lo mem0.lo mem1.lo mem2.lo mem3.lo mem5.lo \
          memdb.lo memjournal.lo \
-         mutex.lo mutex_noop.lo mutex_unix.lo mutex_w32.lo \
+         mutex.lo mutex_noop.lo mutex_unix.lo mutex_w32.lo mview.lo \
          notify.lo opcodes.lo os.lo os_kv.lo os_unix.lo os_win.lo \
          pager.lo pcache.lo pcache1.lo pragma.lo prepare.lo printf.lo proc.lo \
          random.lo resolve.lo rowset.lo rtree.lo \
@@ -1374,6 +1374,7 @@ SRC00 = \
   $(TOP)\src\mutex_noop.c \
   $(TOP)\src\mutex_unix.c \
   $(TOP)\src\mutex_w32.c \
+  $(TOP)\src\mview.c \
   $(TOP)\src\notify.c \
   $(TOP)\src\os.c \
   $(TOP)\src\os_kv.c \
@@ -2190,6 +2191,9 @@ printf.lo:	$(TOP)\src\printf.c $(HDR)
 
 proc.lo:	$(TOP)\src\proc.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\proc.c
+
+mview.lo:	$(TOP)\src\mview.c $(HDR)
+	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\mview.c
 
 random.lo:	$(TOP)\src\random.c $(HDR)
 	$(LTCOMPILE) $(CORE_COMPILE_OPTS) -c $(TOP)\src\random.c

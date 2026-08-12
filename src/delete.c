@@ -121,6 +121,19 @@ int sqlite3IsReadOnly(Parse *pParse, Table *pTab, Trigger *pTrigger){
     sqlite3ErrorMsg(pParse, "table %s may not be modified", pTab->zName);
     return 1;
   }
+  /* A materialized view (fork) is engine-written only.  Nested parses
+  ** (population at CREATE, synthesized maintenance) pass; so does
+  ** writable_schema, the declared everything-off switch; so does
+  ** VACUUM, whose rebuild copies the view's content like a table's. */
+  if( IsMView(pTab)
+   && pParse->nested==0
+   && sqlite3WritableSchema(pParse->db)==0
+   && (pParse->db->mDbFlags & DBFLAG_Vacuum)==0
+  ){
+    sqlite3ErrorMsg(pParse, "%s is a materialized view and is maintained "
+       "by the engine; write to its base table instead", pTab->zName);
+    return 1;
+  }
 #ifndef SQLITE_OMIT_VIEW
   if( IsView(pTab)
    && (pTrigger==0 || (pTrigger->bReturning && pTrigger->pNext==0))

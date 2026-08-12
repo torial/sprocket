@@ -40,6 +40,35 @@ static int isAlterableTable(Parse *pParse, Table *pTab){
     sqlite3ErrorMsg(pParse, "table %s may not be altered", pTab->zName);
     return 1;
   }
+  if( IsMView(pTab) ){
+    /* fork: the shape of a materialized view IS its definition; change
+    ** the definition (DROP and re-CREATE), not the table under it */
+    sqlite3ErrorMsg(pParse, "materialized view %s may not be altered; "
+       "DROP MATERIALIZED VIEW and re-create it instead", pTab->zName);
+    return 1;
+  }
+  return 0;
+}
+
+/*
+** If any materialized view is defined over pTab, leave an error naming
+** the view and the fix, and return non-zero (fork).  Used by the ALTER
+** operations that would change what the stored view definition resolves
+** to -- a definition that stopped resolving would fail the next schema
+** load of the database file.  ADD COLUMN is not gated: definitions
+** cannot use SELECT *, so a new column is invisible to them.
+*/
+static int alterWouldBreakMView(Parse *pParse, Table *pTab){
+  const char *zMV;
+  int iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  if( iDb<0 ) return 0;
+  zMV = sqlite3MViewFindDependent(pParse->db, iDb, pTab->zName);
+  if( zMV ){
+    sqlite3ErrorMsg(pParse, "cannot alter table %s: materialized view "
+       "%s is defined on it; drop the materialized view first",
+       pTab->zName, zMV);
+    return 1;
+  }
   return 0;
 }
 
@@ -165,6 +194,9 @@ void sqlite3AlterRenameTable(
   ** that the table is being renamed to.
   */
   if( SQLITE_OK!=isAlterableTable(pParse, pTab) ){
+    goto exit_rename_table;
+  }
+  if( alterWouldBreakMView(pParse, pTab) ){
     goto exit_rename_table;
   }
   if( SQLITE_OK!=sqlite3CheckObjectName(pParse,zName,"table",zName) ){
@@ -617,6 +649,7 @@ void sqlite3AlterRenameColumn(
 
   /* Cannot alter a system table */
   if( SQLITE_OK!=isAlterableTable(pParse, pTab) ) goto exit_rename_column;
+  if( alterWouldBreakMView(pParse, pTab) ) goto exit_rename_column;
   if( SQLITE_OK!=isRealTable(pParse, pTab, 0) ) goto exit_rename_column;
 
   /* Which schema holds the table to be altered */ 
@@ -2265,6 +2298,7 @@ void sqlite3AlterDropColumn(Parse *pParse, SrcList *pSrc, const Token *pName){
   /* Make sure this is not an attempt to ALTER a view, virtual table or
   ** system table. */
   if( SQLITE_OK!=isAlterableTable(pParse, pTab) ) goto exit_drop_column;
+  if( alterWouldBreakMView(pParse, pTab) ) goto exit_drop_column;
   if( SQLITE_OK!=isRealTable(pParse, pTab, 1) ) goto exit_drop_column;
 
   /* Find the index of the column being dropped. */

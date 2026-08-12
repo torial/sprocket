@@ -533,7 +533,7 @@ LIBOBJS0 = alter.o analyze.o attach.o auth.o \
          icu.o insert.o json.o legacy.o loadext.o \
          main.o malloc.o mem0.o mem1.o mem2.o mem3.o mem5.o \
          memdb.o memjournal.o \
-         mutex.o mutex_noop.o mutex_unix.o mutex_w32.o \
+         mutex.o mutex_noop.o mutex_unix.o mutex_w32.o mview.o \
          notify.o opcodes.o os.o os_kv.o os_unix.o os_win.o \
          pager.o parse.o pcache.o pcache1.o pragma.o prepare.o printf.o proc.o \
          random.o resolve.o rowset.o rtree.o \
@@ -608,6 +608,7 @@ SRC = \
   $(TOP)/src/mutex_noop.c \
   $(TOP)/src/mutex_unix.c \
   $(TOP)/src/mutex_w32.c \
+  $(TOP)/src/mview.c \
   $(TOP)/src/notify.c \
   $(TOP)/src/os.c \
   $(TOP)/src/os.h \
@@ -839,6 +840,7 @@ TESTSRC2 = \
   $(TOP)/src/pragma.c \
   $(TOP)/src/prepare.c \
   $(TOP)/src/printf.c \
+  $(TOP)/src/mview.c \
   $(TOP)/src/proc.c \
   $(TOP)/src/random.c \
   $(TOP)/src/pcache.c \
@@ -1321,6 +1323,9 @@ printf.o:	$(TOP)/src/printf.c $(DEPS_OBJ_COMMON)
 
 proc.o:	$(TOP)/src/proc.c $(DEPS_OBJ_COMMON)
 	$(T.cc.sqlite) -c $(TOP)/src/proc.c
+
+mview.o:	$(TOP)/src/mview.c $(DEPS_OBJ_COMMON)
+	$(T.cc.sqlite) -c $(TOP)/src/mview.c
 
 random.o:	$(TOP)/src/random.c $(DEPS_OBJ_COMMON)
 	$(T.cc.sqlite) -c $(TOP)/src/random.c

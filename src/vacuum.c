@@ -295,9 +295,12 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
   ** in the temporary database.
   */
   db->init.iDb = nDb; /* force new CREATE statements into vacuum_db */
+  /* Materialized views (fork) rebuild like tables: their DDL replays
+  ** here (populating zero rows, since base tables are still empty) and
+  ** their real content arrives with the table-content copy below. */
   rc = execSqlF(db, pzErrMsg,
       "SELECT sql FROM \"%w\".sqlite_schema"
-      " WHERE type='table'AND name<>'sqlite_sequence'"
+      " WHERE type IN('table','mview')AND name<>'sqlite_sequence'"
       " AND coalesce(rootpage,1)>0",
       zDbMain
   );
@@ -318,7 +321,7 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
       "SELECT'INSERT INTO %s.'||quote(name)"
       "||' SELECT*FROM\"%w\".'||quote(name)"
       "FROM %s.sqlite_schema "
-      "WHERE type='table'AND coalesce(rootpage,1)>0",
+      "WHERE type IN('table','mview')AND coalesce(rootpage,1)>0",
       zDbVacuum, zDbMain, zDbVacuum
   );
   assert( (db->mDbFlags & DBFLAG_Vacuum)!=0 );

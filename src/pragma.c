@@ -1358,7 +1358,7 @@ void sqlite3Pragma(
   **
   ** schema:     Name of attached database hold this table
   ** name:       Name of the table itself
-  ** type:       "table", "view", "virtual", "shadow"
+  ** type:       "table", "view", "virtual", "shadow", "mview" (fork)
   ** ncol:       Number of columns
   ** wr:         True for a WITHOUT ROWID table
   ** strict:     True for a STRICT table
@@ -1414,6 +1414,8 @@ void sqlite3Pragma(
           zType = "virtual";
         }else if( pTab->tabFlags & TF_Shadow ){
           zType = "shadow";
+        }else if( IsMView(pTab) ){
+          zType = "mview";   /* materialized view (fork) */
         }else{
           zType = "table";
         }

@@ -909,6 +909,11 @@ void sqlite3UnlinkAndDeleteTable(sqlite3 *db, int iDb, const char *zTabName){
   testcase( zTabName[0]==0 );  /* Zero-length table names are allowed */
   pDb = &db->aDb[iDb];
   p = sqlite3HashInsert(&pDb->pSchema->tblHash, zTabName, 0);
+  if( p && IsMView(p) ){
+    /* Every drop path funnels through here; the materialized-view
+    ** registry entry leaves with the table (fork) */
+    sqlite3UnlinkAndDeleteMView(db, iDb, zTabName);
+  }
   sqlite3DeleteTable(db, p);
   db->mDbFlags |= DBFLAG_SchemaChange;
 }
@@ -1270,7 +1275,10 @@ void sqlite3StartTable(
   }
   pParse->sNameToken = *pName;
   if( zName==0 ) return;
-  if( sqlite3CheckObjectName(pParse, zName, isView?"view":"table", zName) ){
+  /* A materialized view (fork) is stored as a type='mview' schema row;
+  ** the object-name check must compare against that type at schema load */
+  if( sqlite3CheckObjectName(pParse, zName,
+          pParse->bMViewCreate ? "mview" : (isView?"view":"table"), zName) ){
     goto begin_table_error;
   }
   if( db->init.iDb==1 ) isTemp = 1;
@@ -2836,7 +2844,12 @@ void sqlite3EndTable(
     /*
     ** Initialize zType for the new view or table.
     */
-    if( IsOrdinaryTable(p) ){
+    if( IsMView(p) ){
+      /* A materialized view (fork): a real table stored under its own
+      ** schema type, with the full defining DDL kept as its sql */
+      zType = "mview";
+      zType2 = "MATERIALIZED VIEW";
+    }else if( IsOrdinaryTable(p) ){
       /* A regular table */
       zType = "table";
       zType2 = "TABLE";
@@ -3001,7 +3014,10 @@ void sqlite3EndTable(
   }
 
 #ifndef SQLITE_OMIT_ALTERTABLE
-  if( !pSelect && IsOrdinaryTable(p) ){
+  /* The offset arithmetic assumes a "CREATE TABLE " prefix; a
+  ** materialized view's DDL has a different head and refuses ALTER
+  ** anyway, so it gets no offset. */
+  if( !pSelect && IsOrdinaryTable(p) && !IsMView(p) ){
     assert( pCons && pEnd );
     if( pCons->z==0 ){
       pCons = pEnd;
@@ -3389,7 +3405,7 @@ static void destroyTable(Parse *pParse, Table *pTab){
 ** Remove entries from the sqlite_statN tables (for N in (1,2,3))
 ** after a DROP INDEX or DROP TABLE command.
 */
-static void sqlite3ClearStatTables(
+void sqlite3ClearStatTables(
   Parse *pParse,         /* The parsing context */
   int iDb,               /* The database number */
   const char *zType,     /* "idx" or "tbl" */
@@ -3597,8 +3613,26 @@ void sqlite3DropTable(Parse *pParse, SrcList *pName, int isView, int noErr){
 
 #ifndef SQLITE_OMIT_VIEW
   /* Ensure DROP TABLE is not used on a view, and DROP VIEW is not used
-  ** on a table.
+  ** on a table.  A materialized view (fork) answers to neither: it has
+  ** its own DROP spelling.  And a table that a stored materialized-view
+  ** definition depends on may not be dropped at all -- the definition
+  ** would fail to re-derive at the next schema load.
   */
+  if( IsMView(pTab) ){
+    sqlite3ErrorMsg(pParse,
+       "use DROP MATERIALIZED VIEW to delete materialized view %s",
+       pTab->zName);
+    goto exit_drop_table;
+  }
+  if( !isView ){
+    const char *zMV = sqlite3MViewFindDependent(db, iDb, pTab->zName);
+    if( zMV ){
+      sqlite3ErrorMsg(pParse, "cannot drop table %s: materialized view "
+         "%s is defined on it; drop the materialized view first",
+         pTab->zName, zMV);
+      goto exit_drop_table;
+    }
+  }
   if( isView && !IsView(pTab) ){
     sqlite3ErrorMsg(pParse, "use DROP TABLE to delete table %s", pTab->zName);
     goto exit_drop_table;

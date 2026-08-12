@@ -66,6 +66,22 @@ CREATE INDEX); creation never automatic.
   Gate: creation/read/refusal tests green; every OTHER suite untouched;
   and the absence of maintenance is a STATED fact, not a gap — P2
   proves it visibly.
+  **EXECUTED 2026-08-12.** ivm1 1.x/2.x/8.x green, 13/24 red = exactly
+  the P2–P4 sections; full sweep (proc family + alter/vacuum/view/
+  pragma) 0 errors in BOTH regimes, baselines matching HANDOFF-IVM
+  (procfault 2734 rel / 3192 dbg); parse.out read, zero conflicts.
+  Beyond the checklist, three hazards closed that the plan had not
+  named: (1) columns re-derive from the stored SELECT at every schema
+  load, so DROP/RENAME/DROP-COLUMN of a base table with a dependent
+  mview is REFUSED (registry: `Schema.mviewHash`, procHash lifecycle) —
+  a dangling definition would fail the whole file's next open;
+  (2) `SELECT *` definitions refused (shape drift between stored rows
+  and re-derived columns); (3) VACUUM rebuilds mviews as tables (DDL
+  replays before the content copy; rowids preserved; the write refusal
+  exempts `DBFLAG_Vacuum`).  Also: `.dump`/`.tables`/`.schema`/
+  `PRAGMA table_list` all speak 'mview'.  Verified beyond ivm1 by a
+  reload/persistence/VACUUM/dependency-refusal scratch matrix (close,
+  reopen, re-derive, alter/drop legs both directions).
 - **P2 — the oracle.** `PRAGMA view_check` (rows + coverage summary,
   one snapshot) and `PRAGMA view_list` (name, maintenance, pending,
   stale). Gate: clean immediately after CREATE, and **RED against P1's

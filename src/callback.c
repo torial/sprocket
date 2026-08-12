@@ -519,6 +519,7 @@ void sqlite3SchemaClear(void *p){
     sqlite3HashClear(&tempProc);
   }
 #endif
+  sqlite3MViewHashClear(&pSchema->mviewHash);
   sqlite3HashInit(&pSchema->tblHash);
   for(pElem=sqliteHashFirst(&temp1); pElem; pElem=sqliteHashNext(pElem)){
     Table *pTab = sqliteHashData(pElem);
@@ -551,6 +552,7 @@ Schema *sqlite3SchemaGet(sqlite3 *db, Btree *pBt){
     sqlite3HashInit(&p->idxHash);
     sqlite3HashInit(&p->trigHash);
     sqlite3HashInit(&p->procHash);
+    sqlite3HashInit(&p->mviewHash);
     sqlite3HashInit(&p->fkeyHash);
     p->enc = SQLITE_UTF8;
   }

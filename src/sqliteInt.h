@@ -1516,6 +1516,7 @@ struct Schema {
   Hash idxHash;        /* All (named) indices indexed by name */
   Hash trigHash;       /* All triggers indexed by name */
   Hash procHash;       /* All stored procedures indexed by name */
+  Hash mviewHash;      /* MViewInfo for all materialized views, by name */
   Hash fkeyHash;       /* All foreign keys by referenced table name */
   Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
   u8 file_format;      /* Schema format version for this file */
@@ -2514,6 +2515,9 @@ struct Table {
 #define TF_Eponymous      0x00008000 /* An eponymous virtual table */
 #define TF_Strict         0x00010000 /* STRICT mode */
 #define TF_Imposter       0x00020000 /* An imposter table */
+#define TF_MView          0x00040000 /* A materialized view (fork): a real
+                                     ** table, engine-written only */
+#define TF_MViewDeferred  0x00080000 /* MView with MAINTENANCE DEFERRED */
 
 /*
 ** Allowed values for Table.eTabType
@@ -2524,6 +2528,7 @@ struct Table {
 
 #define IsView(X)           ((X)->eTabType==TABTYP_VIEW)
 #define IsOrdinaryTable(X)  ((X)->eTabType==TABTYP_NORM)
+#define IsMView(X)          (((X)->tabFlags & TF_MView)!=0)
 
 /*
 ** Test to see whether or not a table is a virtual table.  This is
@@ -3945,6 +3950,8 @@ struct Parse {
   bft bHasWith :1;     /* True if statement contains WITH */
   bft okConstFactor:1; /* OK to factor out constants */
   bft checkSchema :1;  /* Causes schema cookie check after an error */
+  bft bMViewCreate:1;  /* Inside CREATE MATERIALIZED VIEW: steers the
+                       ** object-name check's type to 'mview' (fork) */
   int nRangeReg;       /* Size of the temporary register block */
   int iRangeReg;       /* First register in temporary register block */
   int nErr;            /* Number of errors seen */
@@ -4606,6 +4613,7 @@ struct Walker {
     struct Table *pTab;                       /* Table of generated column */
     struct CoveringIndexCheck *pCovIdxCk;     /* Check for covering index */
     SrcItem *pSrcItem;                        /* A single FROM clause item */
+    struct MViewWalk *pMViewWalk;             /* mview conformance (fork) */
     DbFixer *pFix;                            /* See sqlite3FixSelect() */
     Mem *aMem;                                /* See sqlite3BtreeCursorHint() */
     struct CheckOnCtx *pCheckOnCtx;           /* See selectCheckOnClauses() */
@@ -5255,6 +5263,7 @@ void sqlite3CreateView(Parse*,Token*,Token*,Token*,ExprList*,Select*,int,int);
 #endif
 void sqlite3DropTable(Parse*, SrcList*, int, int);
 void sqlite3CodeDropTable(Parse*, Table*, int, int);
+void sqlite3ClearStatTables(Parse*, int, const char*, const char*);
 void sqlite3DeleteTable(sqlite3*, Table*);
 void sqlite3DeleteTableGeneric(sqlite3*, void*);
 void sqlite3FreeIndex(sqlite3*, Index*);
@@ -5538,6 +5547,38 @@ void sqlite3VdbeSetProcInterleave(Vdbe*, Proc*);
 # define sqlite3DeleteProc(A,B)
 # define sqlite3UnlinkAndDeleteProc(A,B,C)
 # define sqlite3ProcCacheFlush(A)
+#endif
+
+/* Materialized views (fork; see mview.c).  The view is a real table under
+** its own name -- schema type 'mview' -- populated at CREATE and, in later
+** phases, maintained by synthesized triggers.  MViewInfo is the in-memory
+** registry entry (Schema.mviewHash, keyed by view name): it carries what
+** the Table struct cannot without widening it for every ordinary table,
+** and it is what lets ALTER/DROP on a base table refuse instead of leaving
+** a definition that would fail to re-derive at the next schema load. */
+#ifndef SQLITE_OMIT_VIEW
+typedef struct MViewInfo MViewInfo;
+struct MViewInfo {
+  char *zName;             /* View name; also the hash key, so the entry
+                           ** never dangles into a freed Table */
+  char *zBase;             /* Name of the single base table */
+  u8 bDeferred;            /* True for WITH MAINTENANCE DEFERRED */
+};
+/* Values returned by sqlite3MViewMaintOption / mvmaint in the grammar */
+#define MVIEW_MAINT_UNSPEC   0    /* No WITH MAINTENANCE clause: eager */
+#define MVIEW_MAINT_EAGER    1
+#define MVIEW_MAINT_DEFERRED 2
+  void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Select*,
+                          int,int);
+  void sqlite3DropMView(Parse*, Token*, SrcList*, int);
+  int sqlite3MViewMaintOption(Parse*, Token*, Token*);
+  const char *sqlite3MViewFindDependent(sqlite3*, int, const char*);
+  void sqlite3MViewHashClear(Hash*);
+  void sqlite3UnlinkAndDeleteMView(sqlite3*, int, const char*);
+#else
+# define sqlite3MViewFindDependent(A,B,C) 0
+# define sqlite3MViewHashClear(A)
+# define sqlite3UnlinkAndDeleteMView(A,B,C)
 #endif
 
 void sqlite3SubProgramUnref(sqlite3*, SubProgram*);

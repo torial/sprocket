@@ -452,6 +452,7 @@ set flist {
    pragma.c
    prepare.c
    proc.c
+   mview.c
    select.c
    table.c
    trigger.c

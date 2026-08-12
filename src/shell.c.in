@@ -9471,7 +9471,9 @@ static int do_meta_command(const char *zLine, ShellState *p){
       zSql = sqlite3_mprintf(
         "SELECT sql FROM sqlite_schema AS o "
         "WHERE (%s) AND sql NOT NULL"
-        "  AND type IN ('index','trigger','view','proc') "
+        "  AND type IN ('index','trigger','view','proc','mview') "
+        /* DESC puts 'mview' after 'proc'/'view'/'trigger' but before
+        ** 'index', so indexes on materialized views restore last */
         "ORDER BY type COLLATE NOCASE DESC",
         zLike
       );
@@ -11408,7 +11410,7 @@ static int do_meta_command(const char *zLine, ShellState *p){
       }
       sqlite3_str_appendf(pSql, "\"%w\".sqlite_schema", zDbName);
       sqlite3_str_appendf(pSql,
-          " WHERE type IN ('table','view')"
+          " WHERE type IN ('table','view','mview')"
           "   AND name NOT LIKE 'sqlite__%%' ESCAPE '_'"
       );
       if( zPattern ){
