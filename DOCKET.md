@@ -1457,7 +1457,7 @@ over-read.
 
 ### Design questions to settle BEFORE code (drafted 2026-08-12, for Sean)
 
-1. **Eager or deferred?** Maintain on every write inside the writer's
+1. **Eager or deferred?** (all six expanded with scenarios in DESIGN-IVM.md) Maintain on every write inside the writer's
    transaction (reads always fresh, writers pay), or mark-dirty and fold in
    on read/checkpoint (writers cheap, first read pays)? The fork's
    read-heavy consumers (Graze, Mosaic) argue deferred; the equality
