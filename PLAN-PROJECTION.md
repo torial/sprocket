@@ -51,10 +51,22 @@ regime caught what its phases were never aimed at.
 **Done-means status:** unmodified callers byte-identical (all suites, both
 build regimes), cache provably separates projections (proc3c 6.2) and
 provably HITS (6.0/6.3), DOCKET §3c's open-question paragraph replaced with
-the settlement and a pointer here. Remaining from "done means": regenerating
-the Mosaic client (`witnesses_full`) picks up the projection automatically
-at its next `procgen` run — that regeneration belongs to the mosaic/sprocket
-repo, not this one.
+the settlement and a pointer here.
+
+**Mosaic regeneration verified 2026-08-11, and the "done means" sentence
+below needed correcting:** the checked-in `generated_mosaic.zbr` is
+byte-identical to a fresh `procgen` run — the 08-08 session had already
+regenerated after the emitter landed — and all three emitted queries run
+against the live `job.db` (atlas 6+6, witnesses 9+26, witnesses_full
+9+26+27, matching the README inventory), each cached under its correct
+key. But `CALL witnesses_full() RETURNING wid, siglum` cannot exist under
+this plan's own v1 scope: `witnesses_full` is DEPTH-2 (witnesses → claims →
+confidences), RETURNING is refused past one level, and `siglum` is not one
+of its columns. The projection benefit reaches the depth-1 clients —
+`atlas()` and `witnesses()` carry `RETURNING <value columns>` today — and
+the deep client honestly carries its folds until depth-N projection is
+built, which is a docket item of its own, not an unfinished edge of this
+one.
 
 ## Why now — a measured regression against the feature's own client
 
