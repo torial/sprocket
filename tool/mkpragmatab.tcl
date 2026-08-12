@@ -282,7 +282,7 @@ set pragma_def {
 
   NAME: proc_list
   FLAG: NeedSchema Result0
-  COLS: name nparams nresultsets declared security
+  COLS: name nparams nresultsets declared security writes
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_PROCEDURE)
 

@@ -146,4 +146,41 @@ do_test 4.1 {
   set r
 } {-1 -1}
 
+#--------------------------------------------------------------------
+# 5.x: the per-segment TOTAL (DOCKET 3f) rides along with the counts --
+# a two-nested-table shape proves the [counts..., totals...] hidden layout
+# indexes per table on both halves.
+#
+do_execsql_test 5.0 {
+  CREATE TABLE tags(tid INTEGER PRIMARY KEY, post_id INTEGER, tag TEXT);
+  INSERT INTO tags VALUES(1,1,'x'),(2,1,'y'),(3,2,'z');
+  CREATE PROCEDURE two_kids()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER)
+                    KEY(post_id = id),
+                  tags TABLE(post_id INTEGER, tag TEXT)
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, cid FROM comments;
+    SELECT post_id, tag FROM tags;
+  END;
+} {}
+do_test 5.1 {
+  set S [sqlite3_prepare_v2 db {CALL two_kids() WITH COUNTS} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_proc_child_count $S 0] [sqlite3_proc_child_total $S 0] \
+              [sqlite3_proc_child_count $S 1] [sqlite3_proc_child_total $S 1]]
+  sqlite3_finalize $S
+  set r
+} {3 4 2 3}
+
+# The visible surface still has not moved: totals are hidden metadata too.
+do_test 5.2 {
+  set S [sqlite3_prepare_v2 db {CALL two_kids() WITH COUNTS} -1 TAIL]
+  set n [sqlite3_column_count $S]
+  sqlite3_finalize $S
+  set n
+} {4}
+
 finish_test

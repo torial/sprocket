@@ -505,4 +505,46 @@ do_test 6.7 {
   execsql {CALL legacy_two(1)}
 } {1 1 1}
 
+#--------------------------------------------------------------------
+# 7.x: the writes column (DOCKET 3e) -- what a transport binding reads to
+# know whether a CALL is retry-safe.  Both directions planted: pure
+# readers (including loops, variables, and control flow) must report 0,
+# or every reader is refused retries it could have had; writers AND their
+# transitive callers must report 1, or a retry duplicates a write.
+#
+do_execsql_test 7.0 {
+  CREATE PROCEDURE w_read()
+  BEGIN
+    DECLARE i INTEGER DEFAULT 0;
+    WHILE i < 3 DO
+      SET i = i + 1;
+    END WHILE;
+    SELECT i;
+  END;
+  CREATE PROCEDURE w_write() RETURNS NOTHING
+  BEGIN
+    INSERT INTO posts VALUES(97, 'w', 'now');
+    DELETE FROM posts WHERE id = 97;
+  END;
+  CREATE PROCEDURE w_caller()
+  BEGIN
+    CALL w_write();
+    SELECT count(*) FROM posts;
+  END;
+  SELECT name, writes FROM pragma_proc_list
+   WHERE name LIKE 'w!_%' ESCAPE '!' ORDER BY name;
+} {w_caller 1 w_read 0 w_write 1}
+
+# Self-recursion is not misread as a write.
+do_execsql_test 7.1 {
+  CREATE PROCEDURE w_rec(n INTEGER)
+  BEGIN
+    IF n > 0 THEN
+      CALL w_rec(n - 1);
+    END IF;
+    SELECT n;
+  END;
+  SELECT writes FROM pragma_proc_list WHERE name = 'w_rec';
+} {0}
+
 finish_test

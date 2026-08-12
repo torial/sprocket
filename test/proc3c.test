@@ -245,4 +245,143 @@ do_test 7.1 {
 } {0}
 db3 close
 
+#--------------------------------------------------------------------
+# 8.x: RETURNING * -- DOCKET 3i.  All value columns, no generated folds,
+# at EVERY level.  The depth-2 fixture carries a tally per child level so
+# the scan counts can be stated per level, not just in total.
+#
+set ::nscan2 0
+proc tally2_cb {v} { incr ::nscan2 ; return $v }
+db function tally2 tally2_cb
+
+do_execsql_test 8.0 {
+  CREATE TABLE replies(rid INTEGER PRIMARY KEY, r_cid INTEGER, txt TEXT);
+  INSERT INTO replies VALUES(1,1,'r1'),(2,2,'r2'),(3,3,'r3');
+  CREATE PROCEDURE deep()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER,
+                                 replies TABLE(r_cid INTEGER, rid INTEGER)
+                                   KEY(r_cid = cid))
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, tally(cid) FROM comments;
+    SELECT r_cid, tally2(rid) FROM replies;
+  END;
+} {}
+
+proc walk_all {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  while 1 {
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+}
+
+# POSITIVE CONTROL and expected magnitudes, stated before the star runs.
+# MEASURED distribution (2026-08-12), not the naive model: seg0 costs
+# tally=16 tally2=3, seg1 adds 4+3, seg2 adds 3.  The naive model says
+# seg0 should cost 8 (2 parents x one full child scan of 4): the root fold
+# at depth evaluates the wrapped child TWICE per parent row -- recorded in
+# DOCKET 3i as a suspected fold-codegen inefficiency, pinned here so a fix
+# SHOWS UP as this number dropping to {12 9}.  Either way the star's win
+# in 8.2 is measured against what the default actually costs.
+do_test 8.1 {
+  set ::nscan 0
+  set ::nscan2 0
+  walk_all {CALL deep()}
+  list $::nscan $::nscan2
+} {20 9}
+
+# THE HEADLINE AT DEPTH: star drops every fold, and each level is scanned
+# exactly once, by its own segment.
+do_test 8.2 {
+  set ::nscan 0
+  set ::nscan2 0
+  walk_all {CALL deep() RETURNING *}
+  list $::nscan $::nscan2
+} {4 3}
+
+# Every segment's shape under star: value columns only, at every level.
+do_test 8.3 {
+  set S [sqlite3_prepare_v2 db {CALL deep() RETURNING *} -1 TAIL]
+  set shapes {}
+  while 1 {
+    set nm {}
+    for {set i 0} {$i < [sqlite3_column_count $S]} {incr i} {
+      lappend nm [sqlite3_column_name $S $i]
+    }
+    lappend shapes $nm
+    while {[sqlite3_step $S] eq "SQLITE_ROW"} {}
+    if {[sqlite3_proc_next_resultset $S] ne "SQLITE_OK"} break
+  }
+  sqlite3_finalize $S
+  set shapes
+} {{id title} {post_id cid} {r_cid rid}}
+
+# Value content under star is byte-identical to the default's value slices.
+do_test 8.4 {
+  set S [sqlite3_prepare_v2 db {CALL deep() RETURNING *} -1 TAIL]
+  set star {}
+  while {[sqlite3_step $S] eq "SQLITE_ROW"} {
+    lappend star [sqlite3_column_text $S 0] [sqlite3_column_text $S 1]
+  }
+  sqlite3_finalize $S
+  set D [sqlite3_prepare_v2 db {CALL deep()} -1 TAIL]
+  set dflt {}
+  while {[sqlite3_step $D] eq "SQLITE_ROW"} {
+    lappend dflt [sqlite3_column_text $D 0] [sqlite3_column_text $D 1]
+  }
+  sqlite3_finalize $D
+  expr {$star eq $dflt}
+} {1}
+
+# The named list stays refused at depth, and the refusal names the fix.
+do_catchsql_test 8.5 {
+  CALL deep() RETURNING id, title;
+} {1 {a RETURNING column list is not supported for a procedure whose nesting exceeds one level; RETURNING * (all value columns, no fold columns) works at any depth}}
+
+# The star body files under its own cache signature and HITS on re-prepare.
+do_test 8.6 {
+  sqlite3 db5 test.db
+  db5 function tally tally_cb
+  db5 function tally2 tally2_cb
+  prep_and_drain db5 {CALL deep() RETURNING *}
+  prep_and_drain db5 {CALL deep() RETURNING *}
+  set r [lsort [sqlite3_proc_cache_list db5]]
+  db5 close
+  set r
+} {{deep * 1}}
+
+# The plan-shaped leg at depth: the default compiles fold aggregates, the
+# star compiles none anywhere.
+do_test 8.7 {
+  list [regexp {json_group_array} [execsql {EXPLAIN CALL deep()}]] \
+       [regexp {json_group_array} [execsql {EXPLAIN CALL deep() RETURNING *}]]
+} {1 0}
+
+# Star composes with WITH COUNTS: the counts are parent-arm columns, not
+# folds, so declining every fold must not lose them.
+do_test 8.8 {
+  set S [sqlite3_prepare_v2 db {CALL pwc() RETURNING * WITH COUNTS} -1 TAIL]
+  sqlite3_step $S
+  set r [list [sqlite3_column_count $S] [sqlite3_proc_child_count $S 0]]
+  sqlite3_finalize $S
+  set r
+} {2 2}
+
+# Star at depth 1 equals the explicit all-value-columns list, row for row.
+do_test 8.9 {
+  set a [execsql {CALL pwc() RETURNING id, title}]
+  set b [execsql {CALL pwc() RETURNING *}]
+  expr {$a eq $b}
+} {1}
+
+# Star on a procedure with no declared shape is refused like a list is.
+do_catchsql_test 8.10 {
+  CREATE PROCEDURE bare() BEGIN SELECT 1; END;
+  CALL bare() RETURNING *;
+} {1 {procedure bare declares no result columns to project}}
+
 finish_test

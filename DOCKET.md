@@ -747,7 +747,109 @@ three bug finds are recorded in the plan.
 
 ---
 
+## 3i. RETURNING at depth — projection over nested shapes
+
+**Written 2026-08-12, from a consumer hitting the wall rather than from
+symmetry.** `witnesses_full` (Mosaic: witnesses → claims → confidences,
+depth 2) is the projection feature's own motivating client one level deeper
+than the feature reaches: RETURNING is refused past one level of nesting, so
+procgen's Zebra emitter leaves the deep client paying JSON fold construction
+at **every** level for columns it stitches from segments and never reads.
+The 3c campaign's "done means" sentence promised this proc a projection it
+cannot legally write — caught 2026-08-11, recorded in PLAN-PROJECTION.md.
+
+**Why depth-1 RETURNING refuses depth.** The projection list names root
+columns, but at depth the *child segments themselves* carry generated folds
+(a claims row carries the confidences fold), and a root-scoped list has no
+way to name them. Silently accepting the list and leaving the inner folds
+would be the accept-and-ignore failure this branch keeps refusing.
+
+**Three designs considered:**
+
+- **A. Root-scope list at depth** — allow the depth-1 semantics on deep
+  procs; inner segments keep their folds. Rejected: for the one consumer
+  that exists this is half the win (the claims-segment fold is exactly as
+  wasted as the root one), and it silently under-delivers what the spelling
+  appears to promise.
+- **B. Nested projection syntax** — `RETURNING wid, claims(subject, cid)`.
+  Full generality: per-column choice at every level, grammar mirroring the
+  declaration. Rejected *for now*: no consumer needs per-column choice at
+  depth (the typed client's need is uniform), and it costs a recursive
+  grammar, recursive validation, and a tree-shaped cache-key
+  canonicalization. This is the someday-general form; nothing in C
+  forecloses it.
+- **C. `RETURNING *` — all value columns, no generated folds, at every
+  level.** The consumer's actual request has one shape: "the declared value
+  columns; I stitch children from segments; generate no folds anywhere."
+  One spelling serves it exactly. **Chosen.**
+
+**C's semantics, deliberately narrow:**
+
+- `RETURNING *` is accepted at ANY depth (including depth 1, where it means
+  "keep every value column, drop every fold" — expressible today only by
+  listing all value columns).
+- Fold columns are declined at every level: the root SELECT's and each
+  child segment's. Segments themselves are untouched, as in 3c —
+  `nresultsets` does not change, the invariant stays opt-in.
+- The named-list form keeps its depth-1-only rule and its refusal past one
+  level; the refusal message now names `RETURNING *` as the fix (UNGIT:
+  refusals name the fix).
+- Cache key: `*` canonicalizes to its own signature, distinct from the
+  default body and from any named list.
+- `WITH COUNTS` composes unchanged (counts are parent-arm columns, not
+  folds). INTERLEAVED continues to refuse RETURNING in both spellings —
+  it computes no folds, nothing to decline (3h, closed).
+- procgen: deep nested procs emit `RETURNING *`; depth-1 emission may
+  switch to `*` for uniformity or keep explicit lists (decide by whichever
+  keeps regeneration byte-identical for existing clients).
+
+**Done means:** a depth-2 fixture under `RETURNING *` shows zero child
+scans on the parent walk at BOTH levels (the proc3c 3.x measurement, one
+level deeper), segment content byte-identical to the default's segments,
+the planted cache legs extended to the `*` signature, and procgen's deep
+emission verified end-to-end against `witnesses_full` on the live Mosaic
+database.
+
+### ✅ IMPLEMENTED 2026-08-12 — and the control measured something extra
+
+Landed as designed (option C): `"*"` sentinel IdList, nested-aware
+`sqlite3ProcProjKeeps(pProj, zName, bNested)`, star flowing down the
+child-descriptor recursion, `"*"` cache signature (deliberately not
+deduped with the expanded list — the comment in `procProjSignature` says
+why), named-list depth refusal now names the fix, procgen deep emission.
+Zero lemon conflicts, checked in `parse.out` rather than assumed.
+`proc3c` 8.x: full walk at depth-2 drops from measured `{20 9}` scans to
+`{4 3}` — each level scanned exactly once, by its own segment.
+
+**The positive control found a real question:** the default's parent walk
+costs `tally=16` where the naive model says 8 — the depth fold evaluates
+the wrapped child TWICE per parent row (measured per segment, pinned in
+proc3c 8.1 so a fix shows up as the number dropping to `{12 9}`).
+Suspect: the inner fold's correlation referencing the wrapped child's
+expression column re-evaluates it.  A fold-codegen inefficiency, not a
+correctness bug (8.4 pins value equality); worth a look whenever the fold
+codegen is next open.
+
+---
+
 ## 3d. `mayAbort` assertion in stored procedures — *a real bug, inherited*
+
+### ✅ FIXED 2026-08-12 on `stored-procs` (`ada5adc0`), merged here
+
+The hypothesis below (cache replay) was **wrong** — the assert fires on the
+first fresh compile. Root cause: `codeProcProgram` claimed
+`sqlite3MayAbort()` blanket for every write step, and the claim is false
+for a body whose writes cannot abort; simply dropping it fails the debug
+auditor the other way (a body SELECT calling any function counts as
+abortable). The claim is now **computed from the compiled opcodes**
+(`procProgramMayAbort`, mirroring `sqlite3VdbeAssertMayAbort`'s own test),
+so the CALL claims exactly what its body can do. Behind that wall a second
+bug: the autoinc machinery records the `sqlite_sequence` table lock during
+`FinishCoding`, *after* the OP_TableLock prologue is emitted — recorded but
+never coded; `autoIncBegin` now records it in time. (Latent upstream for
+trigger bodies inserting into AUTOINCREMENT tables under shared cache.)
+With both fixes the ENTIRE proc family runs green under `DEBUG=3` for the
+first time — proc1/2/3/4/5/psm1 included.
 
 **Found 2026-08-04 by building `DEBUG=3`.** Every build of this fork's
 procedure work had been `-O2` with `NDEBUG`, so no `assert()` had ever run.
@@ -1189,6 +1291,17 @@ above (support depth ≥ 2 properly) deserves more weight than it was given.
 
 ## 3f. The segment total — the one check per-parent counts cannot make
 
+### ✅ IMPLEMENTED 2026-08-12
+
+As proposed below, with the sibling call: `WITH COUNTS` now also carries a
+per-nested-table TOTAL — the child SELECT's row count WITHOUT the
+correlation, an uncorrelated scalar the optimizer evaluates once — in the
+hidden layout `[counts..., totals...]`, read by `sqlite3_proc_child_total()`.
+`procnull` 1.4 pins the orphan detection on the parent row (count 2,
+total 3, before the child segment is ever walked), 1.6 pins quiet on clean
+data, 1.5 pins the -1 legs; `proc4c` 5.x pins per-table indexing of both
+halves on a two-table shape and that the visible surface does not move.
+
 **Found 2026-08-05 by adversarial review, pinned in `test/procnull.test`.**
 
 A child row whose correlation key is **NULL** attaches to no parent. SQL equality
@@ -1226,6 +1339,19 @@ correlation column, and the R7 index advisory is the natural place to mention it
 ---
 
 ## 3e. Declared idempotency — *the engine knows; nobody can ask*
+
+### ✅ IMPLEMENTED 2026-08-12 — `writes` on `PRAGMA proc_list`
+
+Derived by walking the body's TriggerStep list (`sqlite3ProcBodyWrites`):
+INSERT/UPDATE/DELETE and any unknown step kind report writes; SELECT
+(incl. INTO), DECLARE/SET/LEAVE/RETURN/RAISE do not; IF/WHILE recurse;
+CALL resolves the callee and walks it, with an unresolvable callee, a
+visited-set overflow, or any future step kind all counting as writes —
+conservative in exactly the direction the entry below argues.  Computed
+fresh per pragma row rather than stored, so it cannot go stale against
+the schema it describes.  Recursion (self or mutual) is not misread as a
+write.  `proc4` 7.x pins both directions.  Deliberately NOT named
+idempotent, per the honest limit below.
 
 **Raised 2026-08-05 while checking whether Tack's design accounted for the wire
 transport. It does (`ZEBRA_ORM_ARCHITECTURE.md` §14.6) — but it predates this,

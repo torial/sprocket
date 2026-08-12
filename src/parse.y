@@ -2046,6 +2046,15 @@ cmd ::= CALL fullname(X) LP exprlist(Y) RP RETURNING projlist(P) wcounts(C). {
 cmd ::= CALL fullname(X) RETURNING projlist(P) wcounts(C). {
   sqlite3CallProcProject(pParse, X, 0, P, C);
 }
+// DOCKET 3i: RETURNING * -- all value columns, no generated folds, at any
+// depth.  STAR is an existing token; the sentinel IdList it builds is the
+// only thing that travels.
+cmd ::= CALL fullname(X) LP exprlist(Y) RP RETURNING STAR wcounts(C). {
+  sqlite3CallProcProject(pParse, X, Y, sqlite3ProcProjStar(pParse), C);
+}
+cmd ::= CALL fullname(X) RETURNING STAR wcounts(C). {
+  sqlite3CallProcProject(pParse, X, 0, sqlite3ProcProjStar(pParse), C);
+}
 %endif  !SQLITE_OMIT_PROCEDURE
 
 //////////////////////// ATTACH DATABASE file AS name /////////////////////////

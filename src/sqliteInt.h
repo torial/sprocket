@@ -5511,7 +5511,10 @@ void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
   int sqlite3VdbeAttachSubProgram(Vdbe*, SubProgram*);
   void sqlite3VdbeSetProcShapes(Vdbe*, ProcShape*, IdList*, int);
 void sqlite3VdbeSetProcInterleave(Vdbe*, Proc*);
-  int sqlite3ProcProjKeeps(IdList*,const char*);
+  int sqlite3ProcProjKeeps(IdList*,const char*,int);
+  int sqlite3ProcProjIsStar(IdList*);
+  IdList *sqlite3ProcProjStar(Parse*);
+  int sqlite3ProcBodyWrites(sqlite3*,Proc*);
   int sqlite3ProcCallOption(Parse*,Token*);
   const char *sqlite3ProcFoldKeyName(ProcFold*);
 /* Options on a CALL, a bitmask so they compose rather than multiply the

@@ -2968,15 +2968,22 @@ void sqlite3VdbeApplyProcSet(Vdbe *p, int iSet){
 static void vdbeProcShapeSize(ProcParamList *pC, IdList *pProj, int bCounts,
                               int *pnSet, int *pmaxCol){
   int i, nKeep = 0;
+  /* Named projections stop at the root (depth with a named RETURNING is
+  ** refused at CALL, so recursing 0 was exact).  The STAR projection --
+  ** DOCKET 3i -- reaches every level: each segment's own generated folds
+  ** are declined, so its descriptors must drop nested columns too. */
+  IdList *pProjDown = sqlite3ProcProjIsStar(pProj) ? pProj : 0;
   (*pnSet)++;
   for(i=0; i<pC->nParam; i++){
-    if( sqlite3ProcProjKeeps(pProj, pC->a[i].zName) ) nKeep++;
-    if( bCounts && pC->a[i].pNested ) nKeep++;       /* its hidden count */
+    if( sqlite3ProcProjKeeps(pProj, pC->a[i].zName, pC->a[i].pNested!=0) ){
+      nKeep++;
+    }
+    if( bCounts && pC->a[i].pNested ) nKeep += 2;    /* hidden count+total */
   }
   if( nKeep>*pmaxCol ) *pmaxCol = nKeep;
   for(i=0; i<pC->nParam; i++){
     if( pC->a[i].pNested ){
-      vdbeProcShapeSize(pC->a[i].pNested, 0, bCounts, pnSet, pmaxCol);
+      vdbeProcShapeSize(pC->a[i].pNested, pProjDown, bCounts, pnSet, pmaxCol);
     }
   }
 }
@@ -2984,9 +2991,12 @@ static int vdbeProcShapeFill(Vdbe *p, sqlite3 *db, ProcParamList *pC,
                              IdList *pProj, int bCounts, int *pi){
   VdbeProcSet *pDest = &p->aProcSet[(*pi)++];
   int j, k = 0, nKeep = 0, nHid = 0;
+  IdList *pProjDown = sqlite3ProcProjIsStar(pProj) ? pProj : 0;
   for(j=0; j<pC->nParam; j++){
-    if( sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) nKeep++;
-    if( bCounts && pC->a[j].pNested ) nHid++;
+    if( sqlite3ProcProjKeeps(pProj, pC->a[j].zName, pC->a[j].pNested!=0) ){
+      nKeep++;
+    }
+    if( bCounts && pC->a[j].pNested ) nHid += 2;   /* count + total, 3f */
   }
   /* nCol counts what OP_ResultRow EMITS -- visible columns plus this
   ** shape's trailing count columns -- because vdbe.c asserts the two
@@ -2997,14 +3007,18 @@ static int vdbeProcShapeFill(Vdbe *p, sqlite3 *db, ProcParamList *pC,
   pDest->azType = sqlite3DbMallocZero(db, (nKeep+nHid+1)*sizeof(char*));
   if( pDest->azName==0 || pDest->azType==0 ) return 1;
   for(j=0; j<pC->nParam; j++){
-    if( !sqlite3ProcProjKeeps(pProj, pC->a[j].zName) ) continue;
+    if( !sqlite3ProcProjKeeps(pProj, pC->a[j].zName, pC->a[j].pNested!=0) ){
+      continue;
+    }
     pDest->azName[k] = sqlite3DbStrDup(db, pC->a[j].zName);
     pDest->azType[k] = sqlite3DbStrDup(db, pC->a[j].zType);
     k++;
   }
   for(j=0; j<pC->nParam; j++){
     if( pC->a[j].pNested==0 ) continue;
-    if( vdbeProcShapeFill(p, db, pC->a[j].pNested, 0, bCounts, pi) ) return 1;
+    if( vdbeProcShapeFill(p, db, pC->a[j].pNested, pProjDown, bCounts, pi) ){
+      return 1;
+    }
   }
   return 0;
 }

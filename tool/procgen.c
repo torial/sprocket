@@ -572,9 +572,10 @@ int main(int argc, char **argv){
       ** to deferred-call bind-list lowering means a param'd deferred method
       ** builds its []_SqliteParam exactly like the known query() path, so the
       ** incantation is no longer needed.  RETURNING projects the fold columns
-      ** away -- but only at depth 1: past one level the engine refuses the
-      ** composition, so deep clients carry the fold columns and never read
-      ** them (the cost is paid here, hence noted here). */
+      ** away: an explicit value-column list at depth 1 (kept for regen
+      ** stability of existing clients), and RETURNING * past one level --
+      ** DOCKET 3i -- which declines the folds of EVERY segment, so deep
+      ** clients no longer pay for columns they stitch from segments. */
       if( nNest && nParam==0 ){
         fprintf(out, "    var rows = d.query_segments(\"CALL %s(", zProc);
       }else if( nNest ){
@@ -593,6 +594,8 @@ int main(int argc, char **argv){
           if( nSeen++ ) fputs(", ", out);
           emitIdent(aCol[i].zName);
         }
+      }else if( nNest ){
+        fputs(" RETURNING *", out);
       }
       fputs("\"", out);
       if( nParam>0 ){

@@ -5637,6 +5637,30 @@ int sqlite3_proc_next_resultset(sqlite3_stmt*);
 int sqlite3_proc_child_count(sqlite3_stmt*, int);
 
 /*
+** CAPI3REF: Total Rows Of A Child Segment
+** METHOD: sqlite3_stmt
+**
+** ^This interface returns the total number of rows the N-th nested table's
+** child SELECT produces, computed WITHOUT the parent correlation, for the
+** current row of the current result set.  Like sqlite3_proc_child_count()
+** it is only available under the WITH COUNTS clause and returns -1
+** otherwise, for an out-of-range N, or when no row is available.
+**
+** ^The check this exists for: summing sqlite3_proc_child_count() over the
+** parent rows and comparing against this total crosses the correlation
+** predicate -- the sum counts rows that attached to a parent, the total
+** counts rows the child SELECT produced.  A child row whose correlation
+** key is NULL attaches to no parent and appears in no per-parent count,
+** silently; it does appear here.  A reassembler asserting
+** sum(counts)==total makes that loss loud.
+**
+** The same honest limit as the counts applies: the total and the rows come
+** from the same child SELECT, so this detects rows the correlation LOST,
+** not a correlation that is wrong.
+*/
+int sqlite3_proc_child_total(sqlite3_stmt*, int);
+
+/*
 ** CAPI3REF: Which Segment The Current Row Belongs To
 ** METHOD: sqlite3_stmt
 **

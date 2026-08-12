@@ -83,10 +83,10 @@ even when it reports nothing, so **a clean tail is not a pass.** Always read the
 `N errors out of M tests` line, and check M.
 
 *(Counts refreshed 2026-08-11, PLAN-PROJECTION session.  procfault differs
-by build: 2484 release / 2878 DEBUG=3, where the cache's lock-replay paths
-are walked.  Under DEBUG=3, proc1/2/3/4/5/psm1 die at the pre-existing 3d
-mayAbort assert — run those six on release until 3d is fixed on
-stored-procs.)*
+by build: 2484 release / 2886 DEBUG=3, where the cache's lock-replay paths
+are walked.  3d is FIXED as of 2026-08-12 — the ENTIRE family, proc1/2/3/
+4/5/psm1 included, runs green under DEBUG=3; there is no longer any suite
+that needs a release-only run.)*
 
 | suite | tests | | suite | tests |
 |---|---|---|---|---|

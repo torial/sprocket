@@ -336,6 +336,89 @@ static void procTokenSet(Token *pTok, const char *z){
 }
 
 /*
+** DOCKET 3e -- does this body write the database?  Computed on demand for
+** PRAGMA proc_list's `writes` column, so a generated client can learn at
+** build time whether a CALL is retry-safe over a transport.
+**
+** Conservative in the stated direction: anything unresolvable -- a callee
+** that no longer exists, nesting past the visited cap, a step kind this
+** switch does not know -- counts as a WRITE.  A procedure wrongly marked
+** read-only invites a retry that applies a write twice, silently; one
+** wrongly marked as writing costs an unnecessary error on a dropped
+** connection.  Misses are recoverable, false assurances are not.
+**
+** "Does not write" is deliberately NOT "idempotent": a read-only body
+** calling a non-deterministic function is safe to RESEND, not safe to
+** treat as unchanged.  The column is named `writes` so it cannot be
+** over-read.
+*/
+#define PROC_WRITES_MAXSEEN 16
+static int procStepsWrite(sqlite3*, TriggerStep*, Proc**, int);
+static int procCalleeWrites(sqlite3 *db, TriggerStep *pStep,
+                            Proc **apSeen, int nSeen){
+  Proc *pCallee = 0;
+  int i;
+  if( pStep->pSrc && pStep->pSrc->nSrc>0 && pStep->pSrc->a[0].zName ){
+    SrcItem *pItem = &pStep->pSrc->a[0];
+    const char *zDb = 0;
+    if( pItem->fg.fixedSchema ){
+      zDb = db->aDb[sqlite3SchemaToIndex(db, pItem->u4.pSchema)].zDbSName;
+    }else{
+      zDb = pItem->u4.zDatabase;
+    }
+    for(i=0; i<db->nDb && pCallee==0; i++){
+      Schema *pSchema = db->aDb[i].pSchema;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[i].zDbSName)!=0 ) continue;
+      pCallee = (Proc*)sqlite3HashFind(&pSchema->procHash, pItem->zName);
+    }
+  }
+  if( pCallee==0 ) return 1;             /* unresolvable: writes */
+  for(i=0; i<nSeen; i++){
+    /* Already under examination (recursion, mutual or self): this CALL
+    ** adds no writes beyond what that walk itself finds. */
+    if( apSeen[i]==pCallee ) return 0;
+  }
+  if( nSeen>=PROC_WRITES_MAXSEEN ) return 1;   /* too deep to be sure */
+  apSeen[nSeen] = pCallee;
+  return procStepsWrite(db, pCallee->pBody, apSeen, nSeen+1);
+}
+static int procStepsWrite(sqlite3 *db, TriggerStep *pList,
+                          Proc **apSeen, int nSeen){
+  TriggerStep *pStep;
+  for(pStep=pList; pStep; pStep=pStep->pNext){
+    switch( pStep->op ){
+      case TK_SELECT:      /* reads; INTO writes only variables */
+      case TK_DECLARE:
+      case TK_SET:
+      case TK_LEAVE:
+      case TK_RETURN:
+      case TK_RAISE:
+        break;
+      case TK_IF:
+        if( procStepsWrite(db, pStep->pThen, apSeen, nSeen) ) return 1;
+        if( procStepsWrite(db, pStep->pElse, apSeen, nSeen) ) return 1;
+        break;
+      case TK_WHILE:
+        if( procStepsWrite(db, pStep->pThen, apSeen, nSeen) ) return 1;
+        break;
+      case TK_CALL:
+        if( procCalleeWrites(db, pStep, apSeen, nSeen) ) return 1;
+        break;
+      default:
+        return 1;          /* INSERT, UPDATE, DELETE, and anything newer
+                           ** than this switch */
+    }
+  }
+  return 0;
+}
+int sqlite3ProcBodyWrites(sqlite3 *db, Proc *pProc){
+  Proc *apSeen[PROC_WRITES_MAXSEEN];
+  apSeen[0] = pProc;
+  return procStepsWrite(db, pProc->pBody, apSeen, 1);
+}
+
+/*
 ** Add the flat-client column to the parent SELECT -- PLAN-NESTED phase 5b.
 **
 ** The parent gains a result column at the nested table's DECLARED position:
@@ -565,7 +648,7 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
     pInner->pEList->a[iVal].zEName = sqlite3DbStrDup(db, pCols->a[j].zName);
     pInner->pEList->a[iVal].fg.eEName = ENAME_NAME;
     iVal++;
-    if( !sqlite3ProcProjKeeps(pProj, pCols->a[j].zName) ) continue;
+    if( !sqlite3ProcProjKeeps(pProj, pCols->a[j].zName, 0) ) continue;
     procTokenSet(&tTab, PROC_PARENT_ALIAS);
     procTokenSet(&tCol, pCols->a[j].zName);
     pDot = sqlite3PExpr(pParse, TK_DOT,
@@ -748,7 +831,10 @@ fold_col_err:
     ** over the declaration: dropping an earlier column shifts this one left. */
     int iPos = 0, k;
     for(k=0; k<pF->iDeclPos && k<pF->pShapeCols->nParam; k++){
-      if( sqlite3ProcProjKeeps(pProj, pF->pShapeCols->a[k].zName) ) iPos++;
+      if( sqlite3ProcProjKeeps(pProj, pF->pShapeCols->a[k].zName,
+                               pF->pShapeCols->a[k].pNested!=0) ){
+        iPos++;
+      }
     }
     if( iPos < pPE->nExpr-1 ){
       struct ExprList_item tmp = pPE->a[pPE->nExpr-1];
@@ -821,19 +907,92 @@ static void procAddCountColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
 }
 
 /*
+** DOCKET 3f -- the per-segment TOTAL, the one check per-parent counts
+** cannot make.  A child row whose correlation key is NULL attaches to no
+** parent: absent from the fold, the grouping, and every per-parent count,
+** and the loss is silent (procnull pins it).  This column is the child
+** SELECT's row count WITHOUT the correlation --
+**
+**     (SELECT count(*) FROM (<child SELECT>, ORDER BY stripped))
+**
+** -- so the comparison sum(per-parent counts) == total crosses the
+** predicate: one side is grouped by the correlation, the other is not,
+** which is exactly what makes orphaned rows visible.  Uncorrelated, so
+** the subquery is evaluated once per statement, not per parent row.
+**
+** Same honest limit as the counts (POC 3): this detects rows the
+** correlation LOST, not a correlation that is wrong -- total and rows
+** still come from the same child SELECT.
+*/
+static void procAddTotalColumn(Parse *pParse, Select *pWrap, ProcFold *pF){
+  sqlite3 *db = pParse->db;
+  Expr *pAgg, *pSel;
+  ExprList *pPE;
+  Select *pSub;
+  Token tk;
+
+  if( pF->pChild==0 || pF->pChild->pSelect==0 ) return;
+  pSub = sqlite3SelectDup(db, pF->pChild->pSelect, 0);
+  if( pSub==0 ) return;
+  sqlite3ExprListDelete(db, pSub->pOrderBy);
+  pSub->pOrderBy = 0;
+  sqlite3ExprListDelete(db, pSub->pEList);
+  procTokenSet(&tk, "count");
+  pAgg = sqlite3ExprFunction(pParse, 0, &tk, 0);
+  pSub->pEList = sqlite3ExprListAppend(pParse, 0, pAgg);
+
+  pSel = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+  if( pSel==0 ){
+    sqlite3SelectDelete(db, pSub);
+    return;
+  }
+  sqlite3PExprAddSelect(pParse, pSel, pSub);
+  pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
+  pWrap->pEList = pPE;   /* assign even on failure -- Append freed the old */
+}
+
+/*
 ** Apply every fold recipe belonging to body statement pStep onto *ppSel, which
 ** is the CALL-time copy of that statement's SELECT.  Wraps once, however many
 ** nested tables the shape holds.  A no-op for a procedure that nests nothing,
 ** which is why this can sit unconditionally on the codegen path.
 */
 /*
+** DOCKET 3i.  RETURNING * -- all value columns, no generated folds, at
+** every level -- travels as a sentinel IdList whose single entry is "*".
+** No parsed name can normally collide: the grammar routes a bare * here
+** and a real column would arrive as an identifier.  The one collision is
+** a QUOTED "*" naming a declared column literally called *, which then
+** gets star semantics; a schema doing that has bought its ambiguity, and
+** the workaround (rename the column) is priced here rather than hidden.
+*/
+int sqlite3ProcProjIsStar(IdList *pProj){
+  return pProj!=0 && pProj->nId==1
+      && pProj->a[0].zName[0]=='*' && pProj->a[0].zName[1]==0;
+}
+
+/*
+** Build the sentinel for the grammar action.  NULL on OOM, which
+** sqlite3CallProcProject already treats as a dead parse.
+*/
+IdList *sqlite3ProcProjStar(Parse *pParse){
+  Token t;
+  t.z = "*";
+  t.n = 1;
+  return sqlite3IdListAppend(pParse, 0, &t);
+}
+
+/*
 ** True if a RETURNING projection keeps the named declared column.  A NULL
 ** projection keeps everything, which is what an unmodified client sends and
-** is why the invariant survives this feature.
+** is why the invariant survives this feature.  The star projection keeps
+** every VALUE column and no fold, which is why it needs bNested: the same
+** name answers differently depending on what kind of column it names.
 */
-int sqlite3ProcProjKeeps(IdList *pProj, const char *zName){
+int sqlite3ProcProjKeeps(IdList *pProj, const char *zName, int bNested){
   int i;
   if( pProj==0 ) return 1;
+  if( sqlite3ProcProjIsStar(pProj) ) return !bNested;
   for(i=0; i<pProj->nId; i++){
     if( sqlite3StrICmp(pProj->a[i].zName, zName)==0 ) return 1;
   }
@@ -853,7 +1012,7 @@ static int procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
   for(pF=pProc->pFolds; pF; pF=pF->pNext){
     int bKeep;
     if( pF->pParent!=pStep ) continue;
-    bKeep = sqlite3ProcProjKeeps(pProj, pF->zName);
+    bKeep = sqlite3ProcProjKeeps(pProj, pF->zName, 1);
     if( !bKeep && !bCounts ) continue;
     if( !bWrapped ){
       if( procWrapParent(pParse, ppSel, pF->pShapeCols, pProj) ) return 0;
@@ -865,11 +1024,19 @@ static int procApplyFolds(Parse *pParse, Select **ppSel, Proc *pProc,
   /* Pass 2, kept separate so the counts land AFTER every visible column
   ** whatever the declared positions were.  Their offsets are what
   ** sqlite3_proc_child_count() indexes, so they must be contiguous at the end
-  ** and in declaration order. */
+  ** and in declaration order.  Pass 3 appends the per-segment TOTALS
+  ** (DOCKET 3f) after ALL the counts, so the hidden layout is
+  ** [count_0..count_k-1, total_0..total_k-1] and the count indexing that
+  ** shipped stays where it was. */
   if( bCounts && bWrapped ){
     for(pF=pProc->pFolds; pF; pF=pF->pNext){
       if( pF->pParent!=pStep ) continue;
       procAddCountColumn(pParse, *ppSel, pF);
+      nHidden++;
+    }
+    for(pF=pProc->pFolds; pF; pF=pF->pNext){
+      if( pF->pParent!=pStep ) continue;
+      procAddTotalColumn(pParse, *ppSel, pF);
       nHidden++;
     }
   }
@@ -2844,6 +3011,13 @@ static char *procProjSignature(sqlite3 *db, Proc *pProc, IdList *pProj){
   sqlite3_str acc;
   int i, j;
   assert( pProj!=0 );
+  /* The star projection is its own key, deliberately NOT canonicalized to
+  ** the expanded value-column list: at depth it also declines the INNER
+  ** segments' folds, which no expressible named list means, and letting
+  ** the two spell the same signature would let them share a body whose
+  ** compilations differ.  At depth 1 this costs one redundant cache entry
+  ** for a caller who spells both forms; correctness over dedup. */
+  if( sqlite3ProcProjIsStar(pProj) ) return sqlite3DbStrDup(db, "*");
   sqlite3StrAccumInit(&acc, db, 0, 0, db->aLimit[SQLITE_LIMIT_LENGTH]);
   for(pS=pProc->pShapes; pS; pS=pS->pNext){
     if( pS->pCols==0 ) continue;
@@ -3167,6 +3341,10 @@ static int procCheckProjection(Parse *pParse, Proc *pProc, IdList *pProj){
       "procedure %s declares no result columns to project", pProc->zName);
     return 1;
   }
+  /* RETURNING * -- DOCKET 3i -- names nothing, so there is nothing to
+  ** resolve, no duplicate to refuse, and no fold kept whose correlation
+  ** key could go missing.  Valid for any declared procedure, any depth. */
+  if( sqlite3ProcProjIsStar(pProj) ) return 0;
   for(i=0; i<pProj->nId; i++){
     int bFound = 0;
     for(j=0; j<i; j++){
@@ -3365,12 +3543,15 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
       "procedure %s declares no nested table to count", pProc->zName);
     goto call_cleanup;
   }
-  /* PLAN-DEPTH v1: projection names only root columns and the interleave
-  ** merge has only one order, so both stop at one level of nesting.  Refused
-  ** with the reason, not silently mis-served. */
-  if( pProj && procShapeDepth(pProc)>1 ){
-    sqlite3ErrorMsg(pParse, "RETURNING is not supported for a procedure "
-      "whose nesting exceeds one level yet");
+  /* PLAN-DEPTH v1: a NAMED projection list names only root columns, and
+  ** the child segments at depth carry generated folds it cannot name, so
+  ** it stops at one level of nesting.  RETURNING * (DOCKET 3i) is exempt:
+  ** it declines every fold at every level and names nothing.  Refused
+  ** with the reason AND the fix, not silently mis-served. */
+  if( pProj && !sqlite3ProcProjIsStar(pProj) && procShapeDepth(pProc)>1 ){
+    sqlite3ErrorMsg(pParse, "a RETURNING column list is not supported for "
+      "a procedure whose nesting exceeds one level; RETURNING * (all value "
+      "columns, no fold columns) works at any depth");
     goto call_cleanup;
   }
   if( (bCounts & PROC_OPT_INTERLEAVED)!=0 && procShapeDepth(pProc)>1 ){

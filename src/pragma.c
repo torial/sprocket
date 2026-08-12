@@ -1562,7 +1562,7 @@ void sqlite3Pragma(
   */
   case PragTyp_PROC_LIST: {
     int ii;
-    pParse->nMem = 5;
+    pParse->nMem = 6;
     for(ii=0; ii<db->nDb; ii++){
       HashElem *k;
       Schema *pSchema;
@@ -1575,12 +1575,16 @@ void sqlite3Pragma(
         int nSeg = sqlite3ProcSegmentCount(pProc);
         /* `security` is spelled out rather than reported as a bit: a client
         ** generator has to reproduce the clause, and a human reading the
-        ** pragma should not have to remember which way round 0 and 1 go. */
-        sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
+        ** pragma should not have to remember which way round 0 and 1 go.
+        ** `writes` (DOCKET 3e) is what a transport binding reads to know
+        ** whether a CALL may be retried; computed fresh per row, so it
+        ** cannot go stale against the schema it describes. */
+        sqlite3VdbeMultiLoad(v, 1, "siiisi", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
             pProc->eRet==PROC_RET_TABLES ? nSeg : 0,
             pProc->eRet!=PROC_RET_UNDECLARED,
-            pProc->bDefiner ? "DEFINER" : "INVOKER");
+            pProc->bDefiner ? "DEFINER" : "INVOKER",
+            sqlite3ProcBodyWrites(db, pProc));
       }
     }
     if( !OMIT_TEMPDB && (zDb==0
@@ -1590,14 +1594,12 @@ void sqlite3Pragma(
           k=sqliteHashNext(k)){
         Proc *pProc = (Proc*)sqliteHashData(k);
         int nSeg = sqlite3ProcSegmentCount(pProc);
-        /* `security` is spelled out rather than reported as a bit: a client
-        ** generator has to reproduce the clause, and a human reading the
-        ** pragma should not have to remember which way round 0 and 1 go. */
-        sqlite3VdbeMultiLoad(v, 1, "siiis", pProc->zName,
+        sqlite3VdbeMultiLoad(v, 1, "siiisi", pProc->zName,
             pProc->pParams ? pProc->pParams->nParam : 0,
             pProc->eRet==PROC_RET_TABLES ? nSeg : 0,
             pProc->eRet!=PROC_RET_UNDECLARED,
-            pProc->bDefiner ? "DEFINER" : "INVOKER");
+            pProc->bDefiner ? "DEFINER" : "INVOKER",
+            sqlite3ProcBodyWrites(db, pProc));
       }
     }
   }

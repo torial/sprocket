@@ -130,7 +130,13 @@ control-flow graph -- there is **no cost at CALL time**:
 Introspection (both read the in-memory catalog; no storage change):
 
 ```
-PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments), declared
+PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments),
+                                    -- declared, security, writes.  `writes`
+                                    -- (DOCKET 3e) is whether the body can
+                                    -- write the database -- what a transport
+                                    -- binding reads to decide retry-safety;
+                                    -- conservative toward "writes", and NOT
+                                    -- a claim of idempotency.
 PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
 PRAGMA [schema.]proc_check[(name)]; -- every advisory as ROWS: proc, kind
@@ -259,9 +265,14 @@ metadata.  Each parent row carries, per nested table, the number of child
 rows that belong to it, readable through
 `sqlite3_proc_child_count(stmt, N)` (−1 = not requested / unknowable, 0 = a
 real empty set; a reassembler that conflates them cannot tell an empty set
-from a missing answer).  The count is computed by the parent's own query,
-independent of the child stream — it catches children lost in transit, not a
-wrong correlation, which derives from the same predicate and cannot disagree
+from a missing answer).  `sqlite3_proc_child_total(stmt, N)` (DOCKET 3f)
+rides along: the child SELECT's row count WITHOUT the correlation, so
+asserting sum(counts) == total catches child rows a NULL correlation key
+silently attached to no parent — readable on the first parent row, before
+the child segment is ever walked.  The count is computed by the parent's
+own query, independent of the child stream — it catches children lost in
+transit, not a wrong correlation, which derives from the same predicate
+and cannot disagree
 with itself.
 
 **`CALL p(...) WITH INTERLEAVED`** — the whole tree as ONE result set,
@@ -295,7 +306,15 @@ Output is ordered by the correlation key, not by the body's parent order.
 **`CALL p(...) RETURNING col, ...`** — projection: keep only the named
 parent columns.  Its chief use is declining the nested-table fold columns a
 flat client would otherwise pay JSON construction for, when the caller
-plans to consume the child segments directly.
+plans to consume the child segments directly.  The named list stops at one
+level of nesting (at depth, the child segments carry folds it cannot name).
+
+**`CALL p(...) RETURNING *`** — DOCKET 3i: every declared value column and
+NO generated folds, at EVERY level, any depth.  This is what a typed
+segment-walking client wants and what `procgen` emits for deep procedures:
+each level is then scanned exactly once, by its own segment (proc3c 8.x
+measures a depth-2 walk dropping from 20+9 child scans to 4+3).  Segments
+themselves are untouched in both spellings — `nresultsets` never changes.
 
 The segment-position C API, for segment-aware clients:
 
@@ -308,6 +327,8 @@ sqlite3_proc_current_segment(stmt);  -- 0-based segment now positioned on,
                                      -- reading a column a segment lacks
                                      -- yields NULL, not an error.
 sqlite3_proc_child_count(stmt, N);   -- WITH COUNTS, on parent rows
+sqlite3_proc_child_total(stmt, N);   -- WITH COUNTS: segment total, without
+                                     -- the correlation (DOCKET 3f)
 
 sqlite3_proc_segment_count(stmt);          -- segments this statement carries
 sqlite3_proc_column_count(stmt, iSeg);     -- arity of segment iSeg
@@ -574,6 +595,13 @@ the makefiles invoke freshly built tools by bare name.
   392,950**. The total differs by 6 from the run above; `veryquick`'s count is
   not perfectly stable across environments, so treat the *error* count as the
   contract and the total as informational.
+- **Overnight batch 2026-08-12: full `veryquick` 0 errors out of 393,677.**
+  Aboard: the 3d fix (mayAbort claim computed from opcodes + the autoinc
+  sequence-lock timing fix, merged from `stored-procs`), `RETURNING *`
+  (3i), the segment total (3f), and the `writes` column (3e).  The ENTIRE
+  proc family now runs green under DEBUG=3 — proc1/2/3/4/5/psm1 included,
+  for the first time since the feature began — procfault 3192 debug / 2734
+  release, plus autoinc/shared/trigger1 in both regimes.
 - **PLAN-PROJECTION session 2026-08-11: full `veryquick` 0 errors out of
   393,654, no leaks** — on the tree carrying the cache re-key, the three
   localisation bug fixes (debug-inert cache tier, table-lock replay +

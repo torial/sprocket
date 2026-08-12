@@ -945,10 +945,32 @@ int sqlite3_proc_child_count(sqlite3_stmt *pStmt, int N){
   ** nHiddenCol in sqlite3_column_count() above.  This is the only reader past
   ** the visible end, which is why the accessors' bounds check stays
   ** permissive. */
+  /* The hidden layout since DOCKET 3f is [counts..., totals...], each half
+  ** one entry per nested table, so the table count is nHiddenCol/2. */
   if( p==0 || p->pResultRow==0 || p->nHiddenCol==0 ) return -1;
-  if( N<0 || N>=p->nHiddenCol ) return -1;
+  if( N<0 || N>=p->nHiddenCol/2 ) return -1;
   return sqlite3_value_int(
       (sqlite3_value*)&p->pResultRow[p->nResColumn - p->nHiddenCol + N]);
+}
+
+/*
+** The N-th nested table's SEGMENT TOTAL -- the child SELECT's row count
+** WITHOUT the correlation (DOCKET 3f) -- or -1 when no counts were
+** requested or N is out of range.  sum(child_count over the parent rows)
+** == child_total is the check that catches child rows whose correlation
+** key attaches them to no parent (a NULL key): they are in the total and
+** in the segment, and in no per-parent count.
+*/
+int sqlite3_proc_child_total(sqlite3_stmt *pStmt, int N){
+  Vdbe *p = (Vdbe*)pStmt;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( p==0 ) return -1;
+#endif
+  if( p==0 || p->pResultRow==0 || p->nHiddenCol==0 ) return -1;
+  if( N<0 || N>=p->nHiddenCol/2 ) return -1;
+  return sqlite3_value_int(
+      (sqlite3_value*)&p->pResultRow[p->nResColumn - p->nHiddenCol
+                                     + p->nHiddenCol/2 + N]);
 }
 
 /*
