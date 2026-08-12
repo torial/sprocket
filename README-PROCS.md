@@ -574,6 +574,13 @@ the makefiles invoke freshly built tools by bare name.
   392,950**. The total differs by 6 from the run above; `veryquick`'s count is
   not perfectly stable across environments, so treat the *error* count as the
   contract and the total as informational.
+- **PLAN-PROJECTION session 2026-08-11: full `veryquick` 0 errors out of
+  393,654, no leaks** — on the tree carrying the cache re-key, the three
+  localisation bug fixes (debug-inert cache tier, table-lock replay +
+  OP_TableLock P4_TRANSIENT, OP_Function context pVdbe guard), and the
+  proc_check no-arg extension.  Same binary: all 24 proc-family suites
+  green (procfault 2484); DEBUG=3 rebuild: proccheck 13, proc3c 22,
+  procfault 2878.
 - **Upstream 3.53.4 merged 2026-08-02: 0 errors out of 392,985.** Zero
   conflicts. `resolve.c` and `shell.c.in` auto-merged, and `resolve.c` is the
   one that mattered — it carries the procedure parameter-resolution branch and
