@@ -2324,10 +2324,15 @@ static void codeProcProgram(
     ** whole CALL, not just the failing statement.  Trigger bodies get a
     ** statement journal because pParse->pTriggerTab is set when their
     ** steps compile; procedure bodies have no trigger table, so request
-    ** the journal explicitly for every write step. */
+    ** the journal explicitly for every write step.
+    **
+    ** MultiWrite only.  The matching mayAbort claim is NOT made here:
+    ** it is computed from the compiled opcodes once the body is complete
+    ** (procProgramMayAbort), because a blanket claim is false for a body
+    ** whose writes cannot abort, and sqlite3VdbeAssertMayAbort() audits
+    ** the claim in debug builds -- DOCKET 3d. */
     if( pStep->op!=TK_SELECT ){
       sqlite3MultiWrite(pParse);
-      sqlite3MayAbort(pParse);
     }
 
     switch( pStep->op ){
@@ -2574,6 +2579,72 @@ static void codeProcProgram(
 }
 
 /*
+** DOCKET 3d.  True if the compiled body (including any sub-programs it
+** invokes) contains an opcode that can cause a statement abort.
+**
+** This decides whether the CALL claims mayAbort -- and with the blanket
+** MultiWrite the step loop requests, whether it gets a statement journal.
+** The claim used to be made unconditionally for any write step, which is
+** FALSE for a body whose writes cannot abort (an INSERT into a
+** constraint-free table): sqlite3VdbeAssertMayAbort() audits the claim
+** against the real opcodes in SQLITE_DEBUG builds, and every debug build
+** of proc1/2/3/4/5/psm1 died on it.  The opposite under-claim is just as
+** fatal: any body SELECT calling a function counts as abortable (a UDF
+** can raise), so the claim cannot simply be dropped either.  The only
+** version of the claim that survives the auditor is one computed from
+** the same evidence -- this test MUST mirror the opcode list in
+** sqlite3VdbeAssertMayAbort() exactly.
+**
+** An in-progress recursive compile can present a sub-program whose aOp
+** is still empty; its opcodes are covered when the outermost body -- the
+** one whose scan the toplevel claim actually rides on -- runs its own
+** scan after every aOp is taken.  Bodies embedding sub-programs are
+** refused from the body cache (PROC_CACHE_SUBPROG), so a cached
+** PROCCACHE_MAYABORT flag never depends on this subtlety.
+*/
+static int procProgramMayAbort(sqlite3 *db, SubProgram *pProg){
+  SubProgram **apSub;
+  int nSub = 1, iSub, i, j;
+  int res = 0;
+
+  apSub = sqlite3DbMallocRawNN(db, sizeof(SubProgram*));
+  if( apSub==0 ) return 1;   /* OOM: compile is already failing; the debug
+                             ** auditor accepts any claim under OOM */
+  apSub[0] = pProg;
+  for(iSub=0; iSub<nSub && res==0; iSub++){
+    Op *aOp = apSub[iSub]->aOp;
+    int nOp = apSub[iSub]->nOp;
+    for(i=0; i<nOp; i++){
+      int opcode = aOp[i].opcode;
+      if( opcode==OP_Destroy || opcode==OP_VUpdate || opcode==OP_VRename
+       || opcode==OP_VDestroy
+       || opcode==OP_VCreate
+       || opcode==OP_ParseSchema
+       || opcode==OP_Function || opcode==OP_PureFunc
+       || ((opcode==OP_Halt || opcode==OP_HaltIfNull)
+        && ((aOp[i].p1)!=SQLITE_OK && aOp[i].p2==OE_Abort))
+      ){
+        res = 1;
+        break;
+      }
+      if( aOp[i].p4type==P4_SUBPROGRAM ){
+        SubProgram **apNew;
+        for(j=0; j<nSub; j++){
+          if( apSub[j]==aOp[i].p4.pProgram ) break;
+        }
+        if( j<nSub ) continue;
+        apNew = sqlite3DbRealloc(db, apSub, (nSub+1)*sizeof(SubProgram*));
+        if( apNew==0 ){ res = 1; break; }
+        apSub = apNew;
+        apSub[nSub++] = aOp[i].p4.pProgram;
+      }
+    }
+  }
+  sqlite3DbFree(db, apSub);
+  return res;
+}
+
+/*
 ** Compile the body of pProc into a SubProgram, wrapped in a new ProcPrg
 ** object linked into the toplevel Parse.  The structure of this function
 ** deliberately mirrors trigger.c:codeRowTrigger().
@@ -2690,6 +2761,11 @@ static ProcPrg *codeProcBody(Parse *pParse, Proc *pProc, IdList *pProj,
     if( pParse->nErr==0 ){
       assert( db->mallocFailed==0 );
       pProgram->aOp = sqlite3VdbeTakeOpArray(v, &pProgram->nOp, &pTop->nMaxArg);
+      /* The mayAbort claim, computed from the compiled opcodes rather
+      ** than assumed -- DOCKET 3d, see procProgramMayAbort() above. */
+      if( procProgramMayAbort(db, pProgram) ){
+        sqlite3MayAbort(pParse);
+      }
       /* If this CALL is itself the top-level statement, its prepared
       ** statement reports the procedure's result columns. */
       if( pParse->pToplevel==0 && pPrg->nResCol>0 ){
