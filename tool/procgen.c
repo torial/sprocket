@@ -379,17 +379,39 @@ int main(int argc, char **argv){
   const char *zDb;
   const char *zLang = "c";
 
-  if( argc<2 ){
-    fprintf(stderr, "usage: procgen DATABASE [> out.h]\n");
-    return 1;
-  }
-  zDb = argv[1];
+  /* The database is the first NON-OPTION argument, so options may come
+  ** before or after it.  Before this, "procgen --lang zebra app.db" read
+  ** "--lang" as the database and died with "unable to open database file"
+  ** -- a refusal that named neither the reason nor the fix. */
+  zDb = 0;
   out = stdout;
   {
     int a;
-    for(a=2; a<argc-1; a++){
-      if( strcmp(argv[a], "--lang")==0 ) zLang = argv[a+1];
+    for(a=1; a<argc; a++){
+      if( strcmp(argv[a], "--lang")==0 ){
+        if( a+1>=argc ){
+          fprintf(stderr, "procgen: --lang needs a value (c or zebra)\n");
+          return 1;
+        }
+        zLang = argv[++a];
+      }else if( argv[a][0]=='-' ){
+        fprintf(stderr, "procgen: unknown option %s\n"
+                        "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n",
+                        argv[a]);
+        return 1;
+      }else if( zDb==0 ){
+        zDb = argv[a];
+      }else{
+        fprintf(stderr, "procgen: unexpected argument %s (database is %s)\n"
+                        "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n",
+                        argv[a], zDb);
+        return 1;
+      }
     }
+  }
+  if( zDb==0 ){
+    fprintf(stderr, "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n");
+    return 1;
   }
 #ifdef _WIN32
   /* Emit LF, not CRLF.  Windows text mode silently translates every '\n' into
