@@ -87,7 +87,11 @@ Because declared shapes are validated at CREATE time and exposed through
 contract is machine-readable **without executing anything**:
 
 ```
-procgen.exe app.db > app_client.h     # tool/procgen.c
+procgen.exe app.db > app_client.h                # C header (default)
+procgen.exe app.db --lang zebra > app_client.zbr # typed nested Zebra structs
+procgen.exe app.db --lang python > app_client.py # dataclasses + a ctypes
+                                                 # runtime over the fork's
+                                                 # own sqlite3.dll
 ```
 
 emits a self-contained header of `static` functions — `_prepare`, a typed

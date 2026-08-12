@@ -143,9 +143,35 @@ same CALL issued through plain `sqlite3_prepare()` on the same database. That
 comparison is the positive control — the generated client cannot pass by
 agreeing with itself. Regeneration is byte-identical.
 
-**Still open:** TypeScript, Python and Zebra emitters (the introspection and
-ordering logic is shared; only the emit differs), and wiring it into the shell
-as `.procgen` rather than a standalone tool.
+**Still open:** the TypeScript emitter and wiring `.procgen` into the shell.
+The Zebra emitter is done (2026-08-06, `--lang zebra`).
+
+### ✅ Python emitter done 2026-08-12 — `--lang python`
+
+The "only the emit differs" premise above was FALSE for runtime languages:
+stock SQLite cannot execute CALL and DB-API bindings cannot reach the
+segment APIs, so a Python client needs a runtime binding to the fork.  The
+emitter therefore generates a SELF-CONTAINED client: typed dataclasses plus
+a ctypes runtime over the fork's own `sqlite3.dll` (the proc APIs ride the
+auto-generated export list for free), with `connect(db_path, dll_path)`
+taking the DLL path explicitly — loading whatever is on PATH would be the
+ambient-state failure.  Same RETURNING policy as Zebra (explicit list at
+depth 1, `RETURNING *` past it), bucket-based stitch, python-keyword
+shield, raw column names as dict keys with sanitized dataclass fields.
+Verified end-to-end by `tool/procgen_pytest.py` against
+`tool/procgen_pynest_fixture.sql` (both committed): flat+params, depth-1,
+depth-2 with an empty leaf, a comparator negative control, and a loud
+refusal path.  Regeneration byte-identical; Zebra and C output unchanged.
+
+**TypeScript — deliberately still open, blocked on a runtime choice, not
+on emission:** Node has no fork binding; the candidates are (a)
+`better-sqlite3` recompiled against the fork's amalgamation plus an
+extension surface for the proc APIs (real work, native toolchain per
+consumer), (b) a WASM build of the fork (heavy, but zero native deps), or
+(c) N-API glue generated alongside the client (procgen emitting its own
+binding, the most self-contained and the most code).  Pick when a TS
+consumer exists; the Python emitter is the template for whichever runtime
+wins.
 
 **Effort: small. Differentiation: high.**
 

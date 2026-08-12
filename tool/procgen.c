@@ -154,6 +154,75 @@ static const char *zebraAccessor(CType t, int bNested){
   }
 }
 
+/* ---------------------------------------------------------------------
+** Python emitter helpers.  The client is typed dataclasses over a ctypes
+** binding of THE FORK'S OWN sqlite3.dll -- stock SQLite cannot execute
+** CALL, and DB-API has no reach to the segment APIs, so a self-contained
+** runtime is the only spelling that does not lie about its requirements.
+** --------------------------------------------------------------------- */
+static const char *pyTypeName(CType t){
+  switch( t ){
+    case T_INT:  return "int";
+    case T_REAL: return "float";
+    case T_TEXT: return "str";
+    case T_BLOB: return "bytes";
+    default:     return "object";
+  }
+}
+
+/* The python keyword shield, same mechanism as the zebra one: a declared
+** column named `class` or `import` must not emit an uncompilable field. */
+static int pyKeyword(const char *z){
+  static const char *azKw[] = {
+    "False","None","True","and","as","assert","async","await","break",
+    "class","continue","def","del","elif","else","except","finally","for",
+    "from","global","if","import","in","is","lambda","nonlocal","not","or",
+    "pass","raise","return","try","while","with","yield",
+    /* not keywords, but names the generated scope already owns: */
+    "db","field","dataclass","ctypes","list","dict","ProcError","Db"
+  };
+  int i;
+  for(i=0; i<(int)(sizeof(azKw)/sizeof(azKw[0])); i++){
+    if( strcmp(z, azKw[i])==0 ) return 1;
+  }
+  return 0;
+}
+static void emitPyIdentBuf(char *zBuf, int nBuf, const char *z){
+  int i, j = 0;
+  if( z==0 || z[0]==0 ){ sqlite3_snprintf(nBuf, zBuf, "_"); return; }
+  if( isdigit((unsigned char)z[0]) && j<nBuf-1 ) zBuf[j++] = '_';
+  for(i=0; z[i] && j<nBuf-2; i++){
+    unsigned char c = (unsigned char)z[i];
+    zBuf[j++] = (isalnum(c) || c=='_') ? (char)c : '_';
+  }
+  zBuf[j] = 0;
+  if( pyKeyword(zBuf) && j<nBuf-2 ){ zBuf[j] = '_'; zBuf[j+1] = 0; }
+}
+static void emitPyIdent(const char *z){
+  char zBuf[128];
+  emitPyIdentBuf(zBuf, sizeof(zBuf), z);
+  fputs(zBuf, out);
+}
+static void emitPyCap(const char *z){
+  char zBuf[128];
+  emitPyIdentBuf(zBuf, sizeof(zBuf), z);
+  if( zBuf[0]>='a' && zBuf[0]<='z' ) zBuf[0] = (char)(zBuf[0]-'a'+'A');
+  fputs(zBuf, out);
+}
+/* A python string literal of the RAW column name -- the runtime row dicts
+** are keyed by what sqlite3_column_name() returns, not by the sanitized
+** field spelling. */
+static void emitPyStr(const char *z){
+  int i;
+  fputc('"', out);
+  for(i=0; z && z[i]; i++){
+    if( z[i]=='"' || z[i]=='\\' ) fputc('\\', out);
+    fputc(z[i], out);
+  }
+  fputc('"', out);
+}
+
+
 /* A Zebra identifier with an upper-cased first letter, for type names. */
 static void emitIdentCap(const char *z){
   int i;
@@ -373,6 +442,67 @@ static void znestCollect(Col *aCol, int nCol, ZNest *aN, int nN,
   fputs("))\n", out);
 }
 
+/* ---------------------------------------------------------------------
+** Python emitter bodies.  Same introspection as zebra, different stitch
+** shape: gather every segment into row-dicts first, then build buckets
+** deepest-first (pre-order guarantees a child's set index exceeds its
+** parent's), then assemble parents by bucket lookup.  Every dataclass
+** field carries a default because declaration order may interleave value
+** and nested columns, and python refuses non-default fields after
+** defaulted ones.
+** --------------------------------------------------------------------- */
+static void pynestStructs(Col *aCol, int nCol, ZNest *aN, int nN,
+                          const char *zProc, int iSet){
+  int k, i;
+  for(k=0; k<nN; k++){
+    if( aN[k].iParentSet!=iSet ) continue;
+    pynestStructs(aCol, nCol, aN, nN, zProc, aN[k].iSet);
+    fputs("@dataclass\nclass ", out);
+    emitPyCap(zProc); emitPyCap(aN[k].zCol);
+    fputs(":\n", out);
+    for(i=0; i<nCol; i++){
+      if( aCol[i].iSet!=aN[k].iSet ) continue;
+      fputs("    ", out); emitPyIdent(aCol[i].zName);
+      if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+        fprintf(out, ": %s | None = None\n", pyTypeName(typeOf(aCol[i].zDecl)));
+      }else{
+        fputs(": list[", out); emitPyCap(zProc); emitPyCap(aCol[i].zName);
+        fputs("] = field(default_factory=list)\n", out);
+      }
+    }
+    fputc('\n', out);
+  }
+}
+
+/* Constructor arguments for one set's rows: value columns read from the
+** row dict by their RAW names, nested members looked up in the child
+** bucket keyed by this set's own parent-key column. */
+static void pynestCtorArgs(Col *aCol, int nCol, ZNest *aN, int nN, int iSet){
+  int i, nSeen = 0;
+  for(i=0; i<nCol; i++){
+    if( aCol[i].iSet!=iSet ) continue;
+    if( nSeen++ ) fputs(", ", out);
+    emitPyIdent(aCol[i].zName); fputc('=', out);
+    if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+      fputs("_r[", out); emitPyStr(aCol[i].zName); fputs("]", out);
+    }else{
+      int j;
+      for(j=0; j<nN; j++){
+        if( aN[j].iParentSet==iSet
+         && sqlite3_stricmp(aN[j].zCol, aCol[i].zName)==0 ) break;
+      }
+      if( j<nN ){
+        fprintf(out, "_b%d.get(_r[", aN[j].iSet);
+        emitPyStr(aN[j].zKParent);
+        fputs("], [])", out);
+      }else{
+        fputs("[]", out);   /* proc_nested disagreed with proc_info; the
+                            ** conformance walk makes this unreachable */
+      }
+    }
+  }
+}
+
 int main(int argc, char **argv){
   sqlite3 *db = 0;
   sqlite3_stmt *pList = 0;
@@ -390,27 +520,27 @@ int main(int argc, char **argv){
     for(a=1; a<argc; a++){
       if( strcmp(argv[a], "--lang")==0 ){
         if( a+1>=argc ){
-          fprintf(stderr, "procgen: --lang needs a value (c or zebra)\n");
+          fprintf(stderr, "procgen: --lang needs a value (c, zebra, or python)\n");
           return 1;
         }
         zLang = argv[++a];
       }else if( argv[a][0]=='-' ){
         fprintf(stderr, "procgen: unknown option %s\n"
-                        "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n",
+                        "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n",
                         argv[a]);
         return 1;
       }else if( zDb==0 ){
         zDb = argv[a];
       }else{
         fprintf(stderr, "procgen: unexpected argument %s (database is %s)\n"
-                        "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n",
+                        "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n",
                         argv[a], zDb);
         return 1;
       }
     }
   }
   if( zDb==0 ){
-    fprintf(stderr, "usage: procgen [--lang c|zebra] DATABASE [> out.h]\n");
+    fprintf(stderr, "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n");
     return 1;
   }
 #ifdef _WIN32
@@ -430,7 +560,157 @@ int main(int argc, char **argv){
     die("open", db);
   }
 
-  if( strcmp(zLang, "zebra")==0 ){
+  if( strcmp(zLang, "python")==0 ){
+    fprintf(out,
+      "# GENERATED by tool/procgen.c from \"%s\" -- do not edit.\n"
+      "# Regenerating an unchanged schema produces byte-identical output, so a\n"
+      "# diff here means the database's procedure contract actually moved.\n"
+      "#\n", zDb);
+    fputs(
+      "# Runtime: ctypes over THE FORK'S OWN sqlite3.dll.  Stock SQLite cannot\n"
+      "# execute CALL, and DB-API bindings cannot reach the segment APIs, so a\n"
+      "# self-contained runtime is the only spelling that does not lie about\n"
+      "# its requirements.  connect() takes the dll path EXPLICITLY -- loading\n"
+      "# whatever sqlite3.dll happens to be on PATH would be exactly the\n"
+      "# ambient-state failure this family of tools refuses.\n"
+      "\n"
+      "from __future__ import annotations\n"
+      "import ctypes\n"
+      "from dataclasses import dataclass, field\n"
+      "\n"
+      "_OK = 0\n"
+      "_ROW = 100\n"
+      "_DONE = 101\n"
+      "_TRANSIENT = ctypes.c_void_p(-1)\n"
+      "\n"
+      "\n"
+      "class ProcError(Exception):\n"
+      "    pass\n"
+      "\n"
+      "\n"
+      "class Db:\n"
+      "    def __init__(self, db_path: str, dll_path: str):\n"
+      "        lib = ctypes.CDLL(dll_path)\n"
+      "        P = ctypes.POINTER\n"
+      "        V = ctypes.c_void_p\n"
+      "        lib.sqlite3_open_v2.argtypes = [ctypes.c_char_p, P(V), ctypes.c_int, ctypes.c_char_p]\n"
+      "        lib.sqlite3_close.argtypes = [V]\n"
+      "        lib.sqlite3_errmsg.argtypes = [V]\n"
+      "        lib.sqlite3_errmsg.restype = ctypes.c_char_p\n"
+      "        lib.sqlite3_prepare_v2.argtypes = [V, ctypes.c_char_p, ctypes.c_int, P(V), V]\n"
+      "        lib.sqlite3_step.argtypes = [V]\n"
+      "        lib.sqlite3_finalize.argtypes = [V]\n"
+      "        lib.sqlite3_column_count.argtypes = [V]\n"
+      "        lib.sqlite3_column_name.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_name.restype = ctypes.c_char_p\n"
+      "        lib.sqlite3_column_type.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_int64.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_int64.restype = ctypes.c_longlong\n"
+      "        lib.sqlite3_column_double.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_double.restype = ctypes.c_double\n"
+      "        lib.sqlite3_column_text.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_text.restype = ctypes.c_char_p\n"
+      "        lib.sqlite3_column_blob.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_column_blob.restype = V\n"
+      "        lib.sqlite3_column_bytes.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_bind_int64.argtypes = [V, ctypes.c_int, ctypes.c_longlong]\n"
+      "        lib.sqlite3_bind_double.argtypes = [V, ctypes.c_int, ctypes.c_double]\n"
+      "        lib.sqlite3_bind_text.argtypes = [V, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, V]\n"
+      "        lib.sqlite3_bind_blob.argtypes = [V, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, V]\n"
+      "        lib.sqlite3_bind_null.argtypes = [V, ctypes.c_int]\n"
+      "        lib.sqlite3_proc_next_resultset.argtypes = [V]\n"
+      "        self._lib = lib\n"
+      "        h = V()\n"
+      "        rc = lib.sqlite3_open_v2(db_path.encode(\"utf-8\"), ctypes.byref(h), 1, None)\n"
+      "        if rc != _OK:\n"
+      "            raise ProcError(f\"cannot open {db_path!r} ({rc})\")\n"
+      "        self._h = h\n"
+      "\n"
+      "    def close(self) -> None:\n"
+      "        if self._h:\n"
+      "            self._lib.sqlite3_close(self._h)\n"
+      "            self._h = None\n"
+      "\n"
+      "    def _errmsg(self) -> str:\n"
+      "        m = self._lib.sqlite3_errmsg(self._h)\n"
+      "        return m.decode(\"utf-8\", \"replace\") if m else \"?\"\n"
+      "\n"
+      "    def _segments(self, sql: str, params=()) -> list[list[dict]]:\n"
+      "        lib = self._lib\n"
+      "        stmt = ctypes.c_void_p()\n"
+      "        rc = lib.sqlite3_prepare_v2(self._h, sql.encode(\"utf-8\"), -1,\n"
+      "                                    ctypes.byref(stmt), None)\n"
+      "        if rc != _OK:\n"
+      "            raise ProcError(f\"prepare failed ({rc}): {self._errmsg()}: {sql}\")\n"
+      "        try:\n"
+      "            for i, v in enumerate(params, start=1):\n"
+      "                if v is None:\n"
+      "                    rc = lib.sqlite3_bind_null(stmt, i)\n"
+      "                elif isinstance(v, bool):\n"
+      "                    rc = lib.sqlite3_bind_int64(stmt, i, int(v))\n"
+      "                elif isinstance(v, int):\n"
+      "                    rc = lib.sqlite3_bind_int64(stmt, i, v)\n"
+      "                elif isinstance(v, float):\n"
+      "                    rc = lib.sqlite3_bind_double(stmt, i, v)\n"
+      "                elif isinstance(v, str):\n"
+      "                    b = v.encode(\"utf-8\")\n"
+      "                    rc = lib.sqlite3_bind_text(stmt, i, b, len(b), _TRANSIENT)\n"
+      "                elif isinstance(v, (bytes, bytearray)):\n"
+      "                    b = bytes(v)\n"
+      "                    rc = lib.sqlite3_bind_blob(stmt, i, b, len(b), _TRANSIENT)\n"
+      "                else:\n"
+      "                    raise ProcError(\n"
+      "                        f\"cannot bind parameter {i}: {type(v).__name__}\")\n"
+      "                if rc != _OK:\n"
+      "                    raise ProcError(f\"bind {i} failed ({rc}): {self._errmsg()}\")\n"
+      "            segs: list[list[dict]] = []\n"
+      "            while True:\n"
+      "                names: list[str] | None = None\n"
+      "                rows: list[dict] = []\n"
+      "                while True:\n"
+      "                    rc = lib.sqlite3_step(stmt)\n"
+      "                    if rc == _ROW:\n"
+      "                        if names is None:\n"
+      "                            n = lib.sqlite3_column_count(stmt)\n"
+      "                            names = [lib.sqlite3_column_name(stmt, j)\n"
+      "                                     .decode(\"utf-8\") for j in range(n)]\n"
+      "                        row = {}\n"
+      "                        for j, nm in enumerate(names):\n"
+      "                            t = lib.sqlite3_column_type(stmt, j)\n"
+      "                            if t == 1:\n"
+      "                                row[nm] = lib.sqlite3_column_int64(stmt, j)\n"
+      "                            elif t == 2:\n"
+      "                                row[nm] = lib.sqlite3_column_double(stmt, j)\n"
+      "                            elif t == 3:\n"
+      "                                s = lib.sqlite3_column_text(stmt, j)\n"
+      "                                row[nm] = s.decode(\"utf-8\") if s is not None else None\n"
+      "                            elif t == 4:\n"
+      "                                nb = lib.sqlite3_column_bytes(stmt, j)\n"
+      "                                p = lib.sqlite3_column_blob(stmt, j)\n"
+      "                                row[nm] = ctypes.string_at(p, nb) if p else b\"\"\n"
+      "                            else:\n"
+      "                                row[nm] = None\n"
+      "                        rows.append(row)\n"
+      "                    elif rc == _DONE:\n"
+      "                        break\n"
+      "                    else:\n"
+      "                        raise ProcError(f\"step failed ({rc}): {self._errmsg()}\")\n"
+      "                segs.append(rows)\n"
+      "                rc = lib.sqlite3_proc_next_resultset(stmt)\n"
+      "                if rc == _DONE:\n"
+      "                    break\n"
+      "                if rc != _OK:\n"
+      "                    raise ProcError(\n"
+      "                        f\"next_resultset failed ({rc}): {self._errmsg()}\")\n"
+      "            return segs\n"
+      "        finally:\n"
+      "            lib.sqlite3_finalize(stmt)\n"
+      "\n"
+      "\n"
+      "def connect(db_path: str, dll_path: str) -> Db:\n"
+      "    return Db(db_path, dll_path)\n"
+      "\n\n", out);
+  }else if( strcmp(zLang, "zebra")==0 ){
     fprintf(out,
       "# GENERATED by tool/procgen.c from \"%s\" -- do not edit.\n"
       "# Regenerating an unchanged schema produces byte-identical output, so a\n"
@@ -643,6 +923,138 @@ int main(int argc, char **argv){
       }
       fputs("    return out\n\n", out);
 
+      for(iN=0; iN<nNest; iN++){
+        sqlite3_free(aNest[iN].zCol);
+        sqlite3_free(aNest[iN].zKChild);
+        sqlite3_free(aNest[iN].zKParent);
+      }
+      for(i=0; i<nCol; i++){ sqlite3_free(aCol[i].zName); sqlite3_free(aCol[i].zDecl); }
+      free(aCol);
+      continue;
+    }
+
+    /* ---------------------------------------------------------------------
+    ** PYTHON EMITTER.  Same introspection and the same RETURNING policy as
+    ** the Zebra emitter (explicit value-column list at depth 1, RETURNING *
+    ** past it, plain CALL for procedures that nest nothing); the stitch is
+    ** bucket-based (see pynestStructs above).  Only shape 1 is emitted,
+    ** as in the other emitters.
+    ** --------------------------------------------------------------------- */
+    if( strcmp(zLang, "python")==0 ){
+      ZNest aNest[32];
+      int nNest = 0, iN;
+      int nEmitted = 0, bDeep = 0;
+      sqlite3_stmt *pNest = 0;
+      if( sqlite3_prepare_v2(db,
+            "SELECT resultset_index, \"column\", key_child, key_parent"
+            "  FROM pragma_proc_nested(?1) ORDER BY resultset_index",
+            -1, &pNest, 0)!=SQLITE_OK ){
+        die("prepare proc_nested", db);
+      }
+      sqlite3_bind_text(pNest, 1, zProc, -1, SQLITE_TRANSIENT);
+      while( sqlite3_step(pNest)==SQLITE_ROW && nNest<32 ){
+        aNest[nNest].iSet     = sqlite3_column_int(pNest, 0);
+        aNest[nNest].iParentSet = 0;
+        aNest[nNest].zCol     = sqlite3_mprintf("%s", sqlite3_column_text(pNest,1));
+        aNest[nNest].zKChild  = sqlite3_mprintf("%s", sqlite3_column_text(pNest,2));
+        aNest[nNest].zKParent = sqlite3_mprintf("%s", sqlite3_column_text(pNest,3));
+        nNest++;
+      }
+      sqlite3_finalize(pNest);
+      znestAssign(aCol, nCol, aNest, nNest, 1, 0);
+      for(iN=0; iN<nNest; iN++){
+        if( aNest[iN].iParentSet>1 ) bDeep = 1;
+      }
+
+      fprintf(out, "# ---- procedure %s ----\n", zProc);
+      pynestStructs(aCol, nCol, aNest, nNest, zProc, 1);
+
+      fputs("@dataclass\nclass ", out); emitPyCap(zProc); fputs("Row:\n", out);
+      for(i=0; i<nCol; i++){
+        if( aCol[i].iSet!=1 ) continue;
+        fputs("    ", out); emitPyIdent(aCol[i].zName);
+        if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+          fprintf(out, ": %s | None = None\n",
+                  pyTypeName(typeOf(aCol[i].zDecl)));
+        }else{
+          fputs(": list[", out); emitPyCap(zProc); emitPyCap(aCol[i].zName);
+          fputs("] = field(default_factory=list)\n", out);
+        }
+        nEmitted++;
+      }
+      if( nEmitted==0 ){
+        fputs("    _empty: int | None = None\n", out);   /* RETURNS NOTHING */
+      }
+      fputc('\n', out);
+
+      fputs("def ", out); emitPyIdent(zProc); fputs("(db: Db", out);
+      for(i=0; i<nCol; i++){
+        if( aCol[i].iSet!=0 ) continue;
+        fputs(", ", out); emitPyIdent(aCol[i].zName);
+        fprintf(out, ": %s | None", pyTypeName(typeOf(aCol[i].zDecl)));
+      }
+      fputs(") -> list[", out); emitPyCap(zProc); fputs("Row]:\n", out);
+
+      fprintf(out, "    _segs = db._segments(\"CALL %s(", zProc);
+      for(i=0; i<nParam; i++) fprintf(out, "%s?", i?",":"");
+      fputs(")", out);
+      if( nNest && !bDeep ){
+        int nSeen = 0;
+        fputs(" RETURNING ", out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=1 ) continue;
+          if( aCol[i].zDecl==0 || aCol[i].zDecl[0]==0 ) continue;
+          if( nSeen++ ) fputs(", ", out);
+          emitIdent(aCol[i].zName);
+        }
+      }else if( nNest ){
+        fputs(" RETURNING *", out);
+      }
+      fputs("\"", out);
+      if( nParam>0 ){
+        int nSeen = 0;
+        fputs(", [", out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=0 ) continue;
+          if( nSeen++ ) fputs(", ", out);
+          emitPyIdent(aCol[i].zName);
+        }
+        fputc(']', out);
+      }
+      fputs(")\n", out);
+
+      if( nSet>0 ){
+        fprintf(out, "    if len(_segs) != %d:\n", nSet);
+        fputs("        raise ProcError(\n", out);
+        fprintf(out,
+          "            f\"%s: expected %d segments, got {len(_segs)}\")\n",
+          zProc, nSet);
+      }else{
+        fputs("    return []\n\n", out);       /* RETURNS NOTHING */
+        goto python_done;
+      }
+
+      /* Buckets, deepest first: pre-order set numbering guarantees every
+      ** child bucket exists before the set that consumes it. */
+      for(iN=nNest-1; iN>=0; iN--){
+        fprintf(out, "    _b%d: dict = {}\n", aNest[iN].iSet);
+        fprintf(out, "    for _r in _segs[%d]:\n", aNest[iN].iSet-1);
+        fprintf(out, "        _b%d.setdefault(_r[", aNest[iN].iSet);
+        emitPyStr(aNest[iN].zKChild);
+        fputs("], []).append(", out);
+        emitPyCap(zProc); emitPyCap(aNest[iN].zCol);
+        fputc('(', out);
+        pynestCtorArgs(aCol, nCol, aNest, nNest, aNest[iN].iSet);
+        fputs("))\n", out);
+      }
+      fputs("    _out: list[", out); emitPyCap(zProc);
+      fputs("Row] = []\n", out);
+      fputs("    for _r in _segs[0]:\n        _out.append(", out);
+      emitPyCap(zProc); fputs("Row(", out);
+      pynestCtorArgs(aCol, nCol, aNest, nNest, 1);
+      fputs("))\n    return _out\n\n", out);
+
+python_done:
       for(iN=0; iN<nNest; iN++){
         sqlite3_free(aNest[iN].zCol);
         sqlite3_free(aNest[iN].zKChild);
