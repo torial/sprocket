@@ -1396,6 +1396,31 @@ over-read.
 
 ## 4. Incremental view maintenance — *the big one, and the one I most want*
 
+### Design questions to settle BEFORE code (drafted 2026-08-12, for Sean)
+
+1. **Eager or deferred?** Maintain on every write inside the writer's
+   transaction (reads always fresh, writers pay), or mark-dirty and fold in
+   on read/checkpoint (writers cheap, first read pays)? The fork's
+   read-heavy consumers (Graze, Mosaic) argue deferred; the equality
+   contract is easier to state eager.
+2. **The maintainable subset, drawn where?** SUM/COUNT/AVG have inverses;
+   MIN/MAX under deletion need the base rows; DISTINCT needs counts; joins
+   need which-side-changed bookkeeping. Propose: v1 = single-table
+   GROUP BY with invertible aggregates + refuse the rest BY NAME at CREATE
+   (the UNGIT shape), v2 = inner joins. Is MIN/MAX worth its cost tier?
+3. **Delta capture: triggers underneath, or a write-path hook?** Hidden
+   auto-triggers reuse shipped machinery but make the view's cost visible
+   in trigger-land; a pager/vdbe hook is cleaner and far more invasive.
+4. **Where does the materialization live?** A real shadow table with a
+   rootpage (checkpointable, crash story = WAL's) vs in-memory with
+   rebuild-on-open (simpler, cold-start cost).
+5. **The correctness contract as a PRAGMA?** `PRAGMA view_check(name)`
+   recomputing from scratch and diffing — the equality oracle as a
+   first-class surface from day one, not a test-only harness.
+6. **Interaction with procedures:** may a proc body write a table that
+   feeds a maintained view (trigger-depth interactions), and may a proc
+   SELECT from one mid-transaction under eager maintenance?
+
 Materialized views that update as writes land rather than being recomputed.
 
 This is the missing structural piece of the architecture in `DESIGN-NETWORK.md`.
