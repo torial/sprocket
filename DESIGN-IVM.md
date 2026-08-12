@@ -1,11 +1,36 @@
 # DESIGN-IVM — incremental view maintenance: the six decisions, with scenarios
 
 *Written 2026-08-12 (Fable), expanding DOCKET #4's design questions into
-pros/cons and worked examples at Sean's request. Nothing here is decided;
-each section ends with a recommendation and its confidence. The running
-example is the docket's own motivating pattern (DESIGN-NETWORK's
-append-only ledger + rollups), with Graze (read-heavy docs site), Mosaic
-(witness/claims), and bugbook (status counts) as the live consumers.*
+pros/cons and worked examples at Sean's request. The running example is
+the docket's own motivating pattern (DESIGN-NETWORK's append-only ledger
++ rollups), with Graze (read-heavy docs site), Mosaic (witness/claims),
+and bugbook (status counts) as the live consumers.*
+
+## RULINGS — Sean, 2026-08-12 (design is now DECIDED; plan in PLAN-IVM.md)
+
+- **Q1: the per-view CHOICE (scenario C)** — `WITH MAINTENANCE EAGER`
+  (the default) `| DEFERRED`. Overrules the eager-only recommendation,
+  with the structural constraint intact: DEFERRED means *declared
+  staleness plus an explicit refresh verb*, never a read-side fold. The
+  two-paths cost shrinks by construction (recorded in the plan): ONE
+  capture path — the same triggers — with two application schedules,
+  inline vs logged-and-folded, rather than two capture mechanisms.
+- **Q1 addendum, index auto-creation:** detection is wanted and cheap
+  (the planner already knows — the R7 instrument). Creation stays
+  ADVISORY: the advisory names the exact `CREATE INDEX` statement;
+  auto-creation, if ever, is an explicit opt-in clause, never ambient.
+- **Q2: Tier 1 for v1**, Tier 2 (MIN/MAX with the advisory, inner
+  equi-joins) as the anticipated follow-on.
+- **Q3: A — generated internal triggers**, with the proc-body-cache
+  tradeoff DOCUMENTED PROMINENTLY, so choosing a materialized view is
+  done with the cost in hand (a write-procedure touching a maintained
+  table compiles per statement; `PRAGMA proc_check` names it).
+- **Q4: A — the FTS5-convention shadow table.** "An easy way to leverage
+  all of the existing SQLite machinery / quality."
+- **Q5: as recommended** — `PRAGMA view_check` ships in the same commit
+  as the feature; the acceptance gate is a randomized write storm
+  leaving it empty.
+- **Q6: follows Q3** — the cache exclusion is accepted and documented.
 
 ## The running example
 

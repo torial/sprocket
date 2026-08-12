@@ -1,0 +1,200 @@
+# 2026-08-12
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# DOCKET #4 / PLAN-IVM -- incremental view maintenance.  THIS FILE IS
+# WRITTEN RED, ON PURPOSE, BEFORE THE FEATURE EXISTS.  It is the
+# specification: each case states what the engine must do, and the file
+# going green is the definition of the campaign being done.
+#
+# Do not adjust an expectation here to make the suite pass.  If an
+# expectation is wrong, the DESIGN is wrong: DESIGN-IVM.md (rulings) and
+# PLAN-IVM.md change first.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix ivm1
+
+#--------------------------------------------------------------------
+# 1.x: CREATE, catalog, and refusals-by-name (P1)
+#
+do_execsql_test 1.0 {
+  CREATE TABLE ledger(id INTEGER PRIMARY KEY, account TEXT NOT NULL,
+                      amount INTEGER NOT NULL);
+  INSERT INTO ledger(account, amount) VALUES
+    ('alice', 50), ('alice', 90), ('bob', 10);
+  CREATE MATERIALIZED VIEW balances AS
+    SELECT account, sum(amount) AS balance, count(*) AS entries
+      FROM ledger GROUP BY account;
+  SELECT type, name FROM sqlite_schema WHERE name='balances';
+} {mview balances}
+
+# The definition round-trips through the schema.
+do_execsql_test 1.1 {
+  SELECT sql LIKE 'CREATE MATERIALIZED VIEW%' FROM sqlite_schema
+   WHERE name='balances';
+} {1}
+
+# Refusals name the construct and the reason -- Tier 1 only.
+do_catchsql_test 1.2 {
+  CREATE MATERIALIZED VIEW bad1 AS
+    SELECT account, max(amount) FROM ledger GROUP BY account;
+} {1 {bad1 cannot be incrementally maintained: max() requires rescanning a group on delete (Tier 2, not yet supported)}}
+
+do_catchsql_test 1.3 {
+  CREATE MATERIALIZED VIEW bad2 AS
+    SELECT date('now') AS d, count(*) FROM ledger;
+} {1 {bad2 cannot be incrementally maintained: date('now') is non-deterministic; a maintained view's definition may not depend on when it is evaluated}}
+
+do_catchsql_test 1.4 {
+  CREATE MATERIALIZED VIEW bad3 AS
+    SELECT l.account, count(*) FROM ledger l, ledger r GROUP BY l.account;
+} {1 {bad3 cannot be incrementally maintained: joins are not yet supported (Tier 2)}}
+
+#--------------------------------------------------------------------
+# 2.x: population at CREATE, ordinary reads, ordinary indexes (P1)
+#
+do_execsql_test 2.0 {
+  SELECT account, balance, entries FROM balances ORDER BY account;
+} {alice 140 2 bob 10 1}
+
+do_execsql_test 2.1 {
+  CREATE INDEX bal_ix ON balances(balance);
+  SELECT account FROM balances WHERE balance > 100;
+} {alice}
+
+# A materialized view is engine-maintained: user writes are refused with
+# the reason, like writes to an ordinary view.
+do_catchsql_test 2.2 {
+  INSERT INTO balances VALUES('mallory', 1000, 1);
+} {1 {balances is a materialized view and is maintained by the engine; write to its base table instead}}
+
+#--------------------------------------------------------------------
+# 3.x: THE ORACLE (P2) -- and its seen-red leg exists by construction:
+# these run when maintenance does NOT yet exist, so a base write MUST
+# turn view_check red.  When P3 lands, 3.2's expectation flips green and
+# 3.9x pins the storm instead.
+#
+do_execsql_test 3.0 {
+  SELECT kind FROM pragma_view_check('balances') WHERE kind='summary';
+} {summary}
+
+# Clean immediately after CREATE: no difference rows, and the summary
+# proves coverage (2 groups compared, not 0).
+do_execsql_test 3.1 {
+  SELECT count(*) FROM pragma_view_check('balances') WHERE kind='diff';
+} {0}
+do_execsql_test 3.1b {
+  SELECT detail FROM pragma_view_check('balances') WHERE kind='summary';
+} {{2 groups compared, 0 differ}}
+
+#--------------------------------------------------------------------
+# 5.x: EAGER maintenance (P3).  Placed before the deferred section so a
+# reader meets the default first.
+#
+do_execsql_test 5.0 {
+  INSERT INTO ledger(account, amount) VALUES('alice', -40), ('carol', 7);
+  SELECT account, balance, entries FROM balances ORDER BY account;
+} {alice 100 3 bob 10 1 carol 7 1}
+
+do_execsql_test 5.1 {
+  DELETE FROM ledger WHERE account='bob';
+  SELECT count(*) FROM balances WHERE account='bob';
+} {0}
+
+do_execsql_test 5.2 {
+  UPDATE ledger SET amount = amount + 1 WHERE account='carol';
+  SELECT balance FROM balances WHERE account='carol';
+} {8}
+
+# The oracle agrees after every mutation above.
+do_execsql_test 5.3 {
+  SELECT count(*) FROM pragma_view_check('balances') WHERE kind='diff';
+} {0}
+
+# THE ACCEPTANCE STORM: a deterministic pre-generated op sequence; the
+# expected magnitudes are stated by recomputation at the end, and the
+# oracle must be empty with full coverage.
+do_test 5.9 {
+  set ops 0
+  foreach {acct amt} {
+    a 5  b 3  a -2  c 9  b -3  d 1  a 7  c -9  d 4  e 2
+    a -5 b 6  e -2  d -1 c 3   a 1  b -6 d -4  e 5  c -3
+  } {
+    db eval {INSERT INTO ledger(account, amount) VALUES($acct, $amt)}
+    incr ops
+  }
+  db eval {DELETE FROM ledger WHERE amount < 0}
+  db eval {UPDATE ledger SET amount = amount * 2 WHERE account = 'a'}
+  list $ops [db eval {
+    SELECT count(*) FROM pragma_view_check('balances') WHERE kind='diff'}]
+} {20 0}
+
+#--------------------------------------------------------------------
+# 6.x: DEFERRED maintenance (P4) -- declared staleness, explicit refresh,
+# never a read-side fold.
+#
+do_execsql_test 6.0 {
+  CREATE TABLE hits(page TEXT NOT NULL);
+  CREATE MATERIALIZED VIEW hit_counts WITH MAINTENANCE DEFERRED AS
+    SELECT page, count(*) AS n FROM hits GROUP BY page;
+  INSERT INTO hits VALUES('a'),('a'),('b');
+  -- deferred: the view has NOT moved, and says so
+  SELECT (SELECT count(*) FROM hit_counts),
+         (SELECT pending FROM pragma_view_list WHERE name='hit_counts'),
+         (SELECT stale   FROM pragma_view_list WHERE name='hit_counts');
+} {0 3 1}
+
+# The oracle refuses to call a stale view clean: staleness is the FIRST
+# thing it says.
+do_execsql_test 6.1 {
+  SELECT kind FROM pragma_view_check('hit_counts') LIMIT 1;
+} {stale}
+
+do_execsql_test 6.2 {
+  PRAGMA view_refresh(hit_counts);
+  SELECT (SELECT page||'='||n FROM hit_counts WHERE page='a'),
+         (SELECT pending FROM pragma_view_list WHERE name='hit_counts'),
+         (SELECT count(*) FROM pragma_view_check('hit_counts')
+           WHERE kind='diff');
+} {a=2 0 0}
+
+#--------------------------------------------------------------------
+# 7.x: procedure interplay (P3 gate) -- the documented tradeoff, TESTED.
+#
+do_execsql_test 7.0 {
+  CREATE PROCEDURE post_entry(acct TEXT, amt INTEGER) RETURNS NOTHING
+  BEGIN
+    INSERT INTO ledger(account, amount) VALUES(acct, amt);
+  END;
+  CALL post_entry('zed', 11);
+  SELECT balance FROM balances WHERE account='zed';
+} {11}
+
+# The proc-cache exclusion is visible where the docs say to look: the
+# body now fires a maintenance trigger, so it compiles per statement,
+# and proc_check names that reason rather than hiding the cliff.
+do_test 7.1 {
+  execsql {SELECT message FROM pragma_proc_check('post_entry')
+            WHERE kind='cache'}
+} {{compiles per prepared statement: the body fires a trigger or CALLs another procedure}}
+
+#--------------------------------------------------------------------
+# 8.x: DROP, and the object leaves cleanly (P1)
+#
+do_execsql_test 8.0 {
+  DROP MATERIALIZED VIEW balances;
+  SELECT count(*) FROM sqlite_schema WHERE name='balances';
+} {0}
+do_catchsql_test 8.1 {
+  SELECT * FROM balances;
+} {1 {no such table: balances}}
+
+finish_test
