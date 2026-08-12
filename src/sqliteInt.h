@@ -5562,19 +5562,26 @@ struct MViewInfo {
   char *zName;             /* View name; also the hash key, so the entry
                            ** never dangles into a freed Table */
   char *zBase;             /* Name of the single base table */
+  char *zSelDef;           /* Text of the definition SELECT (for the
+                           ** view_check recompute) */
+  u8 *aIsKey;              /* nCol flags: 1 = group key / constant column,
+                           ** 0 = maintained aggregate column */
+  int nCol;                /* Number of result columns */
   u8 bDeferred;            /* True for WITH MAINTENANCE DEFERRED */
 };
 /* Values returned by sqlite3MViewMaintOption / mvmaint in the grammar */
 #define MVIEW_MAINT_UNSPEC   0    /* No WITH MAINTENANCE clause: eager */
 #define MVIEW_MAINT_EAGER    1
 #define MVIEW_MAINT_DEFERRED 2
-  void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Select*,
-                          int,int);
+  void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Token*,
+                          Select*,int,int);
   void sqlite3DropMView(Parse*, Token*, SrcList*, int);
   int sqlite3MViewMaintOption(Parse*, Token*, Token*);
   const char *sqlite3MViewFindDependent(sqlite3*, int, const char*);
   void sqlite3MViewHashClear(Hash*);
   void sqlite3UnlinkAndDeleteMView(sqlite3*, int, const char*);
+  void sqlite3MViewCodeCheck(Parse*, Vdbe*, const char*, const char*);
+  void sqlite3MViewCodeList(Parse*, Vdbe*, const char*);
 #else
 # define sqlite3MViewFindDependent(A,B,C) 0
 # define sqlite3MViewHashClear(A)

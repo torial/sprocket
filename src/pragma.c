@@ -1669,6 +1669,83 @@ void sqlite3Pragma(
   ** has not been measured yet says so explicitly ('unknown until ...')
   ** rather than reading as clean: a zero nobody computed is not a zero.
   */
+  /*
+  **   PRAGMA [schema.]view_check(view-name)
+  **   PRAGMA [schema.]view_check
+  **
+  ** The materialized-view equality oracle (fork; DESIGN-IVM Q5): the
+  ** stored rows diffed against a fresh recompute of the definition,
+  ** both sides read in one statement so they share a snapshot.  Rows
+  ** are (view, kind, subject, detail); a coverage summary row is
+  ** always emitted so an empty diff over zero groups reads as the
+  ** finding it is.  Without a name, EVERY materialized view is checked
+  ** -- the no-arg form reports rather than silently doing nothing.
+  */
+  case PragTyp_VIEW_CHECK: {
+    int ii;
+    if( zRight ){
+      MViewInfo *pMV = 0;
+      const char *zDbName = 0;
+      for(ii=0; ii<db->nDb && pMV==0; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        pMV = (MViewInfo*)sqlite3HashFind(&pSchema->mviewHash, zRight);
+        if( pMV ) zDbName = db->aDb[ii].zDbSName;
+      }
+      if( pMV==0 ){
+        sqlite3ErrorMsg(pParse, "no such materialized view: %s", zRight);
+        break;
+      }
+      sqlite3MViewCodeCheck(pParse, v, zDbName, zRight);
+    }else{
+      for(ii=0; ii<db->nDb; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        HashElem *he;
+        MViewInfo **apMV;
+        int nMV = 0, j, k;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+            he=sqliteHashNext(he)) nMV++;
+        if( nMV==0 ) continue;
+        apMV = sqlite3DbMallocRawNN(db, nMV*sizeof(MViewInfo*));
+        if( apMV==0 ) break;
+        j = 0;
+        for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+            he=sqliteHashNext(he)){
+          apMV[j++] = (MViewInfo*)sqliteHashData(he);
+        }
+        for(j=1; j<nMV; j++){
+          MViewInfo *pT = apMV[j];
+          for(k=j; k>0
+               && sqlite3StrICmp(apMV[k-1]->zName, pT->zName)>0; k--){
+            apMV[k] = apMV[k-1];
+          }
+          apMV[k] = pT;
+        }
+        for(j=0; j<nMV; j++){
+          sqlite3MViewCodeCheck(pParse, v, db->aDb[ii].zDbSName,
+                                apMV[j]->zName);
+        }
+        sqlite3DbFree(db, apMV);
+      }
+    }
+  }
+  break;
+
+  /*
+  **   PRAGMA [schema.]view_list
+  **
+  ** One row per materialized view: (name, maintenance, pending, stale).
+  ** pending and stale are NULL until a capture mechanism exists to
+  ** measure them -- unmeasured is spelled NULL, never a zero.
+  */
+  case PragTyp_VIEW_LIST: {
+    sqlite3MViewCodeList(pParse, v, zDb);
+  }
+  break;
+
   case PragTyp_PROC_CHECK: {
     int ii;
     pParse->nMem = 4;

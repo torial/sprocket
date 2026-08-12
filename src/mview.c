@@ -517,18 +517,23 @@ static void mviewRegister(
   Parse *pParse,
   Table *p,                /* The view's table object */
   const char *zBase,       /* Name of the base table */
-  int bDeferred
+  int bDeferred,
+  Select *pSelect,         /* Resolved definition (for the key flags) */
+  const char *zSelDef,     /* Definition SELECT text */
+  int nSelDef              /* Length of zSelDef */
 ){
   MViewInfo *pInfo, *pOld;
   sqlite3 *db = pParse->db;
   sqlite3_int64 nName = sqlite3Strlen30(p->zName)+1;
   sqlite3_int64 nBase = sqlite3Strlen30(zBase)+1;
+  int nCol = pSelect->pEList->nExpr;
+  int i;
   assert( db->init.busy );
   assert( sqlite3SchemaMutexHeld(db, 0, p->pSchema) );
-  /* One allocation: struct, then the two strings.  The hash keys off
-  ** pInfo->zName rather than the Table's own name so the entry never
-  ** points into memory the table teardown frees. */
-  pInfo = sqlite3MallocZero(sizeof(MViewInfo)+nName+nBase);
+  /* One allocation: struct, strings, then the key-flag array.  The hash
+  ** keys off pInfo->zName rather than the Table's own name so the entry
+  ** never points into memory the table teardown frees. */
+  pInfo = sqlite3MallocZero(sizeof(MViewInfo)+nName+nBase+nSelDef+1+nCol);
   if( pInfo==0 ){
     sqlite3OomFault(db);
     return;
@@ -537,6 +542,15 @@ static void mviewRegister(
   memcpy(pInfo->zName, p->zName, nName);
   pInfo->zBase = pInfo->zName + nName;
   memcpy(pInfo->zBase, zBase, nBase);
+  pInfo->zSelDef = pInfo->zBase + nBase;
+  memcpy(pInfo->zSelDef, zSelDef, nSelDef);
+  pInfo->zSelDef[nSelDef] = 0;
+  pInfo->aIsKey = (u8*)(pInfo->zSelDef + nSelDef + 1);
+  pInfo->nCol = nCol;
+  for(i=0; i<nCol; i++){
+    pInfo->aIsKey[i] =
+        (u8)(pSelect->pEList->a[i].pExpr->op!=TK_AGG_FUNCTION);
+  }
   pInfo->bDeferred = (u8)(bDeferred!=0);
   pOld = sqlite3HashInsert(&p->pSchema->mviewHash, pInfo->zName, pInfo);
   if( pOld ){
@@ -613,6 +627,7 @@ void sqlite3CreateMView(
   Token *pName1,     /* First part of the view name */
   Token *pName2,     /* Second part of the view name */
   int maintMode,     /* MVIEW_MAINT_UNSPEC, _EAGER or _DEFERRED */
+  Token *pAs,        /* The AS keyword: the definition text follows it */
   Select *pSelect,   /* The definition */
   int isTemp,        /* TRUE if TEMP appeared */
   int noErr          /* IF NOT EXISTS */
@@ -747,8 +762,17 @@ void sqlite3CreateMView(
   ** this: a live CREATE re-parses its own row via OP_ParseSchema, so the
   ** registry has exactly one write path. */
   if( db->init.busy ){
+    /* The definition SELECT's text: everything after the AS keyword,
+    ** through the trimmed end of the statement computed above. */
+    const char *zSelDef = pAs->z + pAs->n;
+    int nSelDef = (int)((z + n) - zSelDef);
+    while( nSelDef>0 && sqlite3Isspace(zSelDef[0]) ){
+      zSelDef++;
+      nSelDef--;
+    }
     /* EndTable consumed pNewTable into the schema; p remains valid. */
-    mviewRegister(pParse, p, zBase, (p->tabFlags & TF_MViewDeferred)!=0);
+    mviewRegister(pParse, p, zBase, (p->tabFlags & TF_MViewDeferred)!=0,
+                  pSelect, zSelDef, nSelDef);
   }
 
 create_mview_fail:
@@ -828,6 +852,211 @@ void sqlite3DropMView(Parse *pParse, Token *pMat, SrcList *pName, int noErr){
 
 exit_drop_mview:
   sqlite3SrcListDelete(db, pName);
+}
+
+/*
+** Append the comma-separated key-column list of pInfo, using the CTE
+** column aliases mv$0..mv$N.  If the view has no key columns (a
+** whole-table aggregate), append the constant 1: there is exactly one
+** group, and SELECT DISTINCT 1 counts it as such.
+*/
+static void mviewAppendKeyList(sqlite3_str *pStr, const MViewInfo *pInfo){
+  int i, n = 0;
+  for(i=0; i<pInfo->nCol; i++){
+    if( !pInfo->aIsKey[i] ) continue;
+    if( n++ ) sqlite3_str_append(pStr, ",", 1);
+    sqlite3_str_appendf(pStr, "\"mv$%d\"", i);
+  }
+  if( n==0 ) sqlite3_str_append(pStr, "1", 1);
+}
+
+/*
+** Append an expression rendering columns as quote()d text:
+**   quote("mv$0")||','||quote("mv$1")...
+** With bKeysOnly, only key columns; the caller guarantees at least one
+** column is rendered or supplies its own fallback.
+*/
+static void mviewAppendRowRender(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  int bKeysOnly
+){
+  int i, n = 0;
+  for(i=0; i<pInfo->nCol; i++){
+    if( bKeysOnly && !pInfo->aIsKey[i] ) continue;
+    if( n++ ) sqlite3_str_appendall(pStr, "||','||");
+    sqlite3_str_appendf(pStr, "quote(\"mv$%d\")", i);
+  }
+  if( n==0 ) sqlite3_str_appendall(pStr, "NULL");
+}
+
+/*
+** Generate code for PRAGMA view_check on one materialized view: the
+** stored rows diffed against a fresh recompute of the definition, BOTH
+** SIDES READ INSIDE THIS ONE STATEMENT, so they share a snapshot.
+**
+** Output rows (view, kind, subject, detail), in kind order
+** stale < diff < summary:
+**   kind='diff'    -- one row per group present on only one side or
+**                     disagreeing in an aggregate; subject = the group
+**                     key, detail names the side and renders the row
+**   kind='summary' -- ALWAYS EMITTED, LAST: 'N groups compared, M
+**                     differ', so an empty diff over zero compared
+**                     groups reads as the finding it is, never as a
+**                     clean bill
+** (kind='stale' is reserved for deferred views with pending deltas --
+** a later phase; the ORDER BY already knows its place.)
+**
+** The SQL is compiled via sqlite3NestedParse into the pragma's own
+** program: a nested SELECT's result rows are the pragma's result rows.
+*/
+void sqlite3MViewCodeCheck(
+  Parse *pParse,
+  Vdbe *v,
+  const char *zDbName,    /* Schema holding the view */
+  const char *zView       /* View name (known to be an mview) */
+){
+  sqlite3 *db = pParse->db;
+  MViewInfo *pInfo = 0;
+  sqlite3_str *pStr;
+  char *zSql;
+  int i, ii;
+
+  UNUSED_PARAMETER(v);
+  for(ii=0; ii<db->nDb && pInfo==0; ii++){
+    Schema *pSchema = db->aDb[ii].pSchema;
+    if( pSchema==0 ) continue;
+    if( sqlite3StrICmp(zDbName, db->aDb[ii].zDbSName)!=0 ) continue;
+    pInfo = (MViewInfo*)sqlite3HashFind(&pSchema->mviewHash, zView);
+  }
+  if( pInfo==0 ){
+    sqlite3ErrorMsg(pParse, "no such materialized view: %s", zView);
+    return;
+  }
+
+  pStr = sqlite3_str_new(db);
+
+  /* WITH fresh(mv$0,..) AS (<definition>),
+  **      stored(mv$0,..) AS (SELECT <cols> FROM <view>),
+  **      gone  AS (fresh EXCEPT stored),   -- recomputed, not stored
+  **      extra AS (stored EXCEPT fresh)    -- stored, not recomputed
+  ** EXCEPT compares NULLs as equal, which is the wanted semantics for
+  ** aggregate columns. */
+  sqlite3_str_appendall(pStr, "WITH fresh(");
+  for(i=0; i<pInfo->nCol; i++){
+    sqlite3_str_appendf(pStr, "%s\"mv$%d\"", i ? "," : "", i);
+  }
+  sqlite3_str_appendf(pStr, ") AS (%s), stored(", pInfo->zSelDef);
+  for(i=0; i<pInfo->nCol; i++){
+    sqlite3_str_appendf(pStr, "%s\"mv$%d\"", i ? "," : "", i);
+  }
+  sqlite3_str_appendall(pStr, ") AS (SELECT ");
+  {
+    Table *pTab = sqlite3FindTable(db, zView, zDbName);
+    if( NEVER(pTab==0) || NEVER(pTab->nCol<pInfo->nCol) ){
+      sqlite3ErrorMsg(pParse, "materialized view %s could not be read",
+                      zView);
+      sqlite3_free(sqlite3_str_finish(pStr));
+      return;
+    }
+    for(i=0; i<pInfo->nCol; i++){
+      sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                          pTab->aCol[i].zCnName);
+    }
+  }
+  sqlite3_str_appendf(pStr, " FROM \"%w\".\"%w\"), ", zDbName, zView);
+  sqlite3_str_appendall(pStr,
+     "gone AS (SELECT * FROM fresh EXCEPT SELECT * FROM stored), "
+     "extra AS (SELECT * FROM stored EXCEPT SELECT * FROM fresh) "
+     "SELECT \"view\", kind, subject, detail FROM (");
+
+  /* Rows the recompute has and the stored table lacks (or disagrees) */
+  sqlite3_str_appendf(pStr,
+     "SELECT %Q AS \"view\", 'diff' AS kind, ", zView);
+  mviewAppendRowRender(pStr, pInfo, 1);
+  sqlite3_str_appendall(pStr,
+     " AS subject, 'recomputed but not stored: ('||");
+  mviewAppendRowRender(pStr, pInfo, 0);
+  sqlite3_str_appendall(pStr, "||')' AS detail FROM gone UNION ALL ");
+
+  /* Rows the stored table has and the recompute lacks (or disagrees) */
+  sqlite3_str_appendf(pStr, "SELECT %Q, 'diff', ", zView);
+  mviewAppendRowRender(pStr, pInfo, 1);
+  sqlite3_str_appendall(pStr, ", 'stored but not recomputed: ('||");
+  mviewAppendRowRender(pStr, pInfo, 0);
+  sqlite3_str_appendall(pStr, "||')' FROM extra UNION ALL ");
+
+  /* The mandatory coverage summary */
+  sqlite3_str_appendf(pStr,
+     "SELECT %Q, 'summary', NULL, "
+     "(SELECT count(*) FROM (SELECT ", zView);
+  mviewAppendKeyList(pStr, pInfo);
+  sqlite3_str_appendall(pStr, " FROM fresh UNION SELECT ");
+  mviewAppendKeyList(pStr, pInfo);
+  sqlite3_str_appendall(pStr,
+     " FROM stored))||' groups compared, '||"
+     "(SELECT count(*) FROM (SELECT ");
+  mviewAppendKeyList(pStr, pInfo);
+  sqlite3_str_appendall(pStr, " FROM gone UNION SELECT ");
+  mviewAppendKeyList(pStr, pInfo);
+  sqlite3_str_appendall(pStr,
+     " FROM extra))||' differ' "
+     ") ORDER BY CASE kind WHEN 'stale' THEN 0 WHEN 'diff' THEN 1 "
+     "ELSE 2 END, subject");
+
+  zSql = sqlite3_str_finish(pStr);
+  if( zSql==0 ){
+    sqlite3OomFault(db);
+    return;
+  }
+  sqlite3NestedParse(pParse, "%s", zSql);
+  sqlite3_free(zSql);
+}
+
+/*
+** Generate code for PRAGMA view_list: one row per materialized view --
+** (name, maintenance, pending, stale).  pending and stale are NULL
+** until a capture mechanism exists to measure them: unmeasured is
+** spelled NULL, never a reassuring zero.  Sorted by name within each
+** schema so the output is stable rather than hash-ordered.
+*/
+void sqlite3MViewCodeList(Parse *pParse, Vdbe *v, const char *zDb){
+  sqlite3 *db = pParse->db;
+  int ii;
+  pParse->nMem = 4;
+  for(ii=0; ii<db->nDb; ii++){
+    Schema *pSchema = db->aDb[ii].pSchema;
+    HashElem *he;
+    MViewInfo **apMV;
+    int nMV = 0, j, k;
+    if( pSchema==0 ) continue;
+    if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+    for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+        he=sqliteHashNext(he)) nMV++;
+    if( nMV==0 ) continue;
+    apMV = sqlite3DbMallocRawNN(db, nMV*sizeof(MViewInfo*));
+    if( apMV==0 ) break;
+    j = 0;
+    for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+        he=sqliteHashNext(he)){
+      apMV[j++] = (MViewInfo*)sqliteHashData(he);
+    }
+    for(j=1; j<nMV; j++){
+      MViewInfo *pT = apMV[j];
+      for(k=j; k>0 && sqlite3StrICmp(apMV[k-1]->zName, pT->zName)>0; k--){
+        apMV[k] = apMV[k-1];
+      }
+      apMV[k] = pT;
+    }
+    for(j=0; j<nMV; j++){
+      sqlite3VdbeMultiLoad(v, 1, "ssss",
+         apMV[j]->zName,
+         apMV[j]->bDeferred ? "deferred" : "eager",
+         (const char*)0,      /* pending: unmeasured until capture */
+         (const char*)0);     /* stale:   unmeasured until capture */
+    }
+    sqlite3DbFree(db, apMV);
+  }
 }
 
 #endif /* !defined(SQLITE_OMIT_VIEW) */

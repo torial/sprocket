@@ -304,6 +304,18 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_PROCEDURE)
 
+  NAME: view_check
+  FLAG: NeedSchema Result0 Result1 SchemaOpt
+  COLS: view kind subject detail
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_VIEW)
+
+  NAME: view_list
+  FLAG: NeedSchema Result0 SchemaOpt
+  COLS: name maintenance pending stale
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_VIEW)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

@@ -87,6 +87,24 @@ CREATE INDEX); creation never automatic.
   stale). Gate: clean immediately after CREATE, and **RED against P1's
   unmaintained writes — the oracle's own seen-red leg exists by
   construction before the feature it checks.**
+  **EXECUTED 2026-08-12.** ivm1 10/24: all of 3.x green; the remaining
+  red is exactly 5.x/6.x/7.x.  The seen-red leg was run by hand and
+  watched: after unmaintained base writes the oracle reported three
+  diff rows naming group and side, summary '3 groups compared, 2
+  differ' — the arithmetic itself checked (alice both-sides, carol
+  missing, bob matching).  An EMPTY view reports '0 groups compared'
+  — coverage stated, never a clean bill.  Implementation: one
+  generated WITH fresh/stored/gone/extra compound compiled via nested
+  parse into the pragma's own program, so both sides share the
+  statement's snapshot; EXCEPT gives NULL-safe aggregate comparison.
+  view_check works no-arg (checks everything, proc_check's lesson);
+  unknown names are refused by name.  view_list spells unmeasured
+  pending/stale as NULL — a zero there would be a fabrication until
+  capture exists (P3/P4 flip them to measured values).  MViewInfo now
+  carries the definition text (captured at the AS token) and
+  per-column key flags, both written by the single init-path
+  registration.  Suites: full sweep + pragma family, 0 errors, both
+  regimes.
 - **P3 — eager maintenance.** Synthesized triggers; per-statement
   grouped application; group liveness via the mandatory COUNT; UPDATE
   as two-sided delta; WHERE filtering both sides; AVG as SUM+COUNT.

@@ -530,8 +530,8 @@ cmd ::= DROP VIEW ifexists(E) fullname(X). {
 //
 %ifndef SQLITE_OMIT_VIEW
 cmd ::= createkw(B) temp(T) nm(M) VIEW ifnotexists(E) nm(Y) dbnm(Z)
-        mvmaint(MM) AS select(S). {
-  sqlite3CreateMView(pParse, &B, &M, &Y, &Z, MM, S, T, E);
+        mvmaint(MM) AS(A) select(S). {
+  sqlite3CreateMView(pParse, &B, &M, &Y, &Z, MM, &A, S, T, E);
 }
 %type mvmaint {int}
 mvmaint(A) ::= . { A = MVIEW_MAINT_UNSPEC; }
