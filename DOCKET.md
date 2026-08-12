@@ -821,14 +821,30 @@ Zero lemon conflicts, checked in `parse.out` rather than assumed.
 `proc3c` 8.x: full walk at depth-2 drops from measured `{20 9}` scans to
 `{4 3}` — each level scanned exactly once, by its own segment.
 
-**The positive control found a real question:** the default's parent walk
-costs `tally=16` where the naive model says 8 — the depth fold evaluates
-the wrapped child TWICE per parent row (measured per segment, pinned in
-proc3c 8.1 so a fix shows up as the number dropping to `{12 9}`).
-Suspect: the inner fold's correlation referencing the wrapped child's
-expression column re-evaluates it.  A fold-codegen inefficiency, not a
-correctness bug (8.4 pins value equality); worth a look whenever the fold
-codegen is next open.
+**The positive control found a real defect, diagnosed exactly 2026-08-12
+(EXPLAIN receipts in the session log):** `procAddFoldColumn` hands the
+inner recursion a RAW DUP of the child's key expression
+(`procFoldInnerExpr(..., sqlite3ExprDup(pOld->a[v].pExpr))` — the comment
+beside it argues capture-safety, which is true, and misses evaluation
+semantics).  The dup'd expression becomes the RHS of the grandchild
+correlation and lands INSIDE the grandchild scan loop: opcode listing
+shows `tally` at one site per json value (fine) and one site inside the
+replies Rewind loop — **O(children × grandchildren) evaluations of the
+key expression per parent row**.  Measured: 2 json sites + 2 comments ×
+3 replies = 8/parent = the pinned 16.  For a NON-DETERMINISTIC key
+expression this is also a wrongness bug: the correlation evaluates a
+different value than the json displays.
+
+**Fix design (deliberately not implemented in the overnight session —
+it is a restructure, not a patch):** the root fold must WRAP its child
+like the inner levels already do (`FROM (child AS _f*) AS a1 WHERE
+a1._f0 = parent.key`, inner levels correlating on `a1._fN`), with the
+flattener blocked via the `LIMIT -1` idiom (procInterArm's trick) when
+the child carries a further nested fold and any referenced child
+expression is not a plain column — an expression key can never use an
+index, so blocking flattening there costs nothing.  The same guard
+belongs in `procFoldInnerExpr`'s own wrap for level N→N+1.  proc3c 8.1
+announces the fix: `{20 9}` drops to `{12 9}`.
 
 ---
 
