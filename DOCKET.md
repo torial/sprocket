@@ -729,10 +729,21 @@ client steps through, so `nresultsets` becomes projection-dependent and every
 segment-aware consumer has to agree about which sets exist. Worth doing, worth
 doing separately.
 
-**Open question the syntax raises:** `sqlite3_column_count` now varies with the
-projection. That is legal — it is per-statement — but `procgen` must emit
-accessors per projection rather than per procedure, which is a change to its
-output model and should be settled before the emitter is written.
+**The open question this section used to carry — accessors per projection —
+was settled 2026-08-11; the campaign record is `PLAN-PROJECTION.md`.** The
+settlement, briefly: in the Zebra emitter (the consumer that exists) the
+question dissolves, because the PROJECTION IS CHOSEN BY THE GENERATOR, not
+the caller — the emitted client issues one query per procedure with
+`RETURNING <value columns>` fixed at generation time, and its surface is the
+typed struct stitched from segments, so `sqlite3_column_count` variance never
+reaches a consumer. The C emitter does not emit RETURNING and honestly keeps
+accessors per procedure. If a future emitter offers CALLER-chosen
+projections, accessors go per projection then — deferred until such a
+consumer exists. Everything else in this section is implemented: P0–P2
+(grammar, canonical body, projection codegen) landed 2026-08-04
+(`9b8f0539..0704b28e`, `proc3c`), the cache re-key landed 2026-08-11
+(`proc3c` 6.x/7.x, `sqlite3_proc_cache_list`), and the localisation pass's
+three bug finds are recorded in the plan.
 
 ---
 

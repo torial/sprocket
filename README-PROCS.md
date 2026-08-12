@@ -70,11 +70,15 @@ CALL pay_down(42, 19.99);
   re-parse. On top of that, a per-connection cache shares the compiled body
   across statements: re-preparing a CALL skips body compilation entirely
   (measured ~1.35x faster prepares on an 8-statement body; the win scales
-  with body size). Cached bodies must be self-contained -- non-TEMP, no
-  AUTOINCREMENT tables, no triggers fired by body DML, no nested CALL;
-  anything else transparently uses the per-statement tier. The cache
-  invalidates on schema change (cookie), function/collation registration,
-  DETACH, and close.
+  with body size). The cache keys on **(procedure, projection)**: a
+  `RETURNING` CALL files under a canonical signature of the kept columns, so
+  two projections never share a compiled body and re-spelling the same
+  projection still hits (`proc3c` 6.x). Cached bodies must be
+  self-contained -- non-TEMP, no AUTOINCREMENT tables, no triggers fired by
+  body DML, no nested CALL; `WITH COUNTS`/`WITH INTERLEAVED` and anything
+  else transparently use the per-statement tier. The cache invalidates on
+  schema change (cookie), function/collation registration, DETACH, and
+  close. `PRAGMA proc_check` names the tier and the reason.
 
 ## Typed clients from the schema
 
@@ -129,11 +133,14 @@ Introspection (both read the in-memory catalog; no storage change):
 PRAGMA [schema.]proc_list;          -- name, nparams, nresultsets (segments), declared
 PRAGMA [schema.]proc_info(name);    -- resultset_index, position, name, decltype
                                     -- set 0 = parameters, 1..n = declared shapes
-PRAGMA [schema.]proc_check(name);   -- every advisory as ROWS: kind
-                                    -- ('handrolled' | 'index'), subject,
-                                    -- message.  The log channel made
-                                    -- queryable; an unmeasured answer says
-                                    -- "unknown until ...", never silence.
+PRAGMA [schema.]proc_check[(name)]; -- every advisory as ROWS: proc, kind
+                                    -- ('handrolled' | 'index' | 'cache'),
+                                    -- subject, message.  Without a name it
+                                    -- checks EVERY procedure, sorted (the
+                                    -- foreign_key_check shape).  The log
+                                    -- channel made queryable; an unmeasured
+                                    -- answer says "unknown until ...",
+                                    -- never silence.
 PRAGMA [schema.]proc_nested(name);  -- one row per NESTED TABLE: its segment,
                                     -- the column it hangs from, key_child,
                                     -- key_parent.  proc_info shows a nested
@@ -279,9 +286,11 @@ through, `sqlite3_proc_current_segment()` reports −1 (the discriminator is
 the column), and `sqlite3_proc_next_resultset()` is `SQLITE_MISUSE`.
 Because the merge needs one order, every nested table must correlate on the
 SAME parent column, and multi-result-set procedures are refused — those
-shapes keep the segmented protocol.  Combining with `COUNTS` or `RETURNING`
-is refused (not silently ignored) until built.  Output is ordered by the
-correlation key, not by the body's parent order.
+shapes keep the segmented protocol.  Combining with `COUNTS` is refused
+(not silently ignored) until a consumer earns it; combining with
+`RETURNING` is refused **by design, permanently** -- INTERLEAVED computes
+no folds, so there is nothing to project away (DOCKET 3h, 2026-08-08).
+Output is ordered by the correlation key, not by the body's parent order.
 
 **`CALL p(...) RETURNING col, ...`** — projection: keep only the named
 parent columns.  Its chief use is declining the nested-table fold columns a

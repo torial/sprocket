@@ -299,8 +299,8 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_PROCEDURE)
 
   NAME: proc_check
-  FLAG: NeedSchema Result1 SchemaOpt
-  COLS: kind subject message
+  FLAG: NeedSchema Result0 Result1 SchemaOpt
+  COLS: proc kind subject message
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_PROCEDURE)
 

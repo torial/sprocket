@@ -79,6 +79,13 @@ do_test 2.1 { shapeof {CALL pwc() RETURNING id, comments} } {id comments}
 # columns, it does not reorder them.
 do_test 2.2 { shapeof {CALL pwc() RETURNING title, id} } {id title}
 
+# POSITIVE CONTROL for the suppressor: a projection that KEEPS a fold must
+# still produce that fold's rows -- proof the machinery that declines folds
+# cannot fire when the fold was asked for.  Content, not just shape.
+do_execsql_test 2.3 {
+  CALL pwc() RETURNING id, comments;
+} {1 {[{"post_id":1,"cid":1},{"post_id":1,"cid":2}]} 2 {[{"post_id":2,"cid":3},{"post_id":2,"cid":4}]}}
+
 #--------------------------------------------------------------------
 # 3.x: THE HEADLINE -- the double scan disappears
 #

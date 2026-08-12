@@ -82,18 +82,26 @@ State the expected number, then compare. `testfixture` prints a memory summary
 even when it reports nothing, so **a clean tail is not a pass.** Always read the
 `N errors out of M tests` line, and check M.
 
+*(Counts refreshed 2026-08-11, PLAN-PROJECTION session.  procfault differs
+by build: 2484 release / 2878 DEBUG=3, where the cache's lock-replay paths
+are walked.  Under DEBUG=3, proc1/2/3/4/5/psm1 die at the pre-existing 3d
+mayAbort assert — run those six on release until 3d is fixed on
+stored-procs.)*
+
 | suite | tests | | suite | tests |
 |---|---|---|---|---|
-| `procinter` | 17 | | `proc6adv` | 12 |
-| `proc1` | 33 | | `proc3c` | 13 |
+| `procinter` | 36 | | `proc6adv` | 12 |
+| `proc1` | 33 | | `proc3c` | 21 |
 | `proc4` | 47 | | `proc4c` | 13 |
 | `proc5` | 24 | | `hiddencol` | 12 |
 | `proc6` | 52 | | `procadv` | 8 |
 | `psm1` | 35 | | `foldshape` | 7 |
 | `prochostile` | 13 | | `fold` | 6 |
 | `proclk` | 9 | | `b64` | 6 |
-| `procfault` | 1064 | | `procnull` | 6 |
-| `procmosaic` | 6 | | | |
+| `procfault` | 2484/2878 | | `procnull` | 6 |
+| `procmosaic` | 6 | | `proccheck` | 12 |
+| `proc2` | 31 | | `proc3` | 29 |
+| `procdeep` | 19 | | `procbench` | 9 |
 
 ## Design — settled, do not relitigate
 

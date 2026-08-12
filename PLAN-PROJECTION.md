@@ -7,6 +7,55 @@ turns it into an executable campaign. Read HANDOFF-3h.md for build mechanics
 and suite baselines. Sibling docket item 3d (`mayAbort` assert) is a
 stored-procs bug — do NOT bundle it into this branch's work.*
 
+## EXECUTED 2026-08-11 — status, and a correction to this file's premise
+
+**The localisation pass found this plan's premise a week stale.** P0–P2 were
+already implemented on 2026-08-04, the same afternoon the docket entry was
+written (`9b8f0539` spec → `0820e55d` 3a → `03565319` 3b-i → `0704b28e`
+3b-ii, `proc3c` 13/13) — the docket entry was never annotated ✅, and this
+brief was drafted from its text without checking git. The measured regression
+below ("proc6-8.5/8.6 show 4 and 8") describes the pre-08-04 state; those
+suites have pinned 4/8 default and 0/4 projected ever since. Let the lesson
+ride along: **a campaign brief that names commits it expects to find missing
+is checkable in one `git log` — run it before believing the premise.**
+
+Per-phase reality:
+
+- **P0 Grammar** — landed 08-04. `proc3c` 1.x/2.x/5.x.
+- **P1 Canonical body** — landed 08-04 (3b-i). The fold generates onto a
+  copy at CALL-compile (`procApplyFolds` from `codeProcProgram`), "so that
+  it can be declined."
+- **P2 Projection codegen** — landed 08-04 (3b-ii). This session added the
+  plan-shaped leg: `proc3c` 7.x pins EXPLAIN showing the fold aggregate by
+  default (positive control) and none under projection.
+- **P3 Cache re-key** — **built this session** (`babe7bf8`). Canonical
+  signature = declared spelling of kept columns in declaration order; both
+  planted legs green with receipts from `sqlite3_proc_cache_list`
+  (`proc3c` 6.x); COUNTS/INTERLEAVED still bypass by choice.
+- **P4 procgen** — emitter landed 08-06 (`944ec9d9`); verified + hardened
+  this session (`08cdd73d`): depth-1 emits `RETURNING <value columns>`,
+  depth-2 emits none, regen byte-identical, emitted SQL accepted verbatim,
+  `PROCGEN_TEST` 17/17 against the now-committed
+  `tool/procgen_fixture.sql`. Accessors-per-projection settled by
+  construction — the generator chooses the projection (DOCKET §3c).
+
+**And the localisation's own control (`DEBUG=3` per phase) found three real
+bugs before any campaign edit** (`bf1545dc`): the proc cache was inert in
+every debug build (upstream's mark-everything-sharable exerciser), the
+cache-hit path never replayed table-lock bookkeeping, and — live in release
+since the cache landed — a cached SubProgram's shared `sqlite3_context`
+could keep a dead statement's register pointers when two statements'
+output registers coincided on one heap address. The plan's own control
+regime caught what its phases were never aimed at.
+
+**Done-means status:** unmodified callers byte-identical (all suites, both
+build regimes), cache provably separates projections (proc3c 6.2) and
+provably HITS (6.0/6.3), DOCKET §3c's open-question paragraph replaced with
+the settlement and a pointer here. Remaining from "done means": regenerating
+the Mosaic client (`witnesses_full`) picks up the projection automatically
+at its next `procgen` run — that regeneration belongs to the mosaic/sprocket
+repo, not this one.
+
 ## Why now — a measured regression against the feature's own client
 
 Phase 5b baked the nested-table fold into the parent SELECT at CREATE

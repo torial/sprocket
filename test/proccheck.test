@@ -33,13 +33,22 @@ do_execsql_test 0.0 {
 # State 1: nothing measured yet.
 do_execsql_test 1.0 {
   PRAGMA proc_check(pwc);
-} {index comments {unknown until a CALL has been prepared on this connection; prepare one and re-run} cache pwc {unknown until a CALL has been prepared on this connection; prepare one and re-run}}
+} {pwc index comments {unknown until a CALL has been prepared on this connection; prepare one and re-run} pwc cache pwc {unknown until a CALL has been prepared on this connection; prepare one and re-run}}
 
 # State 2: a CALL has compiled; there is no index on comments(post_id).
 do_test 1.1 {
   execsql {CALL pwc()}
   execsql {PRAGMA proc_check(pwc)}
-} {index comments {the declared correlation comments.post_id requires an ordering that no index supplies; every CALL sorts this segment}}
+} {pwc index comments {the declared correlation comments.post_id requires an ordering that no index supplies; every CALL sorts this segment}}
+
+# The NO-ARGUMENT form checks every procedure, like foreign_key_check
+# without a table.  It used to be a silent no-op -- zero rows reading
+# exactly like "nothing to report" -- so this leg is placed where the
+# check MUST report something: an empty-result placement could not be
+# told apart from the old silence.
+do_execsql_test 1.1b {
+  PRAGMA proc_check;
+} {pwc index comments {the declared correlation comments.post_id requires an ordering that no index supplies; every CALL sorts this segment}}
 
 # State 3: the index exists; the schema change expires the compiled body, the
 # next CALL remeasures, and the advisory is gone.
@@ -115,7 +124,7 @@ do_test 4.0 {
   }
   execsql {CALL outer_p()}
   execsql {PRAGMA proc_check(outer_p)}
-} {cache outer_p {compiles per prepared statement: the body fires a trigger or CALLs another procedure}}
+} {outer_p cache outer_p {compiles per prepared statement: the body fires a trigger or CALLs another procedure}}
 
 #--------------------------------------------------------------------
 # 5.x: the GENUINE shared-cache refusal.  SQLITE_DEBUG builds mark every
@@ -138,6 +147,6 @@ do_test 5.0 {
   dbS close
   sqlite3_enable_shared_cache $scSave
   set r
-} {cache sc_probe {compiles per prepared statement: the database uses shared-cache mode}}
+} {sc_probe cache sc_probe {compiles per prepared statement: the database uses shared-cache mode}}
 
 finish_test

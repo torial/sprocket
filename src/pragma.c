@@ -435,6 +435,67 @@ static void pragmaProcNestedLevel(Vdbe *v, ProcParamList *pC, int *piNext){
     pragmaProcNestedLevel(v, pC->a[j].pNested, piNext);
   }
 }
+
+/*
+** One procedure's PRAGMA proc_check rows: (proc, kind, subject, message).
+** Shared by the named form and the check-everything form.
+*/
+static void pragmaProcCheckOne(Vdbe *v, Proc *pProc){
+  ProcFold *pF;
+  for(pF=pProc->pFolds; pF; pF=pF->pNext){
+    if( pF->bHandRolled ){
+      char *z = sqlite3_mprintf("nested table %s builds a further level "
+        "by hand; that inner correlation is not checked, not ordered by "
+        "the engine, and not covered by WITH COUNTS", pF->zName);
+      if( z ){
+        sqlite3VdbeMultiLoad(v, 1, "ssss", pProc->zName, "handrolled",
+                             pF->zName, z);
+        sqlite3_free(z);
+      }
+    }
+    if( !pF->bSortKnown ){
+      sqlite3VdbeMultiLoad(v, 1, "ssss", pProc->zName, "index", pF->zName,
+        "unknown until a CALL has been prepared on this connection; "
+        "prepare one and re-run");
+    }else if( pF->bNeedsSort ){
+      char *z = sqlite3_mprintf("the declared correlation %s.%s requires "
+        "an ordering that no index supplies; every CALL sorts this "
+        "segment", pF->zName, sqlite3ProcFoldKeyName(pF));
+      if( z ){
+        sqlite3VdbeMultiLoad(v, 1, "ssss", pProc->zName, "index",
+                             pF->zName, z);
+        sqlite3_free(z);
+      }
+    }
+  }
+  /* The cache tier: silent when cached (fine needs no row), a named
+  ** reason when the body compiles per statement, and an explicit
+  ** "unknown" before any plain CALL has compiled. */
+  switch( pProc->eCachePlan ){
+    case PROC_CACHE_OK: break;
+    case PROC_CACHE_UNKNOWN:
+      sqlite3VdbeMultiLoad(v, 1, "ssss", pProc->zName, "cache",
+        pProc->zName,
+        "unknown until a CALL has been prepared on this connection; "
+        "prepare one and re-run");
+      break;
+    default: {
+      static const char *azWhy[] = { 0, 0,
+        "the procedure lives in the TEMP schema",
+        "the database uses shared-cache mode",
+        "the body touches an AUTOINCREMENT table",
+        "the body fires a trigger or CALLs another procedure" };
+      char *z = sqlite3_mprintf("compiles per prepared statement: %s",
+                  azWhy[pProc->eCachePlan]);
+      if( z ){
+        sqlite3VdbeMultiLoad(v, 1, "ssss", pProc->zName, "cache",
+                             pProc->zName, z);
+        sqlite3_free(z);
+      }
+      break;
+    }
+  }
+}
 #endif /* SQLITE_OMIT_PROCEDURE */
 
 /*
@@ -1604,66 +1665,51 @@ void sqlite3Pragma(
   ** has not been measured yet says so explicitly ('unknown until ...')
   ** rather than reading as clean: a zero nobody computed is not a zero.
   */
-  case PragTyp_PROC_CHECK: if( zRight ){
-    Proc *pProc = 0;
+  case PragTyp_PROC_CHECK: {
     int ii;
-    pParse->nMem = 3;
-    for(ii=0; ii<db->nDb && pProc==0; ii++){
-      Schema *pSchema = db->aDb[ii].pSchema;
-      if( pSchema==0 ) continue;
-      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
-      pProc = (Proc*)sqlite3HashFind(&pSchema->procHash, zRight);
-    }
-    if( pProc ){
-      ProcFold *pF;
-      for(pF=pProc->pFolds; pF; pF=pF->pNext){
-        if( pF->bHandRolled ){
-          char *z = sqlite3_mprintf("nested table %s builds a further level "
-            "by hand; that inner correlation is not checked, not ordered by "
-            "the engine, and not covered by WITH COUNTS", pF->zName);
-          if( z ){
-            sqlite3VdbeMultiLoad(v, 1, "sss", "handrolled", pF->zName, z);
-            sqlite3_free(z);
-          }
-        }
-        if( !pF->bSortKnown ){
-          sqlite3VdbeMultiLoad(v, 1, "sss", "index", pF->zName,
-            "unknown until a CALL has been prepared on this connection; "
-            "prepare one and re-run");
-        }else if( pF->bNeedsSort ){
-          char *z = sqlite3_mprintf("the declared correlation %s.%s requires "
-            "an ordering that no index supplies; every CALL sorts this "
-            "segment", pF->zName, sqlite3ProcFoldKeyName(pF));
-          if( z ){
-            sqlite3VdbeMultiLoad(v, 1, "sss", "index", pF->zName, z);
-            sqlite3_free(z);
-          }
-        }
+    pParse->nMem = 4;
+    if( zRight ){
+      Proc *pProc = 0;
+      for(ii=0; ii<db->nDb && pProc==0; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        pProc = (Proc*)sqlite3HashFind(&pSchema->procHash, zRight);
       }
-      /* The cache tier: silent when cached (fine needs no row), a named
-      ** reason when the body compiles per statement, and an explicit
-      ** "unknown" before any plain CALL has compiled. */
-      switch( pProc->eCachePlan ){
-        case PROC_CACHE_OK: break;
-        case PROC_CACHE_UNKNOWN:
-          sqlite3VdbeMultiLoad(v, 1, "sss", "cache", pProc->zName,
-            "unknown until a CALL has been prepared on this connection; "
-            "prepare one and re-run");
-          break;
-        default: {
-          static const char *azWhy[] = { 0, 0,
-            "the procedure lives in the TEMP schema",
-            "the database uses shared-cache mode",
-            "the body touches an AUTOINCREMENT table",
-            "the body fires a trigger or CALLs another procedure" };
-          char *z = sqlite3_mprintf("compiles per prepared statement: %s",
-                      azWhy[pProc->eCachePlan]);
-          if( z ){
-            sqlite3VdbeMultiLoad(v, 1, "sss", "cache", pProc->zName, z);
-            sqlite3_free(z);
-          }
-          break;
+      if( pProc ) pragmaProcCheckOne(v, pProc);
+    }else{
+      /* No name: check EVERY procedure, like foreign_key_check without a
+      ** table.  This form used to be a silent no-op -- zero rows that read
+      ** exactly like "nothing to report" -- and that silence misled its own
+      ** author before anyone else (2026-08-11).  Sorted by name so the
+      ** output is stable rather than hash-ordered. */
+      for(ii=0; ii<db->nDb; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        HashElem *he;
+        Proc **apProc;
+        int nProc = 0, j, k;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        for(he=sqliteHashFirst(&pSchema->procHash); he;
+            he=sqliteHashNext(he)) nProc++;
+        if( nProc==0 ) continue;
+        apProc = sqlite3DbMallocRawNN(db, nProc*sizeof(Proc*));
+        if( apProc==0 ) break;
+        j = 0;
+        for(he=sqliteHashFirst(&pSchema->procHash); he;
+            he=sqliteHashNext(he)){
+          apProc[j++] = (Proc*)sqliteHashData(he);
         }
+        for(j=1; j<nProc; j++){
+          Proc *pT = apProc[j];
+          for(k=j; k>0
+               && sqlite3StrICmp(apProc[k-1]->zName, pT->zName)>0; k--){
+            apProc[k] = apProc[k-1];
+          }
+          apProc[k] = pT;
+        }
+        for(j=0; j<nProc; j++) pragmaProcCheckOne(v, apProc[j]);
+        sqlite3DbFree(db, apProc);
       }
     }
   }
