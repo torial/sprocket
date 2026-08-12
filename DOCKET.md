@@ -885,13 +885,30 @@ for a body whose writes cannot abort; simply dropping it fails the debug
 auditor the other way (a body SELECT calling any function counts as
 abortable). The claim is now **computed from the compiled opcodes**
 (`procProgramMayAbort`, mirroring `sqlite3VdbeAssertMayAbort`'s own test),
-so the CALL claims exactly what its body can do. Behind that wall a second
-bug: the autoinc machinery records the `sqlite_sequence` table lock during
-`FinishCoding`, *after* the OP_TableLock prologue is emitted — recorded but
-never coded; `autoIncBegin` now records it in time. (Latent upstream for
-trigger bodies inserting into AUTOINCREMENT tables under shared cache.)
-With both fixes the ENTIRE proc family runs green under `DEBUG=3` for the
-first time — proc1/2/3/4/5/psm1 included.
+so the CALL claims exactly what its body can do. With it, the ENTIRE proc
+family runs green under `DEBUG=3` for the first time.
+
+### The second bug behind the wall — CORRECTED twice, kethiv and qere
+
+The overnight fix recorded the `sqlite_sequence` lock in `autoIncBegin`
+and called the hole "latent upstream for triggers." **Both halves were
+wrong, found the same morning by building a STOCK 3.53 debug fixture and
+watching the claimed repro survive.** Upstream is fine: the outer DML
+statement's own end-of-codegen `sqlite3AutoincrementEnd()` call sweeps a
+trigger body's deferred autoinc registrations and records the lock in
+time. What the survival exposed instead was the REAL fork bug, worse than
+any assert: **a CALL statement never made that sweep at all, so a body
+INSERT into an AUTOINCREMENT table read the counter and NEVER wrote it
+back** — `sqlite_sequence` stayed empty and a deleted max rowid was
+silently REUSED through a procedure, the one thing AUTOINCREMENT exists
+to prevent, shipped since procedures could first insert. The debug lock
+assert was this bug's shadow: the read cursor existed, the write side
+that would have recorded the lock never did. Fix: `sqlite3CallProc`'s
+toplevel codegen calls `sqlite3AutoincrementEnd()` exactly as every DML
+statement does; the `autoIncBegin` band-aid is reverted to upstream
+parity. `proc3` 5.3b–5.3d pin the contract (sequence persisted, deleted
+max never reused). No upstream report is warranted — the draft died at
+its own verification step, which is the step existing for that.
 
 **Found 2026-08-04 by building `DEBUG=3`.** Every build of this fork's
 procedure work had been `-O2` with `NDEBUG`, so no `assert()` had ever run.

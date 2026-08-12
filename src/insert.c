@@ -449,18 +449,6 @@ static int autoIncBegin(
       pToplevel->nMem +=2;       /* Rowid in sqlite_sequence + orig max val */
     }
     memId = pInfo->regCtr;
-    /* Record the sqlite_sequence table lock NOW, while codeTableLocks()
-    ** still lies ahead.  The cursors on sqlite_sequence are opened by
-    ** sqlite3AutoincrementBegin()/End(), and when this insert compiles
-    ** inside a sub-context that defers those to sqlite3FinishCoding() --
-    ** a trigger body, or this fork's procedure bodies -- their own
-    ** sqlite3OpenTable() calls record the lock AFTER the OP_TableLock
-    ** prologue was already emitted: recorded but never coded, so on a
-    ** sharable btree the sequence cursor opens with no lock at all
-    ** (hasSharedCacheTableLock assert; found via CALL, latent for
-    ** triggers).  For a top-level INSERT this is a harmless duplicate of
-    ** the lock AutoincrementEnd's OpenTable records anyway. */
-    sqlite3TableLock(pParse, iDb, pSeqTab->tnum, 1, pSeqTab->zName);
   }
   return memId;
 }

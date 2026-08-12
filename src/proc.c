@@ -3785,6 +3785,26 @@ void sqlite3CallProc(Parse *pParse, SrcList *pName, ExprList *pArgs,
   sqlite3VdbeJumpHere(v, addr);
   VdbeComment((v, "Call: %s", pProc->zName));
 
+  /* The autoincrement write-back, exactly where every DML statement does
+  ** it (insert.c end-of-codegen, "nested==0 && pTriggerTab==0").  A body
+  ** INSERT into an AUTOINCREMENT table registers on the toplevel pAinc and
+  ** DEFERS the sqlite_sequence update to the statement that contains it --
+  ** for a trigger that is the outer INSERT/UPDATE/DELETE, which sweeps it
+  ** up here in its own codegen.  A CALL statement has no DML wrapper, and
+  ** until 2026-08-12 nothing ever emitted the write-back: counters were
+  ** read (AutoincrementBegin at FinishCoding) and NEVER persisted, so a
+  ** deleted-then-reinserted max rowid was silently REUSED through a
+  ** procedure -- the one thing AUTOINCREMENT exists to prevent.  The
+  ** debug-build lock assert on the sequence table was this bug's shadow:
+  ** the read cursor existed, the write side that would have recorded the
+  ** lock in time did not.  Emitting End during codegen also records that
+  ** lock before FinishCoding's OP_TableLock prologue, closing both.
+  ** Nested CALLs skip (pToplevel set); the outermost CALL sweeps the
+  ** whole tree's registrations, which all live on the toplevel Parse. */
+  if( pParse->pToplevel==0 ){
+    sqlite3AutoincrementEnd(pParse);
+  }
+
 call_cleanup:
   sqlite3SrcListDelete(db, pName);
   sqlite3ExprListDelete(db, pArgs);

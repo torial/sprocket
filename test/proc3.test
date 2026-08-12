@@ -164,6 +164,24 @@ do_test 5.3 {
   db eval {SELECT id, v FROM t5b ORDER BY id}
 } {1 p 2 q}
 
+# THE AUTOINCREMENT CONTRACT THROUGH A PROCEDURE (found 2026-08-12).  A DML
+# statement sweeps deferred autoinc registrations up in its own codegen
+# (insert.c calls sqlite3AutoincrementEnd); a CALL statement had no such
+# sweep, so the counter was read at every prepare and NEVER written back:
+# sqlite_sequence stayed empty, and a deleted max rowid was silently
+# REUSED -- the one thing AUTOINCREMENT exists to prevent.
+do_test 5.3b {
+  db eval {SELECT name, seq FROM sqlite_sequence WHERE name='t5b'}
+} {t5b 2}
+do_test 5.3c {
+  db eval {DELETE FROM t5b WHERE id=2}
+  db eval {CALL add5b('r')}
+  db eval {SELECT id, v FROM t5b ORDER BY id}
+} {1 p 3 r}
+do_test 5.3d {
+  db eval {SELECT seq FROM sqlite_sequence WHERE name='t5b'}
+} {3}
+
 do_execsql_test 5.4 {
   -- nested CALL => excluded
   CREATE PROCEDURE outer5(v INTEGER) BEGIN CALL add4(v); END;
