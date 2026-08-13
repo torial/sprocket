@@ -1501,6 +1501,21 @@ correctness contract and is beautifully testable.
 **Effort: large. Value: this is the one that would make the fork worth using
 for reasons unrelated to procedures.**
 
+**DONE 2026-08-12.** Sean ruled all six questions (DESIGN-IVM.md, RULINGS,
+including the mid-campaign hidden-columns ruling); the campaign executed as
+`PLAN-IVM.md` P1–P4, one commit per phase (ab17af45, 7547f60c, 8048a13d,
+b5ca293b), and `test/ivm1.test` — the spec, committed red on purpose — is
+green whole, 0 of 24.  The syntax that shipped is `CREATE MATERIALIZED VIEW
+… [WITH MAINTENANCE EAGER|DEFERRED]`.  Everything this entry asked for
+exists: the enforced subset refusing by name (Tier 1; HAVING moved to
+Tier 2 by dated amendment), the equality oracle as a first-class surface
+(`PRAGMA view_check`, diff rows + mandatory coverage summary, stale-first
+on deferred), and the storm test folding to oracle-clean.  User docs:
+`README-IVM.md`, including the Q3 proc-cache tradeoff in its own loud
+section.  Deliberately not in v1 (each refused by name, ranked for the
+follow-on): MIN/MAX with the index advisory, inner joins, DISTINCT,
+HAVING, TEMP-schema views, read-side folding (never).
+
 ## 5. `wal2` and `BEGIN CONCURRENT` — *two decisions, not one*
 
 **Corrected 2026-08-01 after actually looking.** This entry previously treated

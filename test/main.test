@@ -460,10 +460,19 @@ do_test main-3.3 {
     select x*10 from T1 order by x*5;
   }
 } {-0.51 -0.5 0.05 0.5 5.0 500.0 500.0 500.0 5000.0 50000.0}
+# main-3.4 expectation updated 2026-08-12 (fork): CREATE MATERIALIZED VIEW
+# accepts an identifier after CREATE (a checked identifier, not a keyword),
+# so "create bogus" is now a valid PREFIX of a statement and end-of-input
+# reports incomplete rather than a syntax error at the identifier.  With
+# more input the error surfaces at the next token as before.
 do_test main-3.4 {
   set v [catch {execsql {create bogus}} msg]
   lappend v $msg
-} {1 {near "bogus": syntax error}}
+} {1 {incomplete input}}
+do_test main-3.4b {
+  set v [catch {execsql {create bogus table t1(x)}} msg]
+  lappend v $msg
+} {1 {near "table": syntax error}}
 do_test main-3.5 {
   set v [catch {execsql {create}} msg]
   lappend v $msg

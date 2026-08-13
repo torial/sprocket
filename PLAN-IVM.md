@@ -234,8 +234,31 @@ CREATE INDEX); creation never automatic.
   instrument; the advisory carries the runnable `CREATE INDEX ...`
   statement. Gate: fires on the indexless fixture, silent once the
   index exists, never an error.
+  **DISPOSITION 2026-08-12: arrives with Tier 2, not built in v1.**
+  Tier-1 maintenance performs no base-table scans an index could
+  save: insert/delete/update deltas are one-row CTE evaluations, and
+  the view-side seek rides the auto-created key index.  The advisory
+  this phase describes is the MIN/MAX-rescan advisory (DESIGN-IVM
+  Q2 Tier 2), and building an instrument that cannot fire in v1
+  would be a vacuous instrument — a green from a gauge with nothing
+  to measure.  It ships with MIN/MAX, whose rescans give it
+  something true to say.
+  *Related disclosure, for Sean:* P3 auto-creates the view's own
+  UNIQUE key index (`ivm$<view>$key`) without an advisory or opt-in.
+  My reading is that the Q1-addendum ruling ("creation stays
+  ADVISORY") governs user-visible indexes on USER tables — the base
+  rescan indexes — while the key index is part of the
+  materialization format, like the shadow rootpage itself, engine-
+  owned and dropped with the view.  If the ruling was meant
+  strictly, converting it to an advisory is a small change; flagged
+  rather than assumed.
 - **P6 — docs.** README-IVM.md with the Q3 proc-cache tradeoff in its
   own loud section; DOCKET #4 closed with pointers; wiki.
+  **EXECUTED 2026-08-12.** README-IVM.md written (object, maintenance,
+  truth surfaces, the loud cost section, sharp edges, isolation
+  tactics for maintainers); DOCKET #4 closed with commit pointers;
+  wiki log carries the day.  Campaign-close control: full veryquick
+  on the release build (result recorded in the P6 commit).
 
 ## Controls (stated before running, per the house instrument discipline)
 
