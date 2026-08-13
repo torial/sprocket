@@ -1676,7 +1676,11 @@ changes what the fork *is*.
 `BEGIN CONCURRENT` needs a decision before transport Phase 5 regardless of
 where it sits in this list.
 
-## 6. Materialized views and the version-skew lockout -- *found by dogfood, 2026-08-13*
+## 9. Materialized views and the version-skew lockout -- *found by dogfood, 2026-08-13*
+
+*(Filed as a second #6 by mistake on 2026-08-13 -- the temporal-tables
+entry already held that number, which is fitting, because the two
+entries turn out to be the same question; renumbered to 9 same day.)*
 
 **The finding, exact:** a database containing ANY materialized view is
 unreadable AT OPEN by any binary that does not understand the view's tier --

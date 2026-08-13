@@ -145,7 +145,7 @@ refresh is whoever runs the pragma.
   by binaries that do not understand it** — stock SQLite and older
   fork builds alike fail schema load with "malformed database schema",
   and the lockout covers every table in the file.  Found by dogfood
-  the first morning (DOCKET #6, with three candidate postures awaiting
+  the first morning (DOCKET #9, with three candidate postures awaiting
   a ruling).  Until then: a db with mviews is
   exactly-this-fork-version-or-nothing.
 
