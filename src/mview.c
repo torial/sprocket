@@ -469,6 +469,75 @@ static int mviewAggColKind(
 }
 
 /*
+** Collect the join-probe columns for the index advisory: for every
+** top-level equality conjunct in the WHERE (inner-join ON terms live
+** there after prepare) whose two sides are plain columns of DIFFERENT
+** tables, record each side as (base ordinal, column name).  A rowid /
+** INTEGER PRIMARY KEY side is skipped -- the btree key never needs an
+** index.  On overflow the whole capture is dropped: the advisory says
+** nothing rather than something incomplete.
+*/
+static void mviewCollectProbes(
+  Select *pSelect,
+  u8 *aProbeBase,
+  const char **azProbeCol,
+  int *pnProbe,
+  int mxProbe
+){
+  Expr *apStack[32];
+  int nStack = 0;
+  int n = 0;
+  SrcList *pSrc = pSelect->pSrc;
+
+  *pnProbe = 0;
+  if( pSrc->nSrc<2 || pSelect->pWhere==0 ) return;
+  apStack[nStack++] = pSelect->pWhere;
+  while( nStack>0 ){
+    Expr *pE = apStack[--nStack];
+    if( pE==0 ) continue;
+    if( pE->op==TK_AND ){
+      if( nStack+2>(int)ArraySize(apStack) ) return;   /* too deep: drop */
+      apStack[nStack++] = pE->pLeft;
+      apStack[nStack++] = pE->pRight;
+      continue;
+    }
+    if( pE->op==TK_EQ
+     && pE->pLeft && pE->pLeft->op==TK_COLUMN && pE->pLeft->y.pTab
+     && pE->pRight && pE->pRight->op==TK_COLUMN && pE->pRight->y.pTab
+     && pE->pLeft->iTable!=pE->pRight->iTable
+    ){
+      Expr *apSide[2];
+      int s;
+      apSide[0] = pE->pLeft;
+      apSide[1] = pE->pRight;
+      for(s=0; s<2; s++){
+        int k, dup = 0;
+        const char *zCol;
+        if( apSide[s]->iColumn<0 ) continue;         /* rowid: served */
+        zCol = apSide[s]->y.pTab->aCol[apSide[s]->iColumn].zCnName;
+        for(k=0; k<pSrc->nSrc; k++){
+          if( pSrc->a[k].iCursor==apSide[s]->iTable ) break;
+        }
+        if( k>=pSrc->nSrc ) continue;
+        {
+          int m;
+          for(m=0; m<n; m++){
+            if( aProbeBase[m]==(u8)k
+             && sqlite3StrICmp(azProbeCol[m], zCol)==0 ) dup = 1;
+          }
+        }
+        if( dup ) continue;
+        if( n>=mxProbe ){ *pnProbe = 0; return; }    /* overflow: drop */
+        aProbeBase[n] = (u8)k;
+        azProbeCol[n] = zCol;
+        n++;
+      }
+    }
+  }
+  *pnProbe = n;
+}
+
+/*
 ** The Tier-1 conformance walk.  pSelect has already been through
 ** sqlite3ResultSetOfSelect() (names resolved, aggregates marked).
 ** On any violation an error naming the construct and the fix is left in
@@ -483,8 +552,6 @@ static int mviewCheckSelect(
   const char **azBaseCol   /* OUT: base column names (keys, MIN/MAX args) */
 ){
   MViewWalk sWalk;
-  SrcItem *pItem;
-  Table *pBase;
   int i;
 
   sWalk.pParse = pParse;
@@ -517,33 +584,55 @@ static int mviewCheckSelect(
     return sWalk.rc;
   }
 
-  /* Exactly one base, and it must be an ordinary table */
-  assert( pSelect->pSrc!=0 );
-  if( pSelect->pSrc->nSrc!=1 ){
-    mviewRefuse(&sWalk, "joins are not yet supported (Tier 2)");
-    return sWalk.rc;
-  }
-  pItem = &pSelect->pSrc->a[0];
-  if( pItem->fg.isSubquery || pItem->pSTab==0 ){
-    mviewRefuse(&sWalk, "subqueries in FROM are not yet supported");
-    return sWalk.rc;
-  }
-  pBase = pItem->pSTab;
-  if( IsView(pBase) ){
-    mviewRefuse(&sWalk, "the base must be an ordinary table "
-                        "(%s is a view)", pBase->zName);
-    return sWalk.rc;
-  }
-  if( IsVirtual(pBase) ){
-    mviewRefuse(&sWalk, "the base must be an ordinary table "
-                        "(%s is a virtual table)", pBase->zName);
-    return sWalk.rc;
-  }
-  if( IsMView(pBase) ){
-    mviewRefuse(&sWalk, "the base must be an ordinary table (%s is "
-                        "itself a materialized view; cascading "
-                        "maintenance is not yet supported)", pBase->zName);
-    return sWalk.rc;
+  /* Every FROM item must be an ordinary base table, appearing once,
+  ** inner-joined.  The per-base trigger construction shadows ONE table
+  ** with the one-row delta and probes the others live, which is
+  ** correct for any deterministic inner condition -- an inner join
+  ** distributes over the union of one side's rows.  A table appearing
+  ** twice breaks that (the shadow would replace both occurrences), and
+  ** outer joins flip null-extended rows on membership changes. */
+  assert( pSelect->pSrc!=0 && pSelect->pSrc->nSrc>=1 );
+  {
+    int k, j;
+    for(k=0; k<pSelect->pSrc->nSrc; k++){
+      SrcItem *pItem = &pSelect->pSrc->a[k];
+      Table *pB;
+      if( pItem->fg.isSubquery || pItem->pSTab==0 ){
+        mviewRefuse(&sWalk, "subqueries in FROM are not yet supported");
+        return sWalk.rc;
+      }
+      pB = pItem->pSTab;
+      if( IsView(pB) ){
+        mviewRefuse(&sWalk, "the base must be an ordinary table "
+                            "(%s is a view)", pB->zName);
+        return sWalk.rc;
+      }
+      if( IsVirtual(pB) ){
+        mviewRefuse(&sWalk, "the base must be an ordinary table "
+                            "(%s is a virtual table)", pB->zName);
+        return sWalk.rc;
+      }
+      if( IsMView(pB) ){
+        mviewRefuse(&sWalk, "the base must be an ordinary table (%s is "
+                            "itself a materialized view; cascading "
+                            "maintenance is not yet supported)",
+                            pB->zName);
+        return sWalk.rc;
+      }
+      if( (pItem->fg.jointype & JT_OUTER)!=0 ){
+        mviewRefuse(&sWalk, "outer joins are not yet supported (a "
+            "departing row can flip null-extended rows on the other "
+            "side)");
+        return sWalk.rc;
+      }
+      for(j=0; j<k; j++){
+        if( pSelect->pSrc->a[j].pSTab==pB ){
+          mviewRefuse(&sWalk, "%s appears more than once (self-joins "
+                              "are not yet maintainable)", pB->zName);
+          return sWalk.rc;
+        }
+      }
+    }
   }
 
   /* Result columns: each is either a Tier-1 aggregate call or an
@@ -551,11 +640,33 @@ static int mviewCheckSelect(
   ** refused: which row the engine picks for them is unspecified, and a
   ** maintained view may not depend on it.) */
   assert( pSelect->pEList!=0 );
+  {
+  int bJoin = pSelect->pSrc->nSrc>1;
+  int bHasCount0 = 0;
   for(i=0; i<pSelect->pEList->nExpr; i++){
     Expr *pE = pSelect->pEList->a[i].pExpr;
     if( pE->op==TK_AGG_FUNCTION ){
       int kind = mviewAggColKind(&sWalk, pE, &azColl[i], &azBaseCol[i]);
       if( sWalk.rc ) return sWalk.rc;
+      if( bJoin ){
+        /* A join view carries no hidden bookkeeping (one base row is
+        ** many join rows, so the one-row derivations do not exist):
+        ** what cannot be derived must be declared or refused. */
+        if( kind==MVIEW_COL_SUM ){
+          mviewRefuse(&sWalk, "sum() is not yet maintainable in a join "
+              "view (its NULL-restoring count cannot be derived across "
+              "a join); use total()");
+          return sWalk.rc;
+        }
+        if( kind==MVIEW_COL_AVG ){
+          mviewRefuse(&sWalk, "avg() is not yet maintainable in a join "
+              "view (its sum and count cannot be derived across a "
+              "join); declare total() and count(*) and divide at query "
+              "time");
+          return sWalk.rc;
+        }
+        if( kind==MVIEW_COL_COUNT0 ) bHasCount0 = 1;
+      }
       aColKind[i] = (u8)kind;
       continue;
     }
@@ -588,6 +699,12 @@ static int mviewCheckSelect(
           i+1, zCol ? zCol : "?");
       return sWalk.rc;
     }
+  }
+  if( bJoin && !bHasCount0 ){
+    mviewRefuse(&sWalk, "a join view must declare count(*) (the "
+        "group's liveness cannot be derived across a join)");
+    return sWalk.rc;
+  }
   }
 
   /* WHERE filters the delta; must be deterministic, no aggregates by
@@ -671,46 +788,67 @@ static void mviewCodePopulate(Parse *pParse, Table *p, Select *pSelect){
 static void mviewRegister(
   Parse *pParse,
   Table *p,                /* The view's table object */
-  Table *pBase,            /* The base table (gets TF_MViewBase) */
+  SrcList *pSrc,           /* The resolved FROM: every item an ordinary
+                           ** base table (each gets TF_MViewBase) */
   int bDeferred,
   int nCol,                /* Number of VISIBLE result columns */
   const u8 *aColKind,      /* The conformance walk's column kinds */
   const char **azColl,     /* MIN/MAX arg collations (entries may be 0) */
   const char **azBaseCol,  /* Base column names (entries may be 0) */
+  const u8 *aProbeBase,    /* Join-probe capture: base ordinal ... */
+  const char **azProbeCol, /* ... and column name, nProbe entries */
+  int nProbe,
   const char *zSelDef,     /* Definition SELECT text */
   int nSelDef              /* Length of zSelDef */
 ){
   MViewInfo *pInfo, *pOld;
   sqlite3 *db = pParse->db;
   sqlite3_int64 nName = sqlite3Strlen30(p->zName)+1;
-  sqlite3_int64 nBase = sqlite3Strlen30(pBase->zName)+1;
   sqlite3_int64 nStr, nAlloc;
+  int nBase = pSrc->nSrc;
   char *zOut;
   int i;
   assert( db->init.busy );
   assert( sqlite3SchemaMutexHeld(db, 0, p->pSchema) );
-  /* One allocation: struct, the two pointer arrays (aligned, so they
-  ** come first), then the string pool and the kind array.  The hash
-  ** keys off pInfo->zName rather than the Table's own name so the
-  ** entry never points into memory the table teardown frees. */
-  nStr = nName + nBase + nSelDef + 1;
+  /* One allocation: struct, then every pointer array (aligned, so they
+  ** come first -- Trigger* and char* share alignment), then the string
+  ** pool and the byte arrays.  The hash keys off pInfo->zName rather
+  ** than the Table's own name so the entry never points into memory
+  ** the table teardown frees. */
+  nStr = nName + nSelDef + 1;
+  for(i=0; i<nBase; i++){
+    nStr += sqlite3Strlen30(pSrc->a[i].pSTab->zName) + 1;
+  }
   for(i=0; i<nCol; i++){
     if( azColl[i] ) nStr += sqlite3Strlen30(azColl[i]) + 1;
     if( azBaseCol[i] ) nStr += sqlite3Strlen30(azBaseCol[i]) + 1;
   }
-  nAlloc = sizeof(MViewInfo) + 2*nCol*sizeof(char*) + nStr + nCol;
+  for(i=0; i<nProbe; i++){
+    nStr += sqlite3Strlen30(azProbeCol[i]) + 1;
+  }
+  nAlloc = sizeof(MViewInfo)
+         + (nBase + 2*nCol + nProbe + 3*nBase)*sizeof(char*)
+         + nStr + nCol + nProbe;
   pInfo = sqlite3MallocZero(nAlloc);
   if( pInfo==0 ){
     sqlite3OomFault(db);
     return;
   }
-  pInfo->azColl = (char**)&pInfo[1];
+  pInfo->azBase = (char**)&pInfo[1];
+  pInfo->azColl = pInfo->azBase + nBase;
   pInfo->azBaseCol = pInfo->azColl + nCol;
-  zOut = (char*)(pInfo->azBaseCol + nCol);
+  pInfo->azProbeCol = pInfo->azBaseCol + nCol;
+  pInfo->apTrig = (Trigger**)(pInfo->azProbeCol + nProbe);
+  zOut = (char*)(pInfo->apTrig + 3*nBase);
   pInfo->zName = zOut;
   memcpy(zOut, p->zName, nName);      zOut += nName;
-  pInfo->zBase = zOut;
-  memcpy(zOut, pBase->zName, nBase);  zOut += nBase;
+  for(i=0; i<nBase; i++){
+    const char *zB = pSrc->a[i].pSTab->zName;
+    int n = sqlite3Strlen30(zB) + 1;
+    pInfo->azBase[i] = zOut;
+    memcpy(zOut, zB, n);
+    zOut += n;
+  }
   pInfo->zSelDef = zOut;
   memcpy(zOut, zSelDef, nSelDef);
   zOut[nSelDef] = 0;                  zOut += nSelDef + 1;
@@ -728,13 +866,26 @@ static void mviewRegister(
       zOut += n;
     }
   }
+  for(i=0; i<nProbe; i++){
+    int n = sqlite3Strlen30(azProbeCol[i]) + 1;
+    pInfo->azProbeCol[i] = zOut;
+    memcpy(zOut, azProbeCol[i], n);
+    zOut += n;
+  }
   pInfo->aColKind = (u8*)zOut;
   memcpy(pInfo->aColKind, aColKind, nCol);
+  zOut += nCol;
+  pInfo->aProbeBase = (u8*)zOut;
+  if( nProbe>0 ) memcpy(pInfo->aProbeBase, aProbeBase, nProbe);
   pInfo->nCol = nCol;
+  pInfo->nBase = nBase;
+  pInfo->nProbe = nProbe;
   pInfo->bDeferred = (u8)(bDeferred!=0);
-  /* The base table now has a dependent: TriggerList consults the
-  ** registry for it (eager maintenance), and ALTER/DROP refuse. */
-  pBase->tabFlags |= TF_MViewBase;
+  /* Every base table now has a dependent: TriggerList consults the
+  ** registry for them (eager maintenance), and ALTER/DROP refuse. */
+  for(i=0; i<nBase; i++){
+    pSrc->a[i].pSTab->tabFlags |= TF_MViewBase;
+  }
   pOld = sqlite3HashInsert(&p->pSchema->mviewHash, pInfo->zName, pInfo);
   if( pOld ){
     if( pOld==pInfo ){          /* OOM inside HashInsert */
@@ -756,7 +907,7 @@ static void mviewRegister(
 static void mviewInfoFree(sqlite3 *db, MViewInfo *pInfo){
   int i;
   if( pInfo==0 ) return;
-  for(i=0; i<3; i++){
+  for(i=0; i<3*pInfo->nBase; i++){
     sqlite3DeleteTrigger(db, pInfo->apTrig[i]);
   }
   sqlite3_free(pInfo);
@@ -785,23 +936,28 @@ void sqlite3MViewHashClear(sqlite3 *db, Hash *pHash){
 void sqlite3UnlinkAndDeleteMView(sqlite3 *db, int iDb, const char *zName){
   Hash *pHash;
   MViewInfo *pInfo;
+  int k;
   assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
   pHash = &db->aDb[iDb].pSchema->mviewHash;
   pInfo = sqlite3HashInsert(pHash, zName, 0);
-  if( pInfo && pInfo->bTrigBuilt ){
-    Table *pBase = sqlite3FindTable(db, pInfo->zBase,
-                                    db->aDb[iDb].zDbSName);
-    if( pBase ){
-      Trigger **pp = &pBase->pTrigger;
-      while( *pp ){
-        int i, isMine = 0;
-        for(i=0; i<3; i++){
-          if( *pp==pInfo->apTrig[i] ) isMine = 1;
-        }
-        if( isMine ){
-          *pp = (*pp)->pNext;
-        }else{
-          pp = &(*pp)->pNext;
+  if( pInfo ){
+    for(k=0; k<pInfo->nBase; k++){
+      Table *pBase;
+      if( pInfo->apTrig[3*k]==0 ) continue;   /* this set never built */
+      pBase = sqlite3FindTable(db, pInfo->azBase[k],
+                               db->aDb[iDb].zDbSName);
+      if( pBase ){
+        Trigger **pp = &pBase->pTrigger;
+        while( *pp ){
+          int i, isMine = 0;
+          for(i=0; i<3; i++){
+            if( *pp==pInfo->apTrig[3*k+i] ) isMine = 1;
+          }
+          if( isMine ){
+            *pp = (*pp)->pNext;
+          }else{
+            pp = &(*pp)->pNext;
+          }
         }
       }
     }
@@ -826,8 +982,11 @@ const char *sqlite3MViewFindDependent(
   pHash = &db->aDb[iDb].pSchema->mviewHash;
   for(pElem=sqliteHashFirst(pHash); pElem; pElem=sqliteHashNext(pElem)){
     MViewInfo *pInfo = (MViewInfo*)sqliteHashData(pElem);
-    if( sqlite3_stricmp(pInfo->zBase, zBase)==0 ){
-      return pInfo->zName;
+    int k;
+    for(k=0; k<pInfo->nBase; k++){
+      if( sqlite3_stricmp(pInfo->azBase[k], zBase)==0 ){
+        return pInfo->zName;
+      }
     }
   }
   return 0;
@@ -860,11 +1019,13 @@ void sqlite3CreateMView(
   int iDb;
   sqlite3 *db = pParse->db;
   Table *pSelTab;    /* Result-set shape of the definition */
-  Table *pBase = 0;  /* The single base table */
   Select *pSelDup = 0; /* Pre-resolution copy, for population */
   u8 *aColKind = 0;  /* Conformance walk's per-column kinds */
   const char **azColl = 0;    /* MIN/MAX arg collations, walk-captured */
   const char **azBaseCol = 0; /* Base column names, walk-captured */
+  u8 aProbeBase[32];          /* Join-probe capture: base ordinals... */
+  const char *azProbeCol[32]; /* ...and column names */
+  int nProbe = 0;
   int nVis = 0;      /* Number of visible result columns */
 
   if( pMat->n!=12 || sqlite3_strnicmp(pMat->z, "materialized", 12)!=0 ){
@@ -975,11 +1136,19 @@ void sqlite3CreateMView(
                        azColl, azBaseCol) ){
     goto create_mview_fail;
   }
-  assert( pSelect->pSrc->nSrc==1 && pSelect->pSrc->a[0].pSTab!=0 );
-  pBase = pSelect->pSrc->a[0].pSTab;
+  /* Join-probe capture for the advisory: each base's plain columns in
+  ** top-level equality conjuncts against another table.  Overflowing
+  ** the fixed capture drops the whole set: no advisory rather than a
+  ** wrong one. */
+  mviewCollectProbes(pSelect, aProbeBase, azProbeCol, &nProbe,
+                     (int)ArraySize(aProbeBase));
 
-  /* The hidden bookkeeping columns, at CREATE and at every load */
-  if( mviewAppendHiddenCols(pParse, p, nVis, aColKind) ){
+  /* The hidden bookkeeping columns, at CREATE and at every load.
+  ** Join views carry none: their liveness is the count(*) the walk
+  ** required, and their SUM/AVG (the other hidden consumers) are
+  ** refused. */
+  if( pSelect->pSrc->nSrc==1
+   && mviewAppendHiddenCols(pParse, p, nVis, aColKind) ){
     goto create_mview_fail;
   }
 
@@ -990,8 +1159,10 @@ void sqlite3CreateMView(
       pParse->nErr++;
       goto create_mview_fail;
     }
-    mviewAugmentSelect(pParse, pSelDup, nVis, aColKind);
-    if( pParse->nErr || db->mallocFailed ) goto create_mview_fail;
+    if( pSelect->pSrc->nSrc==1 ){
+      mviewAugmentSelect(pParse, pSelDup, nVis, aColKind);
+      if( pParse->nErr || db->mallocFailed ) goto create_mview_fail;
+    }
     mviewCodePopulate(pParse, p, pSelDup);
     if( pParse->nErr ) goto create_mview_fail;
   }
@@ -1096,8 +1267,10 @@ void sqlite3CreateMView(
       nSelDef--;
     }
     /* EndTable consumed pNewTable into the schema; p remains valid. */
-    mviewRegister(pParse, p, pBase, (p->tabFlags & TF_MViewDeferred)!=0,
-                  nVis, aColKind, azColl, azBaseCol, zSelDef, nSelDef);
+    mviewRegister(pParse, p, pSelect->pSrc,
+                  (p->tabFlags & TF_MViewDeferred)!=0,
+                  nVis, aColKind, azColl, azBaseCol,
+                  aProbeBase, azProbeCol, nProbe, zSelDef, nSelDef);
   }
 
 create_mview_fail:
@@ -1218,6 +1391,26 @@ exit_drop_mview:
 */
 
 /*
+** The group-liveness column: single-table views carry the hidden
+** ivm$count; join views carry no hidden columns, and their liveness is
+** the count(*) the conformance walk REQUIRES them to declare.
+*/
+static const char *mviewLiveName(
+  const MViewInfo *pInfo,
+  const Table *pView
+){
+  int i;
+  if( pInfo->nBase==1 ) return "ivm$count";
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_COUNT0 ){
+      return pView->aCol[i].zCnName;
+    }
+  }
+  assert( !"join view without count(*) got past the walk" );
+  return "ivm$count";
+}
+
+/*
 ** Append the DELTA subquery for one affected row:
 **   (WITH "base"(cols) AS (VALUES(ROW.cols))
 **    SELECT d.*, <bookkeeping>, 1 AS "ivm$count" FROM (
@@ -1245,19 +1438,26 @@ static void mviewAppendDelta(
                         pBase->aCol[i].zCnName);
   }
   sqlite3_str_appendall(pStr, ")) SELECT d.*");
-  for(i=0; i<pInfo->nCol; i++){
-    const char *zC = pView->aCol[i].zCnName;
-    if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
-      sqlite3_str_appendf(pStr,
-         ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i);
-    }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
-      sqlite3_str_appendf(pStr,
-         ", d.\"%w\" AS \"ivm$s$%d\""
-         ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i, zC, i);
+  if( pInfo->nBase==1 ){
+    /* The ONE-ROW identities: valid only when the delta is a single
+    ** base row.  A join view's outputs are already its group deltas
+    ** (the shadowed definition aggregates the joined rows), and it
+    ** has no hidden columns to feed. */
+    for(i=0; i<pInfo->nCol; i++){
+      const char *zC = pView->aCol[i].zCnName;
+      if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
+        sqlite3_str_appendf(pStr,
+           ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i);
+      }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
+        sqlite3_str_appendf(pStr,
+           ", d.\"%w\" AS \"ivm$s$%d\""
+           ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i, zC, i);
+      }
     }
+    sqlite3_str_appendall(pStr, ", 1 AS \"ivm$count\"");
   }
   sqlite3_str_appendf(pStr,
-     ", 1 AS \"ivm$count\" FROM (\n%s\n) AS d)", pInfo->zSelDef);
+     " FROM (\n%s\n) AS d)", pInfo->zSelDef);
 }
 
 /*
@@ -1372,9 +1572,11 @@ static void mviewAppendCombine(
         break;
     }
   }
-  sqlite3_str_appendf(pStr,
-     "%s\"ivm$count\" = \"%w\".\"ivm$count\" %c d.\"ivm$count\"",
-     n ? ", " : "", zV, cSign);
+  if( pInfo->nBase==1 ){
+    sqlite3_str_appendf(pStr,
+       "%s\"ivm$count\" = \"%w\".\"ivm$count\" %c d.\"ivm$count\"",
+       n ? ", " : "", zV, cSign);
+  }
 }
 
 /*
@@ -1457,8 +1659,8 @@ static void mviewAppendSteps(
   }else{
     if( nKey>0 ){
       sqlite3_str_appendf(pStr,
-         "DELETE FROM \"%w\" WHERE \"%w\".\"ivm$count\"<=0",
-         pView->zName, pView->zName);
+         "DELETE FROM \"%w\" WHERE \"%w\".\"%w\"<=0",
+         pView->zName, pView->zName, mviewLiveName(pInfo, pView));
       for(i=0; i<pInfo->nCol; i++){
         if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
         sqlite3_str_appendf(pStr, " AND \"%w\".\"%w\" IS (SELECT \"%w\" FROM ",
@@ -1483,6 +1685,7 @@ static char *mviewBuildTriggerSql(
   const Table *pView,
   const Table *pBase,
   const char *zDbName,
+  int iBase,                /* pBase's ordinal: unique trigger names */
   int op
 ){
   static const char *azOp[] = { "INSERT", "DELETE", "UPDATE" };
@@ -1493,8 +1696,8 @@ static char *mviewBuildTriggerSql(
     if( pInfo->aColKind[i]==MVIEW_COL_KEY ) nKey++;
   }
   sqlite3_str_appendf(pStr,
-     "CREATE TRIGGER \"%w\".\"ivm$%w$%s\" AFTER %s ON \"%w\" BEGIN ",
-     zDbName, pView->zName, azSuf[op], azOp[op], pBase->zName);
+     "CREATE TRIGGER \"%w\".\"ivm$%w$%d$%s\" AFTER %s ON \"%w\" BEGIN ",
+     zDbName, pView->zName, iBase, azSuf[op], azOp[op], pBase->zName);
   if( op!=0 ){  /* DELETE and UPDATE subtract the OLD row */
     mviewAppendSteps(pStr, pInfo, pView, pBase, 0, nKey);
   }
@@ -1573,31 +1776,42 @@ void sqlite3MViewSynthTriggers(Parse *pParse, Table *pTab){
       he=sqliteHashNext(he)){
     MViewInfo *pInfo = (MViewInfo*)sqliteHashData(he);
     Table *pView;
-    int k;
-    if( pInfo->bTrigBuilt ) continue;
-    if( sqlite3_stricmp(pInfo->zBase, pTab->zName)!=0 ) continue;
+    int k, kb, iBase = -1;
+    if( pInfo->bTrigBuilt ) continue;      /* every base's set built */
+    for(kb=0; kb<pInfo->nBase; kb++){
+      if( sqlite3_stricmp(pInfo->azBase[kb], pTab->zName)==0 ){
+        iBase = kb;
+        break;
+      }
+    }
+    if( iBase<0 ) continue;
+    if( pInfo->apTrig[3*iBase]!=0 ) continue;  /* this base's set built */
     pView = sqlite3FindTable(db, pInfo->zName, db->aDb[iDb].zDbSName);
     if( NEVER(pView==0) ) continue;
     for(k=0; k<3; k++){
       char *zSql = mviewBuildTriggerSql(db, pInfo, pView, pTab,
-                                        db->aDb[iDb].zDbSName, k);
+                                        db->aDb[iDb].zDbSName, iBase, k);
       if( zSql==0 ){
         sqlite3OomFault(db);
         return;
       }
-      pInfo->apTrig[k] = mviewParseTrigger(pParse, zSql);
+      pInfo->apTrig[3*iBase+k] = mviewParseTrigger(pParse, zSql);
       sqlite3_free(zSql);
-      if( pInfo->apTrig[k]==0 ) return;
-      pInfo->apTrig[k]->bMViewMaint = 1;
+      if( pInfo->apTrig[3*iBase+k]==0 ) return;
+      pInfo->apTrig[3*iBase+k]->bMViewMaint = 1;
     }
-    /* All three built: link them into the base's list so every DML
+    /* All three built: link them into THIS base's list so every DML
     ** compile sees them (and so the xfer/truncate fast paths disable
-    ** themselves, which is a correctness dependency here). */
+    ** themselves, which is a correctness dependency here).  Other
+    ** bases' sets build when their own first DML asks. */
     for(k=0; k<3; k++){
-      pInfo->apTrig[k]->pNext = pTab->pTrigger;
-      pTab->pTrigger = pInfo->apTrig[k];
+      pInfo->apTrig[3*iBase+k]->pNext = pTab->pTrigger;
+      pTab->pTrigger = pInfo->apTrig[3*iBase+k];
     }
-    pInfo->bTrigBuilt = 1;
+    for(kb=0; kb<pInfo->nBase; kb++){
+      if( pInfo->apTrig[3*kb]==0 ) break;
+    }
+    if( kb>=pInfo->nBase ) pInfo->bTrigBuilt = 1;
   }
 }
 
@@ -1660,19 +1874,23 @@ static void mviewAppendFoldSource(
     }
   }
   /* The hidden columns, in the same order they were appended to the
-  ** view: per-column parts ascending, then ivm$count */
-  for(i=0; i<pInfo->nCol; i++){
-    if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
-      sqlite3_str_appendf(pStr,
-         ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i);
-    }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
-      sqlite3_str_appendf(pStr,
-         ",sum(\"ivm$w\"*coalesce(\"ivm$s$%d\",0)) AS \"ivm$s$%d\""
-         ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i, i, i);
+  ** view: per-column parts ascending, then ivm$count.  Join views have
+  ** no hidden columns; their liveness count(*) folded above with the
+  ** other visible columns. */
+  if( pInfo->nBase==1 ){
+    for(i=0; i<pInfo->nCol; i++){
+      if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
+        sqlite3_str_appendf(pStr,
+           ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i);
+      }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
+        sqlite3_str_appendf(pStr,
+           ",sum(\"ivm$w\"*coalesce(\"ivm$s$%d\",0)) AS \"ivm$s$%d\""
+           ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i, i, i);
+      }
     }
+    sqlite3_str_appendall(pStr,
+       ",sum(\"ivm$w\"*\"ivm$count\") AS \"ivm$count\"");
   }
-  sqlite3_str_appendall(pStr,
-     ",sum(\"ivm$w\"*\"ivm$count\") AS \"ivm$count\"");
   sqlite3_str_appendf(pStr, " FROM \"%w\".\"sqlite_ivm_%w_log\"",
                       zDbName, pView->zName);
   if( nKey>0 ){
@@ -1764,8 +1982,8 @@ void sqlite3MViewCodeRefresh(
 
     /* Step 3: groups whose liveness count reached zero */
     sqlite3NestedParse(pParse,
-       "DELETE FROM \"%w\".\"%w\" WHERE \"ivm$count\"<=0",
-       zDbName, pView->zName);
+       "DELETE FROM \"%w\".\"%w\" WHERE \"%w\"<=0",
+       zDbName, pView->zName, mviewLiveName(pInfo, pView));
     if( pParse->nErr ) return;
   }
 
@@ -2061,16 +2279,55 @@ void sqlite3MViewCodeCheck(
   sqlite3_str_appendall(pStr, " FROM extra))||' differ' ");
 
   /* Tier 2: the index advisory rides the same surface, last -- fires
-  ** while the qualifying-delete rescan would scan, silent once the
+  ** while a maintenance probe or rescan would scan, silent once the
   ** index exists (this compile-time detection expires with the schema
-  ** cookie, so a CREATE INDEX makes the very next check clean). */
-  {
-    Table *pBase = sqlite3FindTable(db, pInfo->zBase, zDbName);
+  ** cookie, so a CREATE INDEX makes the very next check clean).
+  **
+  ** Single-base views advise the rescan index (keys, then extremum
+  ** arguments).  Join views advise the JOIN-PROBE indexes: one row per
+  ** equality-condition column not already the btree key or the leading
+  ** column of some index -- each base's delta select probes the others
+  ** through exactly these.  (The rescan advisory is not attempted
+  ** across tables: no advisory rather than a guessed one.) */
+  if( pInfo->nBase==1 ){
+    Table *pBase = sqlite3FindTable(db, pInfo->azBase[0], zDbName);
     char *zAdv = pBase ? mviewAdvisory(db, pInfo, pBase) : 0;
     if( zAdv ){
       sqlite3_str_appendf(pStr,
          "UNION ALL SELECT %Q, 'advisory', NULL, %Q ", zView, zAdv);
       sqlite3_free(zAdv);
+    }
+  }else{
+    int m;
+    for(m=0; m<pInfo->nProbe; m++){
+      Table *pBase = sqlite3FindTable(db,
+                        pInfo->azBase[pInfo->aProbeBase[m]], zDbName);
+      const char *zCol = pInfo->azProbeCol[m];
+      Index *pIdx;
+      int served = 0;
+      if( pBase==0 ) continue;
+      if( pBase->iPKey>=0
+       && sqlite3StrICmp(pBase->aCol[pBase->iPKey].zCnName, zCol)==0 ){
+        served = 1;
+      }
+      for(pIdx=pBase->pIndex; pIdx && !served; pIdx=pIdx->pNext){
+        if( pIdx->nKeyCol>=1 && pIdx->aiColumn[0]>=0
+         && sqlite3StrICmp(pBase->aCol[pIdx->aiColumn[0]].zCnName,
+                           zCol)==0 ){
+          served = 1;
+        }
+      }
+      if( !served ){
+        char *zAdv = sqlite3MPrintf(db,
+           "CREATE INDEX \"ivmadv$%w$%d$%w\" ON \"%w\"(\"%w\")",
+           pInfo->zName, pInfo->aProbeBase[m], zCol,
+           pBase->zName, zCol);
+        if( zAdv ){
+          sqlite3_str_appendf(pStr,
+             "UNION ALL SELECT %Q, 'advisory', NULL, %Q ", zView, zAdv);
+          sqlite3DbFree(db, zAdv);
+        }
+      }
     }
   }
 

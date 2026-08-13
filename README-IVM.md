@@ -45,7 +45,19 @@ is enforced at the edges:
 
 Supported (Tier 1): `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `TOTAL(x)`,
 `AVG(x)`; `WHERE`; deterministic GROUP BY expressions and constants;
-one ordinary base table.  **Tier 2 stage one (PLAN-IVM2): `MIN(col)`
+one ordinary base table.  **Tier 2 stage two (PLAN-IVM3): INNER
+JOINS** — any number of ordinary base tables, each appearing once,
+under any deterministic inner-join conditions.  Maintenance runs a
+trigger set per base; each base's deltas re-run the definition with
+that one table shadowed by the changed row, so the join probe uses
+whatever index exists — and `view_check`'s advisory names the exact
+`CREATE INDEX` per unserved probe column when one is missing.  A join
+view carries no hidden bookkeeping: it must declare `count(*)` (that
+column IS the group's liveness), `COUNT(x)`/`TOTAL`/`MIN`/`MAX`
+maintain from their own outputs, and `SUM`/`AVG` refuse by name in
+join views (their NULL-restoring counts are not derivable across a
+join — `total()` is the workaround).  Self-joins and outer joins
+refuse by name.  **Tier 2 stage one (PLAN-IVM2): `MIN(col)`
 and `MAX(col)` over plain columns.**  Inserts maintain by comparison
 (with the column's collation, captured at CREATE and spelled
 explicitly in the generated SQL); deleting the stored extremum

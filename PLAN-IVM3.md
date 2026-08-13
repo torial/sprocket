@@ -40,6 +40,57 @@ SOURCE-AGNOSTIC and need nothing.
 - Every FROM item must be an ordinary base table (views, vtabs,
   subqueries, other mviews: refused per item, existing messages).
 
+## AMENDMENT (2026-08-13, mid-campaign; kethiv in Q0's spec, qere here)
+
+The first build caught a real algebraic error in this plan's silent
+assumption.  Tier 1's delta derivations rest on the ONE-ROW identity:
+a delta contributes ivm$count=1, and a SUM's non-null count-delta is
+`value IS NOT NULL`.  Under a join, ONE BASE ROW IS MANY JOIN ROWS,
+and the identity collapses — measured as a group surviving its own
+death (liveness decremented 1 when two join rows departed).
+
+The definition's own aggregates over the delta group are still exactly
+right (the delta select re-runs the definition, so its count(*) IS the
+group's join-row delta).  What is not derivable from the outputs is
+the HIDDEN bookkeeping — and the honest repair is that join views have
+no hidden columns at all:
+
+- **count(*) is REQUIRED in a join definition** (refused by name with
+  the fix if absent): it is the group's liveness, and under a join it
+  must be declared because it cannot be derived.
+- COUNT(x), TOTAL(x), MIN/MAX(col): maintain from their own outputs,
+  which are correct group-deltas by construction.
+- **SUM and AVG refuse by name in join views**: their NULL-restoring
+  counts (SUM's count-of-non-null, AVG's sum+count) are hidden parts
+  the text cannot re-derive.  total() is the named workaround; a later
+  stage can lift this by detecting declared sibling count(x)/sum(x)
+  columns (sqlite3ExprCompare over the resolved trees makes that
+  checkable at CREATE).
+- The join delta select is therefore the MINIMAL form — the shadowed
+  definition verbatim, no appended derivations — and the liveness
+  column referenced by the death step, the fold, and view_list's
+  arithmetic is the declared count(*) column rather than ivm$count.
+
+Single-table views keep their hidden columns and their one-row
+identities unchanged; every nBase==1 path is untouched.
+
+Two further Q0 spec corrections from the first live runs, same
+authority:
+
+- The storm and reopen sections counted a DEFERRED view's honest
+  staleness diffs as failures — lazyact exists from 6.x on and its log
+  rightly accumulates the storm.  The legs now run no-arg
+  `PRAGMA view_refresh` first, which is also the better test.
+- The probe-economics pins measured absolute FULLSCAN_STEP counts,
+  which include temp-structure steps (the shadow CTE's co-routine, the
+  GROUP BY b-tree) — noise at the 0-vs-4 granularity.  EXPLAIN QUERY
+  PLAN shows the join probe itself is already optimal (SCAN CONSTANT
+  ROW, then SEARCH by rowid).  The pins now measure the O(1) claim
+  directly: inflate the PROBED table with join-inert rows and require
+  the per-op step count NOT to grow for an indexed probe, and to grow
+  for an unindexed one, and to stop growing once the advisory's index
+  exists.
+
 ## Phases
 
 - **Q0 — the spec, red.**  `test/ivm3.test`: acceptance (2-table and
@@ -74,6 +125,34 @@ SOURCE-AGNOSTIC and need nothing.
 - Probe economics measured via FULLSCAN_STEP, both directions, and the
   advisory seen firing AND seen silenced by its own carried statement.
 - Sweep both regimes; the roster gains ivm3.
+
+## EXECUTED 2026-08-13 (the spec drained 25 → 0)
+
+The registry grew its base list, per-base trigger arrays, and the
+join-probe capture; the walk gained the per-item FROM loop with the
+three refusals plus the amendment's two (SUM/AVG in joins, the
+count(*) requirement); synthesis became a per-base lazy loop (each
+base's set builds on ITS first DML — a table never written never pays);
+and the delta select for join views collapsed to the MINIMAL form, the
+shadowed definition verbatim, because a join view's outputs are already
+its group deltas.  The advisory's join mode emits one row per unserved
+probe column, IPK-aware (a rowid probe is never advised).
+
+The first live run caught the campaign's real bug — the one-row
+identity collapse recorded in the amendment above — measured as a
+group surviving its own death, and the fix DELETED code: join views
+carry no hidden columns, no delta derivations, no fold extras; the
+liveness column is the declared count(*), threaded by name through the
+death steps and the fold.  EXPLAIN QUERY PLAN confirmed the shadow
+CTE join-probes optimally with no hints (SCAN CONSTANT ROW, then
+SEARCH by rowid), and the economics pins were rebuilt to measure the
+actual O(1) claim: an indexed probe's cost does not grow when the
+probed table is inflated 20x with join-inert rows; an unindexed
+probe's does; the advisory's own statement stops the growth.
+
+Gates: ivm3 0/33; ivm1 0/24 (1.4 re-pinned at the self-join boundary,
+history in the comment); ivm2 0/38; full sweep with ivm3 in the
+roster, both regimes.
 
 ## Deliberately NOT in this campaign
 

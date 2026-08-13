@@ -5572,7 +5572,7 @@ typedef struct MViewInfo MViewInfo;
 struct MViewInfo {
   char *zName;             /* View name; also the hash key, so the entry
                            ** never dangles into a freed Table */
-  char *zBase;             /* Name of the single base table */
+  char **azBase;           /* nBase base-table names, FROM order */
   char *zSelDef;           /* Text of the definition SELECT (for the
                            ** view_check recompute and the synthesized
                            ** maintenance triggers) */
@@ -5585,9 +5585,18 @@ struct MViewInfo {
                            ** plain base columns and for MIN/MAX argument
                            ** columns, the BASE column name (the index
                            ** advisory is written from these); else 0 */
-  Trigger *apTrig[3];      /* Synthesized maintenance triggers (INSERT,
-                           ** DELETE, UPDATE); memory-only, owned here */
+  u8 *aProbeBase;          /* nProbe entries: which base (index into
+                           ** azBase) each probe column belongs to */
+  char **azProbeCol;       /* nProbe entries: a plain column this base
+                           ** contributes to an equality conjunct against
+                           ** another table -- the join-probe advisory
+                           ** is written from these */
+  Trigger **apTrig;        /* 3*nBase synthesized maintenance triggers
+                           ** (INSERT, DELETE, UPDATE per base);
+                           ** memory-only, owned here */
   int nCol;                /* Number of VISIBLE result columns */
+  int nBase;               /* Number of base tables */
+  int nProbe;              /* Number of probe-column entries */
   u8 bDeferred;            /* True for WITH MAINTENANCE DEFERRED */
   u8 bTrigBuilt;           /* Maintenance triggers synthesized+attached */
 };

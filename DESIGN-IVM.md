@@ -184,8 +184,20 @@ column arguments only (collation becomes statically knowable and every
 generated comparison spells it); the rescan trigger is binary-IS
 equality against the stored extremum (correct under any collation);
 deferred refresh repairs extremum columns per touched group.  The
-advisory is the accept-with-advisory lean below, verbatim.  Inner
-equi-joins remain stage two.
+advisory is the accept-with-advisory lean below, verbatim.
+
+**LANDED 2026-08-13 (stage two: inner joins; PLAN-IVM3).**  A trigger
+set per base, each shadowing its own table with the one-row CTE and
+probing the others live — the textbook delta algebra serialized
+per row.  Any deterministic INNER condition is accepted ("equi" turned
+out to be a cost property, so equalities feed the advisory: one row
+per unserved probe column, the DELETE-a-post example below verbatim).
+Self-joins and outer joins refuse by name.  The amendment recorded in
+PLAN-IVM3: a join view carries NO hidden bookkeeping (one base row is
+many join rows, so the one-row derivations do not exist) — count(*)
+is REQUIRED as the declared liveness, COUNT/TOTAL/MIN/MAX maintain
+from their own outputs, and SUM/AVG refuse by name pending
+sibling-column detection.
 
 **MIN/MAX.** Inserts are a comparison; *deleting the current extremum*
 forces a per-group rescan:
