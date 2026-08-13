@@ -43,9 +43,21 @@ is enforced at the edges:
   to a runtime guard that a stored definition never gets; the walk
   analyzes date-function arguments itself.
 
-Supported in v1 (Tier 1): `COUNT(*)`, `COUNT(x)`, `SUM(x)`,
-`TOTAL(x)`, `AVG(x)`; `WHERE`; deterministic GROUP BY expressions and
-constants; one ordinary base table.
+Supported (Tier 1): `COUNT(*)`, `COUNT(x)`, `SUM(x)`, `TOTAL(x)`,
+`AVG(x)`; `WHERE`; deterministic GROUP BY expressions and constants;
+one ordinary base table.  **Tier 2 stage one (PLAN-IVM2): `MIN(col)`
+and `MAX(col)` over plain columns.**  Inserts maintain by comparison
+(with the column's collation, captured at CREATE and spelled
+explicitly in the generated SQL); deleting the stored extremum
+re-runs the definition for that ONE group — a lazy rescan that only
+evaluates when the departing value binary-matches the stored one, so
+interior deletes cost nothing (measured at zero base scans in
+`ivm2.test`).  With an index leading on the view's key columns the
+rescan is a seek, and if that index is missing, `PRAGMA view_check`
+says so: a `kind='advisory'` row carrying the runnable
+`CREATE INDEX` statement, silent once the index exists.  For deferred
+views, `view_refresh` repairs extremum columns per touched group.
+`min`/`max` over expressions refuse by name (stage two).
 
 ## Maintenance
 

@@ -393,12 +393,20 @@ static int mviewCheckDeterministic(MViewWalk *p, Expr *pExpr){
 }
 
 /*
-** Classify pExpr, known to be TK_AGG_FUNCTION, as one of the Tier-1
+** Classify pExpr, known to be TK_AGG_FUNCTION, as one of the
 ** maintainable aggregates and return its MVIEW_COL_* kind.  On anything
 ** outside the subset, refuse with the named reason and return 0 with
-** p->rc set.
+** p->rc set.  For MIN/MAX (Tier 2), the argument must be a plain base
+** column: that makes the aggregate's comparison collation the COLUMN's,
+** knowable here and captured (with the base column's name) for the
+** generated maintenance SQL and the index advisory.
 */
-static int mviewAggColKind(MViewWalk *p, Expr *pExpr){
+static int mviewAggColKind(
+  MViewWalk *p,
+  Expr *pExpr,
+  const char **pzColl,      /* OUT (MIN/MAX): argument's collation name */
+  const char **pzBaseCol    /* OUT (MIN/MAX): argument's base column name */
+){
   const char *zFunc;
   int nArg;
   int kind;
@@ -407,6 +415,8 @@ static int mviewAggColKind(MViewWalk *p, Expr *pExpr){
   zFunc = pExpr->u.zToken;
   nArg = (ExprUseXList(pExpr) && pExpr->x.pList)
             ? pExpr->x.pList->nExpr : 0;
+  *pzColl = 0;
+  *pzBaseCol = 0;
   if( ExprHasProperty(pExpr, EP_Distinct) ){
     mviewRefuse(p, "%s(DISTINCT) requires tracking a per-group multiset "
                    "(Tier 3, not yet supported)", zFunc);
@@ -417,9 +427,23 @@ static int mviewAggColKind(MViewWalk *p, Expr *pExpr){
     return 0;
   }
   if( sqlite3_stricmp(zFunc,"max")==0 || sqlite3_stricmp(zFunc,"min")==0 ){
-    mviewRefuse(p, "%s() requires rescanning a group on delete "
-                   "(Tier 2, not yet supported)", zFunc);
-    return 0;
+    Expr *pArg;
+    Column *pCol;
+    if( nArg!=1
+     || (pArg = pExpr->x.pList->a[0].pExpr)==0
+     || pArg->op!=TK_COLUMN
+     || pArg->y.pTab==0
+     || pArg->iColumn<0
+    ){
+      mviewRefuse(p, "%s() over an expression is not yet supported "
+                     "(Tier 2 accepts plain column arguments only)", zFunc);
+      return 0;
+    }
+    pCol = &pArg->y.pTab->aCol[pArg->iColumn];
+    *pzColl = sqlite3ColumnColl(pCol);
+    if( *pzColl==0 ) *pzColl = "BINARY";
+    *pzBaseCol = pCol->zCnName;
+    return sqlite3_stricmp(zFunc,"min")==0 ? MVIEW_COL_MIN : MVIEW_COL_MAX;
   }
   if( sqlite3_stricmp(zFunc,"count")==0 ){
     kind = nArg==0 ? MVIEW_COL_COUNT0 : MVIEW_COL_COUNT;
@@ -431,7 +455,7 @@ static int mviewAggColKind(MViewWalk *p, Expr *pExpr){
     kind = MVIEW_COL_AVG;
   }else{
     mviewRefuse(p, "%s() is not incrementally maintainable "
-                   "(v1 supports count, sum, total, avg)", zFunc);
+                   "(supported: count, sum, total, avg, min, max)", zFunc);
     return 0;
   }
   /* Arguments must be deterministic (COUNT(*) has none) */
@@ -454,7 +478,9 @@ static int mviewCheckSelect(
   Parse *pParse,
   const char *zName,       /* View name for messages */
   Select *pSelect,         /* The prepared definition */
-  u8 *aColKind             /* OUT: one MVIEW_COL_* per result column */
+  u8 *aColKind,            /* OUT: one MVIEW_COL_* per result column */
+  const char **azColl,     /* OUT: MIN/MAX arg collation names */
+  const char **azBaseCol   /* OUT: base column names (keys, MIN/MAX args) */
 ){
   MViewWalk sWalk;
   SrcItem *pItem;
@@ -528,12 +554,18 @@ static int mviewCheckSelect(
   for(i=0; i<pSelect->pEList->nExpr; i++){
     Expr *pE = pSelect->pEList->a[i].pExpr;
     if( pE->op==TK_AGG_FUNCTION ){
-      int kind = mviewAggColKind(&sWalk, pE);
+      int kind = mviewAggColKind(&sWalk, pE, &azColl[i], &azBaseCol[i]);
       if( sWalk.rc ) return sWalk.rc;
       aColKind[i] = (u8)kind;
       continue;
     }
     aColKind[i] = MVIEW_COL_KEY;
+    /* A key that is a plain base column gets its name captured: the
+    ** index advisory is written from these.  Expression keys leave the
+    ** slot empty, which the advisory reads as "no index can serve". */
+    if( pE->op==TK_COLUMN && pE->y.pTab!=0 && pE->iColumn>=0 ){
+      azBaseCol[i] = pE->y.pTab->aCol[pE->iColumn].zCnName;
+    }
     /* Aggregates nested inside larger expressions are a Tier-2+ shape:
     ** the raw aggregate would need hidden storage to re-derive the
     ** expression on maintenance.  EP_Agg is set by name resolution on
@@ -643,6 +675,8 @@ static void mviewRegister(
   int bDeferred,
   int nCol,                /* Number of VISIBLE result columns */
   const u8 *aColKind,      /* The conformance walk's column kinds */
+  const char **azColl,     /* MIN/MAX arg collations (entries may be 0) */
+  const char **azBaseCol,  /* Base column names (entries may be 0) */
   const char *zSelDef,     /* Definition SELECT text */
   int nSelDef              /* Length of zSelDef */
 ){
@@ -650,24 +684,51 @@ static void mviewRegister(
   sqlite3 *db = pParse->db;
   sqlite3_int64 nName = sqlite3Strlen30(p->zName)+1;
   sqlite3_int64 nBase = sqlite3Strlen30(pBase->zName)+1;
+  sqlite3_int64 nStr, nAlloc;
+  char *zOut;
+  int i;
   assert( db->init.busy );
   assert( sqlite3SchemaMutexHeld(db, 0, p->pSchema) );
-  /* One allocation: struct, strings, then the column-kind array.  The
-  ** hash keys off pInfo->zName rather than the Table's own name so the
+  /* One allocation: struct, the two pointer arrays (aligned, so they
+  ** come first), then the string pool and the kind array.  The hash
+  ** keys off pInfo->zName rather than the Table's own name so the
   ** entry never points into memory the table teardown frees. */
-  pInfo = sqlite3MallocZero(sizeof(MViewInfo)+nName+nBase+nSelDef+1+nCol);
+  nStr = nName + nBase + nSelDef + 1;
+  for(i=0; i<nCol; i++){
+    if( azColl[i] ) nStr += sqlite3Strlen30(azColl[i]) + 1;
+    if( azBaseCol[i] ) nStr += sqlite3Strlen30(azBaseCol[i]) + 1;
+  }
+  nAlloc = sizeof(MViewInfo) + 2*nCol*sizeof(char*) + nStr + nCol;
+  pInfo = sqlite3MallocZero(nAlloc);
   if( pInfo==0 ){
     sqlite3OomFault(db);
     return;
   }
-  pInfo->zName = (char*)&pInfo[1];
-  memcpy(pInfo->zName, p->zName, nName);
-  pInfo->zBase = pInfo->zName + nName;
-  memcpy(pInfo->zBase, pBase->zName, nBase);
-  pInfo->zSelDef = pInfo->zBase + nBase;
-  memcpy(pInfo->zSelDef, zSelDef, nSelDef);
-  pInfo->zSelDef[nSelDef] = 0;
-  pInfo->aColKind = (u8*)(pInfo->zSelDef + nSelDef + 1);
+  pInfo->azColl = (char**)&pInfo[1];
+  pInfo->azBaseCol = pInfo->azColl + nCol;
+  zOut = (char*)(pInfo->azBaseCol + nCol);
+  pInfo->zName = zOut;
+  memcpy(zOut, p->zName, nName);      zOut += nName;
+  pInfo->zBase = zOut;
+  memcpy(zOut, pBase->zName, nBase);  zOut += nBase;
+  pInfo->zSelDef = zOut;
+  memcpy(zOut, zSelDef, nSelDef);
+  zOut[nSelDef] = 0;                  zOut += nSelDef + 1;
+  for(i=0; i<nCol; i++){
+    if( azColl[i] ){
+      int n = sqlite3Strlen30(azColl[i]) + 1;
+      pInfo->azColl[i] = zOut;
+      memcpy(zOut, azColl[i], n);
+      zOut += n;
+    }
+    if( azBaseCol[i] ){
+      int n = sqlite3Strlen30(azBaseCol[i]) + 1;
+      pInfo->azBaseCol[i] = zOut;
+      memcpy(zOut, azBaseCol[i], n);
+      zOut += n;
+    }
+  }
+  pInfo->aColKind = (u8*)zOut;
   memcpy(pInfo->aColKind, aColKind, nCol);
   pInfo->nCol = nCol;
   pInfo->bDeferred = (u8)(bDeferred!=0);
@@ -802,6 +863,8 @@ void sqlite3CreateMView(
   Table *pBase = 0;  /* The single base table */
   Select *pSelDup = 0; /* Pre-resolution copy, for population */
   u8 *aColKind = 0;  /* Conformance walk's per-column kinds */
+  const char **azColl = 0;    /* MIN/MAX arg collations, walk-captured */
+  const char **azBaseCol = 0; /* Base column names, walk-captured */
   int nVis = 0;      /* Number of visible result columns */
 
   if( pMat->n!=12 || sqlite3_strnicmp(pMat->z, "materialized", 12)!=0 ){
@@ -905,8 +968,11 @@ void sqlite3CreateMView(
   /* Tier-1 conformance: everything outside the maintainable subset is
   ** refused by name, with the fix, before anything is written. */
   aColKind = sqlite3DbMallocRawNN(db, nVis);
-  if( aColKind==0 ) goto create_mview_fail;
-  if( mviewCheckSelect(pParse, p->zName, pSelect, aColKind) ){
+  azColl = (const char**)sqlite3DbMallocZero(db, nVis*sizeof(char*));
+  azBaseCol = (const char**)sqlite3DbMallocZero(db, nVis*sizeof(char*));
+  if( aColKind==0 || azColl==0 || azBaseCol==0 ) goto create_mview_fail;
+  if( mviewCheckSelect(pParse, p->zName, pSelect, aColKind,
+                       azColl, azBaseCol) ){
     goto create_mview_fail;
   }
   assert( pSelect->pSrc->nSrc==1 && pSelect->pSrc->a[0].pSTab!=0 );
@@ -998,6 +1064,12 @@ void sqlite3CreateMView(
       for(i=0; i<p->nCol; i++){
         sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
                             p->aCol[i].zCnName);
+        /* Extremum columns carry the captured collation so the fold's
+        ** min/max over logged values compares as the aggregate does */
+        if( i<nVis && (aColKind[i]==MVIEW_COL_MIN
+                    || aColKind[i]==MVIEW_COL_MAX) ){
+          sqlite3_str_appendf(pStr, " COLLATE %s", azColl[i]);
+        }
       }
       sqlite3_str_appendall(pStr, ",\"ivm$w\" INTEGER)");
       zSql = sqlite3_str_finish(pStr);
@@ -1025,11 +1097,13 @@ void sqlite3CreateMView(
     }
     /* EndTable consumed pNewTable into the schema; p remains valid. */
     mviewRegister(pParse, p, pBase, (p->tabFlags & TF_MViewDeferred)!=0,
-                  nVis, aColKind, zSelDef, nSelDef);
+                  nVis, aColKind, azColl, azBaseCol, zSelDef, nSelDef);
   }
 
 create_mview_fail:
   sqlite3DbFree(db, aColKind);
+  sqlite3DbFree(db, azColl);
+  sqlite3DbFree(db, azBaseCol);
   sqlite3SelectDelete(db, pSelDup);
   sqlite3SelectDelete(db, pSelect);
 }
@@ -1187,15 +1261,52 @@ static void mviewAppendDelta(
 }
 
 /*
+** Append the one-group rescan for column iCol: the definition re-run,
+** filtered to the row's own group -- WHERE-pushdown turns the filter
+** into a base seek when the advised index exists.  Newlines around the
+** definition text keep a trailing -- comment from swallowing the
+** wrapper.  Key-less views have exactly one group; the filter is 1.
+*/
+static void mviewAppendRescan(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  int iCol
+){
+  int i, n = 0;
+  sqlite3_str_appendf(pStr, "(SELECT r.\"%w\" FROM (\n%s\n) AS r WHERE ",
+                      pView->aCol[iCol].zCnName, pInfo->zSelDef);
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
+    sqlite3_str_appendf(pStr, "%sr.\"%w\" IS \"%w\".\"%w\"",
+       n++ ? " AND " : "", pView->aCol[i].zCnName,
+       pView->zName, pView->aCol[i].zCnName);
+  }
+  if( n==0 ) sqlite3_str_append(pStr, "1", 1);
+  sqlite3_str_append(pStr, ")", 1);
+}
+
+/*
 ** Append the SET list combining the view's current row with delta row
 ** d, adding (cSign='+') or subtracting (cSign='-').  Every view-side
 ** reference is qualified: d carries the same column names.
+**
+** MIN/MAX columns (Tier 2): the add side is a comparison carrying the
+** captured collation explicitly; the subtract side is the lazy rescan
+** -- evaluated ONLY when the departing value IS (binary) the stored
+** extremum, which is correct under any collation: in a consistent
+** state every group value >= the stored extremum under the aggregate's
+** collation, so a binary-distinct departure leaves the row that
+** produced the stored value in place.  With bFold (the deferred fold)
+** extremum columns are SKIPPED here entirely; view_refresh repairs
+** them per touched group afterwards.
 */
 static void mviewAppendCombine(
   sqlite3_str *pStr,
   const MViewInfo *pInfo,
   const Table *pView,
-  char cSign
+  char cSign,
+  int bFold
 ){
   const char *zV = pView->zName;
   int i, n = 0;
@@ -1203,6 +1314,29 @@ static void mviewAppendCombine(
     const char *zC = pView->aCol[i].zCnName;
     switch( pInfo->aColKind[i] ){
       case MVIEW_COL_KEY:
+        break;
+      case MVIEW_COL_MIN:
+      case MVIEW_COL_MAX:
+        if( bFold ) break;
+        if( cSign=='+' ){
+          sqlite3_str_appendf(pStr,
+             "%s\"%w\" = CASE WHEN d.\"%w\" IS NULL THEN \"%w\".\"%w\""
+             " WHEN \"%w\".\"%w\" IS NULL THEN d.\"%w\""
+             " WHEN d.\"%w\" %c \"%w\".\"%w\" COLLATE %s THEN d.\"%w\""
+             " ELSE \"%w\".\"%w\" END",
+             n++ ? ", " : "", zC, zC, zV, zC,
+             zV, zC, zC,
+             zC, pInfo->aColKind[i]==MVIEW_COL_MIN ? '<' : '>',
+             zV, zC, pInfo->azColl[i], zC,
+             zV, zC);
+        }else{
+          sqlite3_str_appendf(pStr,
+             "%s\"%w\" = CASE WHEN d.\"%w\" IS NOT NULL"
+             " AND d.\"%w\" IS \"%w\".\"%w\" THEN ",
+             n++ ? ", " : "", zC, zC, zC, zV, zC);
+          mviewAppendRescan(pStr, pInfo, pView, i);
+          sqlite3_str_appendf(pStr, " ELSE \"%w\".\"%w\" END", zV, zC);
+        }
         break;
       case MVIEW_COL_COUNT0:
       case MVIEW_COL_COUNT:
@@ -1296,7 +1430,7 @@ static void mviewAppendSteps(
   }
 
   sqlite3_str_appendf(pStr, "UPDATE \"%w\" SET ", pView->zName);
-  mviewAppendCombine(pStr, pInfo, pView, bAdd ? '+' : '-');
+  mviewAppendCombine(pStr, pInfo, pView, bAdd ? '+' : '-', 0);
   sqlite3_str_appendall(pStr, " FROM ");
   mviewAppendDelta(pStr, pInfo, pView, pBase, zRow);
   sqlite3_str_appendall(pStr, " AS d WHERE ");
@@ -1506,6 +1640,16 @@ static void mviewAppendFoldSource(
            " ELSE sum(\"ivm$w\"*coalesce(\"%w\",0)) END AS \"%w\"",
            i, zC, zC);
         break;
+      case MVIEW_COL_MIN:
+      case MVIEW_COL_MAX:
+        /* A placeholder from the inserted values (the log column
+        ** carries the captured collation, so min/max compare right);
+        ** the repair pass overwrites this for every touched group, so
+        ** it only ever seeds brand-new rows for one statement. */
+        sqlite3_str_appendf(pStr,
+           "%s(CASE WHEN \"ivm$w\">0 THEN \"%w\" END) AS \"%w\"",
+           pInfo->aColKind[i]==MVIEW_COL_MIN ? "min" : "max", zC, zC);
+        break;
       case MVIEW_COL_AVG:
         sqlite3_str_appendf(pStr,
            "CASE WHEN sum(\"ivm$w\"*\"ivm$n$%d\")=0 THEN NULL"
@@ -1584,7 +1728,7 @@ void sqlite3MViewCodeRefresh(
   pStr = sqlite3_str_new(db);
   sqlite3_str_appendf(pStr, "UPDATE \"%w\".\"%w\" SET ",
                       zDbName, pView->zName);
-  mviewAppendCombine(pStr, pInfo, pView, '+');
+  mviewAppendCombine(pStr, pInfo, pView, '+', 1);
   sqlite3_str_appendall(pStr, " FROM ");
   mviewAppendFoldSource(pStr, pInfo, pView, zDbName);
   sqlite3_str_appendall(pStr, " AS d WHERE ");
@@ -1623,6 +1767,51 @@ void sqlite3MViewCodeRefresh(
        "DELETE FROM \"%w\".\"%w\" WHERE \"ivm$count\"<=0",
        zDbName, pView->zName);
     if( pParse->nErr ) return;
+  }
+
+  /* Step 3b (Tier 2): a fold has no inverse for MIN/MAX, so extremum
+  ** columns are REPAIRED per touched group -- one definition re-run
+  ** each, filtered to the group, against the base as it now stands.
+  ** Runs before the log truncation because "touched" is read from it. */
+  {
+    int nExt = 0;
+    for(i=0; i<pInfo->nCol; i++){
+      if( pInfo->aColKind[i]==MVIEW_COL_MIN
+       || pInfo->aColKind[i]==MVIEW_COL_MAX ) nExt++;
+    }
+    if( nExt>0 ){
+      char *zSql;
+      int n = 0;
+      pStr = sqlite3_str_new(db);
+      sqlite3_str_appendf(pStr, "UPDATE \"%w\".\"%w\" SET ",
+                          zDbName, pView->zName);
+      for(i=0; i<pInfo->nCol; i++){
+        if( pInfo->aColKind[i]!=MVIEW_COL_MIN
+         && pInfo->aColKind[i]!=MVIEW_COL_MAX ) continue;
+        sqlite3_str_appendf(pStr, "%s\"%w\" = ", n++ ? ", " : "",
+                            pView->aCol[i].zCnName);
+        mviewAppendRescan(pStr, pInfo, pView, i);
+      }
+      sqlite3_str_appendf(pStr,
+         " WHERE EXISTS(SELECT 1 FROM \"%w\".\"sqlite_ivm_%w_log\" AS lg"
+         " WHERE ", zDbName, pView->zName);
+      {
+        int nk = 0;
+        for(i=0; i<pInfo->nCol; i++){
+          if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
+          sqlite3_str_appendf(pStr, "%slg.\"%w\" IS \"%w\".\"%w\"",
+             nk++ ? " AND " : "", pView->aCol[i].zCnName,
+             pView->zName, pView->aCol[i].zCnName);
+        }
+        if( nk==0 ) sqlite3_str_append(pStr, "1", 1);
+      }
+      sqlite3_str_append(pStr, ")", 1);
+      zSql = sqlite3_str_finish(pStr);
+      if( zSql==0 ){ sqlite3OomFault(db); return; }
+      sqlite3NestedParse(pParse, "%s", zSql);
+      sqlite3_free(zSql);
+      if( pParse->nErr ) return;
+    }
   }
 
   /* Step 4: the folded deltas are applied; the log empties with them */
@@ -1664,6 +1853,87 @@ static void mviewAppendRowRender(
     sqlite3_str_appendf(pStr, "quote(\"mv$%d\")", i);
   }
   if( n==0 ) sqlite3_str_appendall(pStr, "NULL");
+}
+
+/*
+** The index advisory (Tier 2 / PLAN-IVM2 P4).  A MIN/MAX view's
+** qualifying-delete rescan re-runs the definition for one group;
+** WHERE-pushdown turns that into a base seek exactly when an index
+** leads with the view's key columns (ideally followed by the extremum
+** arguments).  If the view has extremum columns and no such index
+** exists, return the runnable CREATE INDEX statement (caller frees);
+** return 0 when no advisory applies -- indexed already, no extremum
+** columns, or an expression key that no index can serve.
+*/
+static char *mviewAdvisory(
+  sqlite3 *db,
+  const MViewInfo *pInfo,
+  Table *pBase
+){
+  const char *azNeed[64];   /* key base cols, then extremum arg cols */
+  int nKey = 0, nNeed = 0;
+  int i, j;
+  Index *pIdx;
+  sqlite3_str *pStr;
+
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_KEY ){
+      if( pInfo->azBaseCol[i]==0 ) return 0;  /* expression key */
+      if( nNeed>=(int)ArraySize(azNeed) ) return 0;
+      azNeed[nNeed++] = pInfo->azBaseCol[i];
+      nKey++;
+    }
+  }
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_MIN
+     || pInfo->aColKind[i]==MVIEW_COL_MAX ){
+      int dup = 0;
+      assert( pInfo->azBaseCol[i]!=0 );
+      for(j=0; j<nNeed; j++){
+        if( sqlite3StrICmp(azNeed[j], pInfo->azBaseCol[i])==0 ) dup = 1;
+      }
+      if( !dup ){
+        if( nNeed>=(int)ArraySize(azNeed) ) return 0;
+        azNeed[nNeed++] = pInfo->azBaseCol[i];
+      }
+    }
+  }
+  if( nNeed==nKey ) return 0;   /* no extremum columns: nothing to advise */
+
+  /* Served already?  An index whose leading nKey columns cover the keys
+  ** as a set (key-less views: whose first column is the first argument
+  ** column) makes the rescan a seek. */
+  for(pIdx=pBase->pIndex; pIdx; pIdx=pIdx->pNext){
+    if( nKey==0 ){
+      if( pIdx->nKeyCol>=1 && pIdx->aiColumn[0]>=0
+       && sqlite3StrICmp(pBase->aCol[pIdx->aiColumn[0]].zCnName,
+                         azNeed[0])==0 ){
+        return 0;
+      }
+    }else if( pIdx->nKeyCol>=nKey ){
+      int nHit = 0;
+      for(i=0; i<nKey; i++){
+        for(j=0; j<nKey; j++){
+          if( pIdx->aiColumn[j]>=0
+           && sqlite3StrICmp(pBase->aCol[pIdx->aiColumn[j]].zCnName,
+                             azNeed[i])==0 ){
+            nHit++;
+            break;
+          }
+        }
+      }
+      if( nHit==nKey ) return 0;
+    }
+  }
+
+  pStr = sqlite3_str_new(db);
+  sqlite3_str_appendf(pStr, "CREATE INDEX \"ivmadv$%w\" ON \"%w\"(",
+                      pInfo->zName, pBase->zName);
+  for(i=0; i<nNeed; i++){
+    sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "", azNeed[i]);
+  }
+  sqlite3_str_append(pStr, ")", 1);
+  return sqlite3_str_finish(pStr);
 }
 
 /*
@@ -1788,10 +2058,25 @@ void sqlite3MViewCodeCheck(
   mviewAppendKeyList(pStr, pInfo);
   sqlite3_str_appendall(pStr, " FROM gone UNION SELECT ");
   mviewAppendKeyList(pStr, pInfo);
+  sqlite3_str_appendall(pStr, " FROM extra))||' differ' ");
+
+  /* Tier 2: the index advisory rides the same surface, last -- fires
+  ** while the qualifying-delete rescan would scan, silent once the
+  ** index exists (this compile-time detection expires with the schema
+  ** cookie, so a CREATE INDEX makes the very next check clean). */
+  {
+    Table *pBase = sqlite3FindTable(db, pInfo->zBase, zDbName);
+    char *zAdv = pBase ? mviewAdvisory(db, pInfo, pBase) : 0;
+    if( zAdv ){
+      sqlite3_str_appendf(pStr,
+         "UNION ALL SELECT %Q, 'advisory', NULL, %Q ", zView, zAdv);
+      sqlite3_free(zAdv);
+    }
+  }
+
   sqlite3_str_appendall(pStr,
-     " FROM extra))||' differ' "
      ") ORDER BY CASE kind WHEN 'stale' THEN 0 WHEN 'diff' THEN 1 "
-     "ELSE 2 END, subject");
+     "WHEN 'summary' THEN 2 ELSE 3 END, subject");
 
   zSql = sqlite3_str_finish(pStr);
   if( zSql==0 ){

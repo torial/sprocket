@@ -86,6 +86,50 @@ extremum columns, which is the point of having built it first.
   where implementation contradicts the algebra, the ESSAY gets the
   correction, kethiv/qere.
 
+## EXECUTED 2026-08-12 (same night as Q0; the spec drained 30 -> 0)
+
+All phases landed in one arc — the campaign's machinery was already
+built by IVM P1–P4, and Tier 2 turned out to be new CASES in existing
+generators plus one new surface:
+
+- The walk classifies MIN/MAX over plain columns, capturing the
+  argument's collation and base-column name into the registry (the
+  registry allocation grew two pointer arrays + a string pool).
+- Eager: the add side is a comparison CASE with the captured COLLATE
+  spelled explicitly; the subtract side is the binary-IS lazy rescan,
+  a scalar subquery inside a CASE arm so non-qualifying deletes never
+  evaluate it — MEASURED at zero FULLSCAN_STEPs by ivm2 3.1 (and the
+  IS key-match seeks the view's own index, also visible in that zero).
+  The rescan's definition re-run is UNSHADOWED by construction: the
+  CTE that shadows the base lives inside the delta subquery's scope,
+  and the SET expressions are outside it.
+- Deferred: the fold skips extremum columns; view_refresh gained a
+  repair pass — one definition re-run per TOUCHED group, before the
+  log truncation because "touched" is read from it.  The delta log's
+  extremum columns carry the captured COLLATE so the fold's seeding
+  min/max compares as the aggregate does.
+- The advisory (PLAN-IVM P5's instrument, now with something true to
+  say): compile-time detection in view_check — no base index leading
+  with the key columns — emitting kind='advisory' with the runnable
+  CREATE INDEX (keys then argument columns).  ivm2 5.2 executes the
+  carried statement VERBATIM and watches the advisory go silent; the
+  schema cookie expires the compiled check, so silence is immediate.
+- ivm1's 1.2 re-pinned at the moved boundary (expression arguments),
+  with its history in the comment — the design changed first, which
+  is the one sanctioned way a spec expectation moves.
+- A reopen section (7.x) was added after first green: synthesis and
+  collation capture happen at schema load, and only a fresh
+  connection proves they re-derive.
+
+The tiers essay's predictions held without exception: no hidden
+columns for extremums (the base is the unbounded state, the rescan
+reads it), and the information-theoretic bound showed up as code
+shape — the rescan subquery IS the Ω(n) memory, paid only on the
+deletes that touch the extremum.
+
+Gates: ivm2 0/38, ivm1 0/24, full sweep + ivm2 in the roster, both
+regimes.
+
 ## Deliberately NOT in this campaign
 
 Inner equi-joins (Tier 2 stage two); `min`/`max` over expressions;

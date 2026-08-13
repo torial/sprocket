@@ -250,4 +250,27 @@ do_execsql_test 6.1 {
   SELECT detail FROM pragma_view_check('extremes') WHERE kind='summary';
 } {{6 groups compared, 0 differ}}
 
+#--------------------------------------------------------------------
+# 7.x: reopen.  Trigger synthesis and the collation/base-column capture
+# happen at schema load; a fresh connection must rebuild all of it from
+# the stored definition -- including the NOCASE comparisons.
+#
+db close
+sqlite3 db test.db
+do_execsql_test 7.0 {
+  INSERT INTO prices(sku, amount) VALUES('a', 2);
+  SELECT lo, hi FROM extremes WHERE sku='a';
+} {2 30}
+do_execsql_test 7.1 {
+  DELETE FROM prices WHERE sku='a' AND amount=2;  -- the min: rescan
+  SELECT lo, hi FROM extremes WHERE sku='a';
+} {30 30}
+do_execsql_test 7.2 {
+  INSERT INTO tags VALUES(4,'x','ab');            -- NOCASE: 'ab' < 'B'
+  SELECT first_label FROM labs;
+} {ab}
+do_execsql_test 7.3 {
+  SELECT count(*) FROM pragma_view_check WHERE kind='diff';
+} {0}
+
 finish_test

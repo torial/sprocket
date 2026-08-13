@@ -178,6 +178,15 @@ even when undeclared, which is why AVG is nearly free.
 
 ### Tier 2 — maintainable with help
 
+**LANDED 2026-08-12 (stage one: MIN/MAX + the advisory; PLAN-IVM2).**
+Implementation decisions inside this ruling, recorded there: plain
+column arguments only (collation becomes statically knowable and every
+generated comparison spells it); the rescan trigger is binary-IS
+equality against the stored extremum (correct under any collation);
+deferred refresh repairs extremum columns per touched group.  The
+advisory is the accept-with-advisory lean below, verbatim.  Inner
+equi-joins remain stage two.
+
 **MIN/MAX.** Inserts are a comparison; *deleting the current extremum*
 forces a per-group rescan:
 

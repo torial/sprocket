@@ -5578,6 +5578,13 @@ struct MViewInfo {
                            ** maintenance triggers) */
   u8 *aColKind;            /* nCol entries: one MVIEW_COL_* per visible
                            ** result column */
+  char **azColl;           /* nCol entries: for MIN/MAX columns, the
+                           ** argument column's collation name (every
+                           ** generated comparison spells it); else 0 */
+  char **azBaseCol;        /* nCol entries: for KEY columns that are
+                           ** plain base columns and for MIN/MAX argument
+                           ** columns, the BASE column name (the index
+                           ** advisory is written from these); else 0 */
   Trigger *apTrig[3];      /* Synthesized maintenance triggers (INSERT,
                            ** DELETE, UPDATE); memory-only, owned here */
   int nCol;                /* Number of VISIBLE result columns */
@@ -5597,6 +5604,9 @@ struct MViewInfo {
                              ** the NULL-when-empty result */
 #define MVIEW_COL_TOTAL  4   /* TOTAL(x): self-maintaining */
 #define MVIEW_COL_AVG    5   /* AVG(x): hidden sum + non-null count */
+#define MVIEW_COL_MIN    6   /* MIN(col): comparison on insert, rescan
+                             ** on qualifying delete (Tier 2) */
+#define MVIEW_COL_MAX    7   /* MAX(col): same, other direction */
   void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Token*,
                           Select*,int,int);
   void sqlite3DropMView(Parse*, Token*, SrcList*, int);
