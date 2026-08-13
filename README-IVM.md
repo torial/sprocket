@@ -141,6 +141,14 @@ refresh is whoever runs the pragma.
 
 ## Sharp edges
 
+- **A database containing any materialized view is unreadable AT OPEN
+  by binaries that do not understand it** — stock SQLite and older
+  fork builds alike fail schema load with "malformed database schema",
+  and the lockout covers every table in the file.  Found by dogfood
+  the first morning (DOCKET #6, with three candidate postures awaiting
+  a ruling).  Until then: a db with mviews is
+  exactly-this-fork-version-or-nothing.
+
 - The `ivm$` column-name prefix and the `sqlite_ivm_` table namespace
   are reserved (refused in definitions; protected by the sqlite_ rule).
 - The delta log is user-readable and, like `sqlite_sequence`,

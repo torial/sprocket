@@ -1675,3 +1675,46 @@ changes what the fork *is*.
 
 `BEGIN CONCURRENT` needs a decision before transport Phase 5 regardless of
 where it sits in this list.
+
+## 6. Materialized views and the version-skew lockout -- *found by dogfood, 2026-08-13*
+
+**The finding, exact:** a database containing ANY materialized view is
+unreadable AT OPEN by any binary that does not understand the view's tier --
+including stock SQLite, where `CREATE MATERIALIZED VIEW` is a syntax error and
+schema load fails with "malformed database schema"; including the fork's OWN
+older binaries, where a Tier-2 join view fails the conformance walk the same
+way.  The lockout is whole-file: `SELECT count(*) FROM claim` on an untouched
+table refuses, because the schema never finishes loading.  Found minutes into
+the first Mosaic dogfood, when the CLI (one campaign stale) refused the
+database the testfixture had just written.  The failure MESSAGE held up
+honestly -- it named the view and the reason -- but the blast radius is every
+table in the file.
+
+**Why it matters more than a stale-binary slip:** version skew is the
+DEPLOYMENT NORM here, not an accident.  Zebra vendors its own engine copy;
+Graze ships whatever it pinned; a fork upgrade reaches binaries one at a time.
+Under the current design, creating one materialized view in a shared database
+flips that file to exactly-this-fork-version-or-nothing.
+
+**Three routes (decision wanted before mviews touch any shared db):**
+
+1. **Accept and declare.**  Fork-only file format, documented loudly
+   (README-IVM sharp edges).  Cheapest; honest; matches FTS5's posture except
+   that FTS5 degrades at QUERY time, not open.
+2. **Degrade at load.**  Tolerate an unparseable/unconformant mview row:
+   mark the object dead, load the rest of the schema, refuse queries that
+   touch the dead view by name (and its maintenance stays off; view_check
+   reports it).  Newer-fork files then open under older forks minus the new
+   tier.  Stock sqlite still refuses (it cannot parse the DDL at all).
+3. **Store as stock-readable.**  Schema row says `CREATE TABLE` (the visible
+   columns; stock reads the materialization as a plain, silently-stale
+   table), and the mview-ness -- definition text, maintenance mode -- lives
+   in an `sqlite_ivm_meta` table the fork consults at load.  Full
+   stock-readability of the DATA; the price is P1's elegant
+   single-schema-row design, .dump semantics rework, and a stale-table
+   hazard handed to stock readers with no staleness surface to consult.
+
+Lean, not a ruling: (2) is the engineering sweet spot (graceful within the
+fork's own lineage, where the skew actually bites today); (3) is the one to
+pick only if stock-readability of mview DATA is a real requirement for the
+Zebra/Graze seam -- worth asking the consumers before paying for it.
