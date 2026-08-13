@@ -316,6 +316,11 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_VIEW)
 
+  NAME: view_refresh
+  FLAG: NeedSchema NoColumns1 SchemaOpt
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+  IF:   !defined(SQLITE_OMIT_VIEW)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

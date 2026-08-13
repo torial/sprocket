@@ -212,6 +212,24 @@ CREATE INDEX); creation never automatic.
   pending/stale surfaces; view_check on a stale view says STALE before
   anything else. Gate: storm + refresh converges to empty view_check;
   reads never block on folding (proven, not asserted).
+  **EXECUTED 2026-08-12.  ivm1 is 0/24 — the spec written red at P0
+  is green whole.**  The deferred trigger body is the SAME delta
+  select as eager, appended to the log with ±1 instead of applied —
+  the Q1 ruling's one-capture-path made this a 15-line branch.  The
+  fold reuses the eager combine generator verbatim, with the grouped
+  log (every column weighted by ivm$w) standing where the one-row
+  delta stood; `HAVING count(*)>0` guards the key-less fold, because
+  a whole-log aggregate over an EMPTY log yields one all-NULL row and
+  NULL folded into a count is corruption, not zero.  pending/stale
+  flipped from P2's honest NULLs to MEASURED values (the log's row
+  count).  The log's DDL is excluded from .dump and VACUUM replay
+  (the view's own CREATE re-makes it; only nested parses may use the
+  sqlite_ namespace) while its CONTENT rides the ordinary table copy,
+  so pending deltas survive VACUUM — verified.  Matrix: 149-delta
+  storm folds to oracle-clean; stale-first row; a stale read's
+  program contains ZERO OpenWrite opcodes (the never-block proof);
+  pending survives close/reopen and VACUUM; no-arg refresh; group
+  death through the fold; DROP leaves no residue.
 - **P5 — the index advisory.** Creation-time detection via the R7
   instrument; the advisory carries the runnable `CREATE INDEX ...`
   statement. Gate: fires on the indexless fixture, silent once the

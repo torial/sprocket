@@ -5607,6 +5607,7 @@ struct MViewInfo {
   void sqlite3MViewCodeCheck(Parse*, Vdbe*, const char*, const char*);
   void sqlite3MViewCodeList(Parse*, Vdbe*, const char*);
   void sqlite3MViewSynthTriggers(Parse*, Table*);
+  void sqlite3MViewCodeRefresh(Parse*, const char*, const char*);
 #else
 # define sqlite3MViewFindDependent(A,B,C) 0
 # define sqlite3MViewHashClear(A,B)

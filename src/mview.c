@@ -52,6 +52,15 @@
 #ifndef SQLITE_OMIT_VIEW
 
 /*
+** Compose the delta-log table name for a DEFERRED materialized view.
+** Caller frees with sqlite3DbFree.  The sqlite_ prefix keeps users from
+** CREATE/DROP collisions the same way sqlite_sequence does.
+*/
+static char *mviewLogName(sqlite3 *db, const char *zView){
+  return sqlite3MPrintf(db, "sqlite_ivm_%s_log", zView);
+}
+
+/*
 ** Grammar helper for the optional WITH MAINTENANCE clause.  The words
 ** MAINTENANCE, EAGER and DEFERRED are checked identifiers, not keywords.
 ** Returns one of the MVIEW_MAINT_* constants; on an unrecognized word the
@@ -976,6 +985,30 @@ void sqlite3CreateMView(
       }
       sqlite3VdbeAddOp4(v, OP_SqlExec, 0x0001, 0, 0, zSql, P4_DYNAMIC);
     }
+
+    /* A DEFERRED view captures into a delta log: the view's columns
+    ** plus the weight.  Created here as part of the CREATE statement
+    ** (the nested parse is what may use the sqlite_ namespace); its
+    ** schema row follows the view's, so reload order is guaranteed. */
+    if( p->tabFlags & TF_MViewDeferred ){
+      sqlite3_str *pStr = sqlite3_str_new(db);
+      char *zSql;
+      sqlite3_str_appendf(pStr, "CREATE TABLE \"%w\".\"sqlite_ivm_%w_log\"(",
+                          db->aDb[iDb].zDbSName, p->zName);
+      for(i=0; i<p->nCol; i++){
+        sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                            p->aCol[i].zCnName);
+      }
+      sqlite3_str_appendall(pStr, ",\"ivm$w\" INTEGER)");
+      zSql = sqlite3_str_finish(pStr);
+      if( zSql==0 ){
+        sqlite3OomFault(db);
+        goto create_mview_fail;
+      }
+      sqlite3NestedParse(pParse, "%s", zSql);
+      sqlite3_free(zSql);
+      if( pParse->nErr ) goto create_mview_fail;
+    }
   }
 
   /* Register in the in-memory mview registry.  Only the init path runs
@@ -1070,6 +1103,17 @@ void sqlite3DropMView(Parse *pParse, Token *pMat, SrcList *pName, int noErr){
     sqlite3BeginWriteOperation(pParse, 1, iDb);
     sqlite3ClearStatTables(pParse, iDb, "tbl", pTab->zName);
     sqlite3CodeDropTable(pParse, pTab, iDb, 0);
+    /* A deferred view's delta log leaves with it */
+    if( pTab->tabFlags & TF_MViewDeferred ){
+      char *zLog = mviewLogName(db, pTab->zName);
+      Table *pLog = zLog ? sqlite3FindTable(db, zLog,
+                              db->aDb[iDb].zDbSName) : 0;
+      if( pLog ){
+        sqlite3ClearStatTables(pParse, iDb, "tbl", pLog->zName);
+        sqlite3CodeDropTable(pParse, pLog, iDb, 0);
+      }
+      sqlite3DbFree(db, zLog);
+    }
   }
 
 exit_drop_mview:
@@ -1235,6 +1279,22 @@ static void mviewAppendSteps(
   const char *zRow = bAdd ? "NEW" : "OLD";
   int i;
 
+  if( pInfo->bDeferred ){
+    /* Deferred: the same delta, APPENDED to the log with its weight
+    ** instead of applied.  PRAGMA view_refresh folds the log later. */
+    sqlite3_str_appendf(pStr, "INSERT INTO \"sqlite_ivm_%w_log\"(",
+                        pView->zName);
+    for(i=0; i<pView->nCol; i++){
+      sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                          pView->aCol[i].zCnName);
+    }
+    sqlite3_str_appendf(pStr, ",\"ivm$w\") SELECT dd.*, %d FROM ",
+                        bAdd ? 1 : -1);
+    mviewAppendDelta(pStr, pInfo, pView, pBase, zRow);
+    sqlite3_str_appendall(pStr, " AS dd; ");
+    return;
+  }
+
   sqlite3_str_appendf(pStr, "UPDATE \"%w\" SET ", pView->zName);
   mviewAppendCombine(pStr, pInfo, pView, bAdd ? '+' : '-');
   sqlite3_str_appendall(pStr, " FROM ");
@@ -1380,7 +1440,7 @@ void sqlite3MViewSynthTriggers(Parse *pParse, Table *pTab){
     MViewInfo *pInfo = (MViewInfo*)sqliteHashData(he);
     Table *pView;
     int k;
-    if( pInfo->bTrigBuilt || pInfo->bDeferred ) continue;
+    if( pInfo->bTrigBuilt ) continue;
     if( sqlite3_stricmp(pInfo->zBase, pTab->zName)!=0 ) continue;
     pView = sqlite3FindTable(db, pInfo->zName, db->aDb[iDb].zDbSName);
     if( NEVER(pView==0) ) continue;
@@ -1405,6 +1465,169 @@ void sqlite3MViewSynthTriggers(Parse *pParse, Table *pTab){
     }
     pInfo->bTrigBuilt = 1;
   }
+}
+
+/*
+** Append the fold source for a deferred view's refresh: the delta log
+** grouped by the view's keys, every column weighted by ivm$w, shaped
+** EXACTLY like the view's column layout so both the UPDATE-combine
+** (which reads the bookkeeping parts) and the INSERT-if-absent (which
+** takes the row whole) can use it as their d.
+**
+** HAVING count(*)>0 exists for the key-less case: a whole-log
+** aggregate over an EMPTY log would produce one all-NULL row, and
+** NULL folded into a count is not zero, it is corruption.
+*/
+static void mviewAppendFoldSource(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  const char *zDbName
+){
+  int i, nKey = 0;
+  sqlite3_str_appendall(pStr, "(SELECT ");
+  for(i=0; i<pInfo->nCol; i++){
+    const char *zC = pView->aCol[i].zCnName;
+    if( i ) sqlite3_str_append(pStr, ",", 1);
+    switch( pInfo->aColKind[i] ){
+      case MVIEW_COL_KEY:
+        sqlite3_str_appendf(pStr, "\"%w\"", zC);
+        nKey++;
+        break;
+      case MVIEW_COL_COUNT0:
+      case MVIEW_COL_COUNT:
+      case MVIEW_COL_TOTAL:
+        sqlite3_str_appendf(pStr,
+           "sum(\"ivm$w\"*\"%w\") AS \"%w\"", zC, zC);
+        break;
+      case MVIEW_COL_SUM:
+        sqlite3_str_appendf(pStr,
+           "CASE WHEN sum(\"ivm$w\"*\"ivm$n$%d\")=0 THEN NULL"
+           " ELSE sum(\"ivm$w\"*coalesce(\"%w\",0)) END AS \"%w\"",
+           i, zC, zC);
+        break;
+      case MVIEW_COL_AVG:
+        sqlite3_str_appendf(pStr,
+           "CASE WHEN sum(\"ivm$w\"*\"ivm$n$%d\")=0 THEN NULL"
+           " ELSE sum(\"ivm$w\"*coalesce(\"ivm$s$%d\",0))"
+           "/CAST(sum(\"ivm$w\"*\"ivm$n$%d\") AS REAL) END AS \"%w\"",
+           i, i, i, zC);
+        break;
+    }
+  }
+  /* The hidden columns, in the same order they were appended to the
+  ** view: per-column parts ascending, then ivm$count */
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
+      sqlite3_str_appendf(pStr,
+         ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i);
+    }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
+      sqlite3_str_appendf(pStr,
+         ",sum(\"ivm$w\"*coalesce(\"ivm$s$%d\",0)) AS \"ivm$s$%d\""
+         ",sum(\"ivm$w\"*\"ivm$n$%d\") AS \"ivm$n$%d\"", i, i, i, i);
+    }
+  }
+  sqlite3_str_appendall(pStr,
+     ",sum(\"ivm$w\"*\"ivm$count\") AS \"ivm$count\"");
+  sqlite3_str_appendf(pStr, " FROM \"%w\".\"sqlite_ivm_%w_log\"",
+                      zDbName, pView->zName);
+  if( nKey>0 ){
+    int n = 0;
+    sqlite3_str_appendall(pStr, " GROUP BY ");
+    for(i=0; i<pInfo->nCol; i++){
+      if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
+      sqlite3_str_appendf(pStr, "%s\"%w\"", n++ ? "," : "",
+                          pView->aCol[i].zCnName);
+    }
+  }
+  sqlite3_str_appendall(pStr, " HAVING count(*)>0)");
+}
+
+/*
+** Generate code for PRAGMA view_refresh on one DEFERRED materialized
+** view: fold the delta log into the stored rows, grouped -- the whole
+** point of deferral is that N deltas against one group cost one
+** application -- then clear the log.  All inside the pragma's own
+** statement, so the fold is atomic with its log truncation.  Eager
+** views have nothing pending by construction and refresh as a no-op.
+*/
+void sqlite3MViewCodeRefresh(
+  Parse *pParse,
+  const char *zDbName,
+  const char *zView
+){
+  sqlite3 *db = pParse->db;
+  MViewInfo *pInfo = 0;
+  Table *pView;
+  sqlite3_str *pStr;
+  char *zSql;
+  int i, ii, nKey = 0;
+
+  for(ii=0; ii<db->nDb && pInfo==0; ii++){
+    Schema *pSchema = db->aDb[ii].pSchema;
+    if( pSchema==0 ) continue;
+    if( sqlite3StrICmp(zDbName, db->aDb[ii].zDbSName)!=0 ) continue;
+    pInfo = (MViewInfo*)sqlite3HashFind(&pSchema->mviewHash, zView);
+  }
+  if( pInfo==0 ){
+    sqlite3ErrorMsg(pParse, "no such materialized view: %s", zView);
+    return;
+  }
+  if( !pInfo->bDeferred ) return;   /* eager: nothing is ever pending */
+  pView = sqlite3FindTable(db, zView, zDbName);
+  if( NEVER(pView==0) ) return;
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_KEY ) nKey++;
+  }
+
+  /* Step 1: combine the folded deltas into existing groups */
+  pStr = sqlite3_str_new(db);
+  sqlite3_str_appendf(pStr, "UPDATE \"%w\".\"%w\" SET ",
+                      zDbName, pView->zName);
+  mviewAppendCombine(pStr, pInfo, pView, '+');
+  sqlite3_str_appendall(pStr, " FROM ");
+  mviewAppendFoldSource(pStr, pInfo, pView, zDbName);
+  sqlite3_str_appendall(pStr, " AS d WHERE ");
+  mviewAppendKeyMatch(pStr, pInfo, pView, "d");
+  zSql = sqlite3_str_finish(pStr);
+  if( zSql==0 ){ sqlite3OomFault(db); return; }
+  sqlite3NestedParse(pParse, "%s", zSql);
+  sqlite3_free(zSql);
+  if( pParse->nErr ) return;
+
+  /* Step 2: groups the fold knows and the view does not */
+  if( nKey>0 ){
+    pStr = sqlite3_str_new(db);
+    sqlite3_str_appendf(pStr, "INSERT INTO \"%w\".\"%w\"(",
+                        zDbName, pView->zName);
+    for(i=0; i<pView->nCol; i++){
+      sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                          pView->aCol[i].zCnName);
+    }
+    sqlite3_str_appendall(pStr, ") SELECT dd.* FROM ");
+    mviewAppendFoldSource(pStr, pInfo, pView, zDbName);
+    sqlite3_str_appendall(pStr,
+       " AS dd WHERE NOT EXISTS(SELECT 1 FROM ");
+    sqlite3_str_appendf(pStr, "\"%w\".\"%w\" WHERE ",
+                        zDbName, pView->zName);
+    mviewAppendKeyMatch(pStr, pInfo, pView, "dd");
+    sqlite3_str_appendall(pStr, ")");
+    zSql = sqlite3_str_finish(pStr);
+    if( zSql==0 ){ sqlite3OomFault(db); return; }
+    sqlite3NestedParse(pParse, "%s", zSql);
+    sqlite3_free(zSql);
+    if( pParse->nErr ) return;
+
+    /* Step 3: groups whose liveness count reached zero */
+    sqlite3NestedParse(pParse,
+       "DELETE FROM \"%w\".\"%w\" WHERE \"ivm$count\"<=0",
+       zDbName, pView->zName);
+    if( pParse->nErr ) return;
+  }
+
+  /* Step 4: the folded deltas are applied; the log empties with them */
+  sqlite3NestedParse(pParse,
+     "DELETE FROM \"%w\".\"sqlite_ivm_%w_log\"", zDbName, pView->zName);
 }
 
 /*
@@ -1523,6 +1746,19 @@ void sqlite3MViewCodeCheck(
      "extra AS (SELECT * FROM stored EXCEPT SELECT * FROM fresh) "
      "SELECT \"view\", kind, subject, detail FROM (");
 
+  /* A deferred view with pending deltas is declared STALE before the
+  ** measurement is reported: the reader learns first that the diffs
+  ** below have a known, fixable cause.  The ORDER BY sorts it first. */
+  if( pInfo->bDeferred ){
+    sqlite3_str_appendf(pStr,
+       "SELECT %Q AS \"view\", 'stale' AS kind, NULL AS subject, "
+       "(SELECT count(*) FROM \"%w\".\"sqlite_ivm_%w_log\")"
+       "||' deltas pending; run PRAGMA view_refresh(''%q'')' AS detail "
+       "WHERE EXISTS(SELECT 1 FROM \"%w\".\"sqlite_ivm_%w_log\") "
+       "UNION ALL ",
+       zView, zDbName, zView, zView, zDbName, zView);
+  }
+
   /* Rows the recompute has and the stored table lacks (or disagrees) */
   sqlite3_str_appendf(pStr,
      "SELECT %Q AS \"view\", 'diff' AS kind, ", zView);
@@ -1603,10 +1839,15 @@ void sqlite3MViewCodeList(Parse *pParse, Vdbe *v, const char *zDb){
     }
     for(j=0; j<nMV; j++){
       if( apMV[j]->bDeferred ){
-        /* No capture mechanism exists for deferred views yet:
-        ** unmeasured is spelled NULL, never a reassuring zero */
-        sqlite3VdbeMultiLoad(v, 1, "ssss",
-           apMV[j]->zName, "deferred", (const char*)0, (const char*)0);
+        /* Deferred: pending IS the delta-log row count, and stale
+        ** follows from it -- measured, not assumed */
+        sqlite3NestedParse(pParse,
+           "SELECT %Q, 'deferred',"
+           "(SELECT count(*) FROM \"%w\".\"sqlite_ivm_%w_log\"),"
+           "(SELECT count(*) FROM \"%w\".\"sqlite_ivm_%w_log\")>0",
+           apMV[j]->zName,
+           db->aDb[ii].zDbSName, apMV[j]->zName,
+           db->aDb[ii].zDbSName, apMV[j]->zName);
       }else{
         /* Eager: maintained inside every writing statement, so zero
         ** pending and never stale -- true by construction */

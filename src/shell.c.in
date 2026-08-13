@@ -9462,6 +9462,10 @@ static int do_meta_command(const char *zLine, ShellState *p){
       "SELECT name, type, sql FROM sqlite_schema AS o "
       "WHERE (%s) AND type=='table'"
       "  AND sql NOT NULL"
+      /* A deferred materialized view's delta log is re-created by the
+      ** view's own CREATE, and a fresh population absorbs whatever was
+      ** pending, so the log is neither declared nor copied */
+      "  AND name NOT LIKE 'sqlite_ivm_%%'"
       " ORDER BY tbl_name='sqlite_sequence', rowid",
       zLike
     );

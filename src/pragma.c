@@ -1738,11 +1738,56 @@ void sqlite3Pragma(
   **   PRAGMA [schema.]view_list
   **
   ** One row per materialized view: (name, maintenance, pending, stale).
-  ** pending and stale are NULL until a capture mechanism exists to
-  ** measure them -- unmeasured is spelled NULL, never a zero.
+  ** Eager views report 0/0 (true by construction); deferred views
+  ** report the delta log's row count -- measured, never assumed.
   */
   case PragTyp_VIEW_LIST: {
     sqlite3MViewCodeList(pParse, v, zDb);
+  }
+  break;
+
+  /*
+  **   PRAGMA [schema.]view_refresh(view-name)
+  **   PRAGMA [schema.]view_refresh
+  **
+  ** Fold a DEFERRED materialized view's pending deltas into its stored
+  ** rows and clear the log, atomically with the fold.  Without a name,
+  ** every deferred view is refreshed.  Eager views are never pending
+  ** and refresh as a no-op.
+  */
+  case PragTyp_VIEW_REFRESH: {
+    int ii;
+    if( zRight ){
+      MViewInfo *pMV = 0;
+      const char *zDbName = 0;
+      for(ii=0; ii<db->nDb && pMV==0; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        pMV = (MViewInfo*)sqlite3HashFind(&pSchema->mviewHash, zRight);
+        if( pMV ) zDbName = db->aDb[ii].zDbSName;
+      }
+      if( pMV==0 ){
+        sqlite3ErrorMsg(pParse, "no such materialized view: %s", zRight);
+        break;
+      }
+      sqlite3MViewCodeRefresh(pParse, zDbName, zRight);
+    }else{
+      for(ii=0; ii<db->nDb; ii++){
+        Schema *pSchema = db->aDb[ii].pSchema;
+        HashElem *he;
+        if( pSchema==0 ) continue;
+        if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+        for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+            he=sqliteHashNext(he)){
+          MViewInfo *pMV = (MViewInfo*)sqliteHashData(he);
+          if( !pMV->bDeferred ) continue;
+          sqlite3MViewCodeRefresh(pParse, db->aDb[ii].zDbSName,
+                                  pMV->zName);
+          if( pParse->nErr ) break;
+        }
+      }
+    }
   }
   break;
 

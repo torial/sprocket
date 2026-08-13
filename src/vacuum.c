@@ -298,9 +298,14 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
   /* Materialized views (fork) rebuild like tables: their DDL replays
   ** here (populating zero rows, since base tables are still empty) and
   ** their real content arrives with the table-content copy below. */
+  /* A deferred view's delta log (sqlite_ivm_*) is re-created by the
+  ** view's own CREATE below -- and a bare replay of its DDL would be
+  ** refused anyway, since only nested parses may use the sqlite_
+  ** namespace.  Its CONTENT still copies with the ordinary tables. */
   rc = execSqlF(db, pzErrMsg,
       "SELECT sql FROM \"%w\".sqlite_schema"
       " WHERE type IN('table','mview')AND name<>'sqlite_sequence'"
+      " AND name NOT LIKE 'sqlite_ivm_%%'"
       " AND coalesce(rootpage,1)>0",
       zDbMain
   );
