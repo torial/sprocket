@@ -280,19 +280,53 @@ proc walk_all {sql} {
 }
 
 # POSITIVE CONTROL and expected magnitudes, stated before the star runs.
-# MEASURED distribution (2026-08-12), not the naive model: seg0 costs
-# tally=16 tally2=3, seg1 adds 4+3, seg2 adds 3.  The naive model says
-# seg0 should cost 8 (2 parents x one full child scan of 4): the root fold
-# at depth evaluates the wrapped child TWICE per parent row -- recorded in
-# DOCKET 3i as a suspected fold-codegen inefficiency, pinned here so a fix
-# SHOWS UP as this number dropping to {12 9}.  Either way the star's win
-# in 8.2 is measured against what the default actually costs.
+# HISTORY: this pinned {20 9} when written (2026-08-12 morning) -- the
+# root fold handed the grandchild correlation a raw dup of the child's
+# projected key expression, which landed inside the grandchild scan loop
+# (O(children x grandchildren) per parent), plus a twice-per-parent
+# evaluation of the child itself.  DOCKET 3i's restructure (same day,
+# evening) rebuilt level 1 through the same aliased wrap the inner
+# levels use; the pin then dropped PAST the predicted {12 9} to {8 9},
+# which is the naive model's own floor: 2 parents x one full child scan
+# of 4 rows, every projected expression evaluated exactly once per
+# scanned row.  tally2=9 is seg0's 3 (one grandchild pass per comment)
+# + seg1's 3 + seg2's own 3.  If this number ever RISES, fold codegen
+# has regressed toward one of the two buried defects.
 do_test 8.1 {
   set ::nscan 0
   set ::nscan2 0
   walk_all {CALL deep()}
   list $::nscan $::nscan2
-} {20 9}
+} {8 9}
+
+# 8.1b: the flattener guard, watched.  dtally DECLARES deterministic (so
+# the query flattener has no scruples about substituting it) while
+# actually counting calls -- the adversarial shape for the LIMIT -1
+# guard in procFoldInnerExpr.  Without the guard, flattening the wrapped
+# child substitutes the projected key into the grandchild correlation
+# site and the count rises above the floor; with it, every projected
+# expression evaluates exactly once per scanned child row.
+set ::ndscan 0
+proc dtally_cb {v} { incr ::ndscan ; return $v }
+db function dtally -deterministic dtally_cb
+do_execsql_test 8.1c {
+  CREATE PROCEDURE deep2()
+    RETURNS TABLE(id INTEGER, title TEXT,
+                  comments TABLE(post_id INTEGER, cid INTEGER,
+                                 replies TABLE(r_cid INTEGER, rid INTEGER)
+                                   KEY(r_cid = cid))
+                    KEY(post_id = id))
+  BEGIN
+    SELECT id, title FROM posts;
+    SELECT post_id, dtally(cid) FROM comments;
+    SELECT r_cid, rid FROM replies;
+  END;
+} {}
+do_test 8.1d {
+  set ::ndscan 0
+  walk_all {CALL deep2()}
+  set ::ndscan
+} {8}
 
 # THE HEADLINE AT DEPTH: star drops every fold, and each level is scanned
 # exactly once, by its own segment.

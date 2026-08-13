@@ -517,6 +517,57 @@ static Expr *procFoldInnerExpr(
     }
     pSub->pEList->a[i].fg.eEName = ENAME_NAME;
   }
+
+  /* DOCKET 3i: everything outside this wrap references the child's
+  ** projected expressions as _f columns, each evaluated ONCE per child
+  ** row -- that is the wrap's whole purpose.  The query flattener would
+  ** undo it, substituting the projected expressions back into every
+  ** reference site; when this level carries a further nested fold, the
+  ** correlation reference lands inside the grandchild's scan loop and
+  ** the cost returns to O(children x grandchildren) -- the defect this
+  ** restructure exists to fix -- and a non-deterministic projected key
+  ** would again correlate on a different value than its json displays.
+  ** So when both conditions hold (a deeper fold exists AND some
+  ** projected column is not a plain column reference), block the
+  ** flattener with the parser-shaped LIMIT -1, the procInterArm idiom.
+  ** Plain-column children stay flattenable: substitution of a bare
+  ** column costs nothing and keeps the child's indexes usable.
+  **
+  ** This guard is LOAD-BEARING, not hardening: measured 2026-08-12
+  ** with the guard alone disabled, the flattener flattened the wrap
+  ** (non-deterministic projected functions included) and proc3c 8.1
+  ** returned to its original defective magnitude exactly, 8 -> 20.
+  ** proc3c 8.1d watches the deterministic-declared case for the same
+  ** regression. */
+  {
+    int hasNested = 0, hasExprCol = 0;
+    for(i=0; i<pF->pNested->nParam; i++){
+      if( pF->pNested->a[i].pNested ) hasNested = 1;
+    }
+    for(i=0; i<nVal; i++){
+      Expr *pX = pSub->pEList->a[i].pExpr;
+      if( pX->op!=TK_ID && pX->op!=TK_COLUMN
+       && !(pX->op==TK_DOT && pX->pRight && pX->pRight->op==TK_ID)
+      ){
+        hasExprCol = 1;
+      }
+    }
+    if( hasNested && hasExprCol && pSub->pLimit==0 ){
+      Expr *pLim = sqlite3ExprAlloc(db, TK_INTEGER, 0, 0);
+      if( pLim ){
+        pLim->flags |= EP_IntValue;
+        pLim->u.iValue = 1;
+        pLim = sqlite3PExpr(pParse, TK_UMINUS, pLim, 0);
+      }
+      if( pLim ) pLim = sqlite3PExpr(pParse, TK_LIMIT, pLim, 0);
+      if( pLim==0 ){
+        sqlite3SelectDelete(db, pSub);
+        sqlite3ExprDelete(db, pParentKeyRef);
+        return 0;
+      }
+      pSub->pLimit = pLim;
+    }
+  }
   sqlite3_snprintf(sizeof(zAlias), zAlias, "sqlite_proc_l%d", iLevel);
 
   /* json_object members in declaration order, values and nested arrays
@@ -690,135 +741,52 @@ static int procWrapParent(Parse *pParse, Select **ppSel, ProcParamList *pCols,
 ** Build one nested table's flat-client column onto an already-wrapped parent
 ** SELECT -- PLAN-NESTED phase 5b, now applied at CALL-compile time.
 **
-**   (SELECT json_group_array(json_object('c1', jsonval(<c1 expr>), ...))
-**      FROM <the child's FROM>
-**     WHERE <the child's WHERE> AND <child key> = <alias>.<parent key>)
+** DOCKET 3i RESTRUCTURE (2026-08-12): level 1 builds through the SAME
+** aliased wrap the inner levels use (procFoldInnerExpr), correlated on
+** the parent alias:
 **
-** Values are copies of the child's PROJECTED EXPRESSIONS, not column
-** references: the declaration is the interface, so a body's SELECT need not
-** spell its columns the way the shape does.
+**   (SELECT json_group_array(json_object('c1', jsonval(l1._f0), ...))
+**      FROM ( <child's SELECT, columns renamed _f0.._fn> ) AS l1
+**     WHERE l1._f<key> = <parent alias>.<parent key>)
+**
+** The earlier construction inlined the child unwrapped and handed the
+** grandchild recursion a RAW DUP of the child's projected key
+** expression; that dup landed inside the grandchild's scan loop --
+** O(children x grandchildren) evaluations per parent row, and for a
+** non-deterministic key a WRONGNESS bug: the correlation evaluated a
+** different value than the json displayed.  Under the wrap, every
+** projected expression is evaluated once per child row and everything
+** outside references it as an _f column.  proc3c 8.1 pins the cost:
+** the restructure announced itself by {20 9} dropping to {12 9}.
 */
 static void procAddFoldColumn(Parse *pParse, Proc *pProc, Select *pWrap,
                               ProcFold *pF, IdList *pProj){
   sqlite3 *db = pParse->db;
-  ExprList *pArgs = 0, *pOld, *pPE;
-  Expr *pObj, *pAgg, *pSel, *pEq;
-  Select *pSub;
-  Token tk;
-  int i;
+  ExprList *pPE;
+  Expr *pSel, *pKeyRef;
+  Token tTab, tCol;
 
   if( pF->pChild==0 || pF->pChild->pSelect==0 ) return;
-  pSub = sqlite3SelectDup(db, pF->pChild->pSelect, 0);
-  if( pSub==0 ) return;
-  sqlite3ExprListDelete(db, pSub->pOrderBy);   /* the segment's, not ours */
-  pSub->pOrderBy = 0;
-  pOld = pSub->pEList;
-  /* Returning here without adding a column would leave the parent row NARROWER
-  ** than sqlite3VdbeSetProcShapes() declares, which is precisely the
-  ** metadata/register mismatch that produced a fabricated value the first time
-  ** this feature was measured.  Conformance guarantees the arity, so this is
-  ** unreachable; assert rather than degrade. */
-  /* PLAN-DEPTH: a nesting child's SELECT streams only its VALUE columns;
-  ** the declared list also carries its nested tables, which have no
-  ** correspondent here.  Compare against the value count. */
-  {
-    int nVal = 0;
-    for(i=0; i<pF->pNested->nParam; i++){
-      if( pF->pNested->a[i].pNested==0 ) nVal++;
-    }
-    assert( pOld!=0 && pOld->nExpr>=nVal && pF->iKeyCol<=pOld->nExpr );
-    if( pOld==0 || pOld->nExpr<nVal || pF->iKeyCol>pOld->nExpr ){
-      goto fold_col_err;
-    }
-  }
-  if( 0 ){
-fold_col_err:
-    pSub->pEList = 0;
-    sqlite3SelectDelete(db, pSub);
-    sqlite3ExprListDelete(db, pOld);
-    sqlite3ErrorMsg(pParse, "cannot build the nested column for %s", pF->zName);
-    return;
-  }
-
-  /* Value columns only, with the ordinal tracked separately: pOld's
-  ** positions are the SELECT's, which has no slots for nested members.
-  ** The inner level's array is phase 3 (PLAN-DEPTH test 3.x) -- building
-  ** it inline would correlate the grandchild against its own scope, the
-  ** id = id tautology the parent alias exists to prevent. */
-  {
-  int iVal = 0;
-  for(i=0; i<pF->pNested->nParam; i++){
-    Expr *pVal;
-    if( pF->pNested->a[i].pNested ){
-      /* PLAN-DEPTH phase 3: the member is itself a nested table -- its
-      ** array is built by the aliased recursion, correlated to THIS level's
-      ** key expression.  Safe to pass the raw copied expression: the inner
-      ** scope's only names are _f*, so it cannot be captured. */
-      ProcFold *pF2;
-      int v = 0, j;
-      for(pF2=pProc->pFolds; pF2; pF2=pF2->pNext){
-        if( pF2->pShapeCols==pF->pNested
-         && sqlite3StrICmp(pF2->zName, pF->pNested->a[i].zName)==0 ) break;
-      }
-      for(j=0; pF2 && j<pF->pNested->nParam; j++){
-        if( pF->pNested->a[j].pNested ) continue;
-        if( sqlite3StrICmp(pF->pNested->a[j].zName, pF2->zKeyParent)==0 ) break;
-        v++;
-      }
-      procTokenSet(&tk, pF->pNested->a[i].zName);
-      pArgs = sqlite3ExprListAppend(pParse, pArgs,
-                sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
-      if( pF2==0 || v>=pOld->nExpr ){
-        sqlite3ExprListDelete(db, pArgs);
-        goto fold_col_err;
-      }
-      pVal = procFoldInnerExpr(pParse, pProc, pF2, 2,
-                     sqlite3ExprDup(db, pOld->a[v].pExpr, 0));
-      if( pVal==0 ){
-        sqlite3ExprListDelete(db, pArgs);
-        goto fold_col_err;
-      }
-      pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
-      continue;
-    }
-    procTokenSet(&tk, pF->pNested->a[i].zName);
-    pArgs = sqlite3ExprListAppend(pParse, pArgs,
-              sqlite3ExprAlloc(db, TK_STRING, &tk, 0));
-    pVal = sqlite3ExprDup(db, pOld->a[iVal++].pExpr, 0);
-    procTokenSet(&tk, "sqlite_proc_jsonval");
-    pVal = sqlite3ExprFunction(pParse,
-             sqlite3ExprListAppend(pParse, 0, pVal), &tk, 0);
-    pArgs = sqlite3ExprListAppend(pParse, pArgs, pVal);
-  }
-  }
-  procTokenSet(&tk, "json_object");
-  pObj = sqlite3ExprFunction(pParse, pArgs, &tk, 0);
-  procTokenSet(&tk, "json_group_array");
-  pAgg = sqlite3ExprFunction(pParse,
-           sqlite3ExprListAppend(pParse, 0, pObj), &tk, 0);
-
-  {
-    Token tTab, tCol;
-    procTokenSet(&tTab, PROC_PARENT_ALIAS);
-    procTokenSet(&tCol, pF->zKeyParent);
-    pEq = sqlite3PExpr(pParse, TK_EQ,
-            sqlite3ExprDup(db, pOld->a[pF->iKeyCol-1].pExpr, 0),
-            sqlite3PExpr(pParse, TK_DOT,
+  procTokenSet(&tTab, PROC_PARENT_ALIAS);
+  procTokenSet(&tCol, pF->zKeyParent);
+  pKeyRef = sqlite3PExpr(pParse, TK_DOT,
               sqlite3ExprAlloc(db, TK_ID, &tTab, 0),
-              sqlite3ExprAlloc(db, TK_ID, &tCol, 0)));
-  }
-  pSub->pWhere = pSub->pWhere
-                   ? sqlite3PExpr(pParse, TK_AND, pSub->pWhere, pEq)
-                   : pEq;
-  sqlite3ExprListDelete(db, pOld);
-  pSub->pEList = sqlite3ExprListAppend(pParse, 0, pAgg);
-
-  pSel = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+              sqlite3ExprAlloc(db, TK_ID, &tCol, 0));
+  if( pKeyRef==0 ) return;
+  pSel = procFoldInnerExpr(pParse, pProc, pF, 1, pKeyRef);
   if( pSel==0 ){
-    sqlite3SelectDelete(db, pSub);
+    /* Conformance guarantees the arity the builder checks, so failure
+    ** here is OOM or a real internal inconsistency; returning without
+    ** the column would leave the parent row NARROWER than
+    ** sqlite3VdbeSetProcShapes() declares -- the metadata/register
+    ** mismatch that produced a fabricated value the first time this
+    ** feature was measured.  Refuse loudly instead. */
+    if( pParse->nErr==0 && !db->mallocFailed ){
+      sqlite3ErrorMsg(pParse, "cannot build the nested column for %s",
+                      pF->zName);
+    }
     return;
   }
-  sqlite3PExprAddSelect(pParse, pSel, pSub);
 
   pPE = sqlite3ExprListAppend(pParse, pWrap->pEList, pSel);
   /* Assigned unconditionally: on failure ExprListAppend deletes BOTH the

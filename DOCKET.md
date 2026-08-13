@@ -872,6 +872,29 @@ index, so blocking flattening there costs nothing.  The same guard
 belongs in `procFoldInnerExpr`'s own wrap for level N→N+1.  proc3c 8.1
 announces the fix: `{20 9}` drops to `{12 9}`.
 
+### ✅ RESTRUCTURE LANDED 2026-08-12 (evening) — and the pin dropped PAST the prediction
+
+Implemented as designed, with one economy the design missed:
+`procAddFoldColumn` now simply CALLS `procFoldInnerExpr` at level 1
+with the parent-alias key reference — the root's broken construction
+and the inner levels' correct one differed only in that the root
+inlined what the inner levels wrapped, so the fix deleted ~90 lines
+rather than adding a parallel path.  One guard site covers every
+level.  proc3c 8.1 announced at `{8 9}`, not the predicted `{12 9}`:
+the restructure also removed the twice-per-parent child evaluation the
+morning note had recorded as a separate suspected inefficiency — 8 is
+the naive model's own floor (2 parents × one full child scan, every
+projected expression evaluated once per scanned row).
+
+**The A/B that mattered:** with ONLY the LIMIT-1 guard disabled, the
+pin snapped back to `{20 9}` exactly — the flattener flattens the wrap
+(non-deterministic projected functions included) and reconstructs the
+original defect byte-for-byte.  The guard is load-bearing, not
+hardening; without it the restructure is a no-op that LOOKS landed.
+proc3c 8.1d now watches the adversarial case (a function DECLARED
+deterministic that counts its calls) so the regression announces
+itself in both flag regimes.
+
 ---
 
 ## 3d. `mayAbort` assertion in stored procedures — *a real bug, inherited*
