@@ -1,0 +1,253 @@
+# 2026-08-12
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-IVM2 -- Tier 2 stage one: MIN/MAX in materialized views, and the
+# index advisory.  THIS FILE IS WRITTEN RED, ON PURPOSE, BEFORE THE
+# FEATURE EXISTS.  It is the specification: the file going green is the
+# campaign's definition of done.
+#
+# Do not adjust an expectation here to make the suite pass.  If an
+# expectation is wrong, PLAN-IVM2.md changes first, with the reason.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix ivm2
+
+#--------------------------------------------------------------------
+# 1.x: acceptance, refusal, population (P1)
+#
+do_execsql_test 1.0 {
+  CREATE TABLE prices(id INTEGER PRIMARY KEY, sku TEXT NOT NULL,
+                      amount INTEGER);
+  INSERT INTO prices VALUES(1,'a',30),(2,'a',10),(3,'a',20),(4,'b',5);
+  CREATE MATERIALIZED VIEW extremes AS
+    SELECT sku, min(amount) AS lo, max(amount) AS hi, count(*) AS n
+      FROM prices GROUP BY sku;
+  SELECT type, name FROM sqlite_schema WHERE name='extremes';
+} {mview extremes}
+
+do_execsql_test 1.1 {
+  SELECT sku, lo, hi, n FROM extremes ORDER BY sku;
+} {a 10 30 3 b 5 5 1}
+
+# Expression arguments stay refused, by name, with the fix.
+do_catchsql_test 1.2 {
+  CREATE MATERIALIZED VIEW bad1 AS
+    SELECT sku, min(amount*2) FROM prices GROUP BY sku;
+} {1 {bad1 cannot be incrementally maintained: min() over an expression is not yet supported (Tier 2 accepts plain column arguments only)}}
+
+#--------------------------------------------------------------------
+# 2.x: eager maintenance (P2).  Fixture state is tracked in comments;
+# every leg ends with the value the from-scratch recompute would give,
+# and 2.12 makes the oracle say so.
+#
+# state: a={30,10,20} b={5}
+do_execsql_test 2.0 {
+  INSERT INTO prices VALUES(5,'a',7);           -- new minimum
+  SELECT lo, hi, n FROM extremes WHERE sku='a';
+} {7 30 4}
+
+do_execsql_test 2.1 {
+  INSERT INTO prices VALUES(6,'a',15);          -- interior value
+  SELECT lo, hi, n FROM extremes WHERE sku='a';
+} {7 30 5}
+
+do_execsql_test 2.2 {
+  DELETE FROM prices WHERE id=6;                -- interior: no rescan path
+  SELECT lo, hi, n FROM extremes WHERE sku='a';
+} {7 30 4}
+
+do_execsql_test 2.3 {
+  DELETE FROM prices WHERE id=5;                -- the minimum: rescan
+  SELECT lo, hi, n FROM extremes WHERE sku='a';
+} {10 30 3}
+
+# Duplicate extremums: deleting one of two equal minimums keeps the value.
+do_execsql_test 2.4 {
+  INSERT INTO prices VALUES(7,'a',10);          -- a={30,10,20,10}
+  DELETE FROM prices WHERE id=2;                -- one of the two 10s
+  SELECT lo, n FROM extremes WHERE sku='a';
+} {10 3}
+
+do_execsql_test 2.5 {
+  DELETE FROM prices WHERE id=7;                -- the last 10
+  SELECT lo, n FROM extremes WHERE sku='a';
+} {20 2}
+
+# UPDATE moving the extremum is a two-sided delta: old side rescans,
+# new side compares.
+do_execsql_test 2.6 {
+  UPDATE prices SET amount=35 WHERE id=3;       -- 20 (the min) -> 35 (the max)
+  SELECT lo, hi FROM extremes WHERE sku='a';
+} {30 35}
+
+do_execsql_test 2.7 {
+  DELETE FROM prices WHERE id=3;                -- the maximum: rescan
+  SELECT lo, hi, n FROM extremes WHERE sku='a';
+} {30 30 1}
+
+do_execsql_test 2.8 {
+  DELETE FROM prices WHERE sku='b';             -- group death
+  SELECT count(*) FROM extremes WHERE sku='b';
+} {0}
+
+# NULL semantics: min/max ignore NULLs; an all-NULL group reads NULL.
+do_execsql_test 2.9 {
+  INSERT INTO prices VALUES(8,'c',NULL);
+  SELECT lo, hi, n FROM extremes WHERE sku='c';
+} {{} {} 1}
+do_execsql_test 2.9b {
+  INSERT INTO prices VALUES(9,'c',4);
+  SELECT lo, hi, n FROM extremes WHERE sku='c';
+} {4 4 2}
+do_execsql_test 2.9c {
+  DELETE FROM prices WHERE id=9;                -- back to all-NULL
+  SELECT lo, hi, n FROM extremes WHERE sku='c';
+} {{} {} 1}
+
+# Collation: the aggregate compares with the COLUMN's collation, and so
+# must the maintenance.  Under NOCASE, 'a' < 'B'; a tie ('A' vs stored
+# 'a') keeps the stored value; deleting the binary-distinct tie member
+# must NOT disturb it; deleting the stored value itself rescans.
+do_execsql_test 2.10 {
+  CREATE TABLE tags(id INTEGER PRIMARY KEY, sku TEXT NOT NULL,
+                    label TEXT COLLATE NOCASE);
+  CREATE MATERIALIZED VIEW labs AS
+    SELECT sku, min(label) AS first_label FROM tags GROUP BY sku;
+  INSERT INTO tags VALUES(1,'x','B');
+  INSERT INTO tags VALUES(2,'x','a');
+  INSERT INTO tags VALUES(3,'x','A');
+  SELECT first_label FROM labs;
+} {a}
+do_execsql_test 2.10b {
+  DELETE FROM tags WHERE id=3;                  -- 'A': tie, binary-distinct
+  SELECT first_label FROM labs;
+} {a}
+do_execsql_test 2.10c {
+  DELETE FROM tags WHERE id=2;                  -- 'a': the stored value
+  SELECT first_label FROM labs;
+} {B}
+
+# The oracle agrees with everything this section did.
+do_execsql_test 2.12 {
+  SELECT count(*) FROM pragma_view_check WHERE kind='diff';
+} {0}
+
+#--------------------------------------------------------------------
+# 3.x: the economics, MEASURED (P2 gate).  A non-qualifying delete must
+# not touch the base table at all beyond its own row: its trigger reads
+# a one-row VALUES delta and seeks the view.  A qualifying delete
+# re-runs the definition for ONE group; with no index on prices(sku)
+# that is a full scan, which is exactly what FULLSCAN_STEP counts and
+# exactly what the 5.x advisory exists to remove.
+#
+proc delsteps {sql} {
+  set S [sqlite3_prepare_v2 db $sql -1 TAIL]
+  sqlite3_step $S
+  set n [sqlite3_stmt_status $S SQLITE_STMTSTATUS_FULLSCAN_STEP 0]
+  sqlite3_finalize $S
+  return $n
+}
+do_execsql_test 3.0 {
+  INSERT INTO prices VALUES(10,'d',100),(11,'d',200),(12,'d',300);
+  SELECT lo, hi, n FROM extremes WHERE sku='d';
+} {100 300 3}
+do_test 3.1 {
+  delsteps {DELETE FROM prices WHERE id=11}     ;# interior: NO rescan
+} {0}
+do_test 3.2 {
+  expr {[delsteps {DELETE FROM prices WHERE id=10}] > 0}  ;# min: rescan
+} {1}
+do_execsql_test 3.3 {
+  SELECT lo, hi, n FROM extremes WHERE sku='d';
+} {300 300 1}
+
+#--------------------------------------------------------------------
+# 4.x: deferred + extremum = touched-group recompute at refresh (P3)
+#
+do_execsql_test 4.0 {
+  CREATE TABLE hits2(id INTEGER PRIMARY KEY, page TEXT NOT NULL,
+                     ms INTEGER);
+  CREATE MATERIALIZED VIEW slow WITH MAINTENANCE DEFERRED AS
+    SELECT page, max(ms) AS worst, count(*) AS n
+      FROM hits2 GROUP BY page;
+  INSERT INTO hits2 VALUES(1,'p',10),(2,'p',90),(3,'q',50);
+  SELECT (SELECT count(*) FROM slow),
+         (SELECT pending FROM pragma_view_list WHERE name='slow');
+} {0 3}
+do_execsql_test 4.1 {
+  PRAGMA view_refresh(slow);
+  SELECT page, worst, n FROM slow ORDER BY page;
+} {p 90 2 q 50 1}
+do_execsql_test 4.2 {
+  DELETE FROM hits2 WHERE id=2;                 -- p's maximum, logged
+  PRAGMA view_refresh(slow);
+  SELECT page, worst, n FROM slow ORDER BY page;
+} {p 10 1 q 50 1}
+do_execsql_test 4.3 {
+  DELETE FROM hits2 WHERE page='q';             -- group death via refresh
+  INSERT INTO hits2 VALUES(4,'r',7);            -- group birth via refresh
+  PRAGMA view_refresh(slow);
+  SELECT page, worst, n FROM slow ORDER BY page;
+} {p 10 1 r 7 1}
+do_execsql_test 4.4 {
+  SELECT count(*) FROM pragma_view_check('slow') WHERE kind='diff';
+} {0}
+
+#--------------------------------------------------------------------
+# 5.x: the index advisory (P4).  Fires while the rescan would scan,
+# carries the RUNNABLE statement, silent once the index exists, and is
+# never an error.
+#
+do_execsql_test 5.0 {
+  SELECT count(*) FROM pragma_view_check('extremes')
+   WHERE kind='advisory';
+} {1}
+do_execsql_test 5.1 {
+  SELECT detail LIKE 'CREATE INDEX%prices%sku%' FROM
+    pragma_view_check('extremes') WHERE kind='advisory';
+} {1}
+# The statement is runnable exactly as carried.
+do_test 5.2 {
+  set stmt [db one {SELECT detail FROM pragma_view_check('extremes')
+                     WHERE kind='advisory'}]
+  db eval $stmt
+  db eval {SELECT count(*) FROM pragma_view_check('extremes')
+            WHERE kind='advisory'}
+} {0}
+# The advisory reports; it never blocks: extremes was CREATED indexless
+# back in 1.0 and every maintenance leg above ran without error.
+
+#--------------------------------------------------------------------
+# 6.x: the storm (campaign acceptance).  Deterministic op soup with
+# extremum churn; the oracle must come back empty with full coverage.
+#
+do_test 6.0 {
+  set ops 0
+  foreach {sku amt} {
+    s1 5  s2 9  s1 3  s3 7  s2 9  s1 8  s3 1  s2 2  s1 3  s3 7
+    s1 6  s2 4  s3 2  s1 9  s2 5  s3 8  s1 1  s2 7  s3 4  s2 6
+  } {
+    db eval {INSERT INTO prices(sku, amount) VALUES($sku, $amt)}
+    incr ops
+  }
+  db eval {DELETE FROM prices WHERE amount IN (1, 9)}
+  db eval {UPDATE prices SET amount = amount + 10 WHERE sku = 's2'}
+  db eval {DELETE FROM prices WHERE amount = 3 AND sku = 's1'}
+  list $ops [db eval {
+    SELECT count(*) FROM pragma_view_check WHERE kind='diff'}]
+} {20 0}
+# Coverage: groups a, c, d (2.x/3.x survivors) + storm's s1, s2, s3.
+do_execsql_test 6.1 {
+  SELECT detail FROM pragma_view_check('extremes') WHERE kind='summary';
+} {{6 groups compared, 0 differ}}
+
+finish_test
