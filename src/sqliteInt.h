@@ -2518,6 +2518,9 @@ struct Table {
 #define TF_MView          0x00040000 /* A materialized view (fork): a real
                                      ** table, engine-written only */
 #define TF_MViewDeferred  0x00080000 /* MView with MAINTENANCE DEFERRED */
+#define TF_MViewBase      0x00100000 /* Some materialized view is defined
+                                     ** over this table (fork): TriggerList
+                                     ** consults the registry */
 
 /*
 ** Allowed values for Table.eTabType
@@ -3952,6 +3955,12 @@ struct Parse {
   bft checkSchema :1;  /* Causes schema cookie check after an error */
   bft bMViewCreate:1;  /* Inside CREATE MATERIALIZED VIEW: steers the
                        ** object-name check's type to 'mview' (fork) */
+  bft bMViewTrigSynth:1; /* Sub-parse synthesizing a maintenance trigger:
+                       ** FinishTrigger builds the object but persists
+                       ** nothing and registers nothing (fork) */
+  bft bMViewMaintProg:1; /* Compiling the body of a synthesized
+                       ** maintenance trigger: its writes to the view
+                       ** are the maintenance itself (fork) */
   int nRangeReg;       /* Size of the temporary register block */
   int iRangeReg;       /* First register in temporary register block */
   int nErr;            /* Number of errors seen */
@@ -4151,6 +4160,8 @@ struct Trigger {
   u8 op;                  /* One of TK_DELETE, TK_UPDATE, TK_INSERT         */
   u8 tr_tm;               /* One of TRIGGER_BEFORE, TRIGGER_AFTER */
   u8 bReturning;          /* This trigger implements a RETURNING clause */
+  u8 bMViewMaint;         /* Synthesized materialized-view maintenance
+                          ** (fork): its program may write the view */
   Expr *pWhen;            /* The WHEN clause of the expression (may be NULL) */
   IdList *pColumns;       /* If this is an UPDATE OF <column-list> trigger,
                              the <column-list> is stored here */
@@ -5563,29 +5574,44 @@ struct MViewInfo {
                            ** never dangles into a freed Table */
   char *zBase;             /* Name of the single base table */
   char *zSelDef;           /* Text of the definition SELECT (for the
-                           ** view_check recompute) */
-  u8 *aIsKey;              /* nCol flags: 1 = group key / constant column,
-                           ** 0 = maintained aggregate column */
-  int nCol;                /* Number of result columns */
+                           ** view_check recompute and the synthesized
+                           ** maintenance triggers) */
+  u8 *aColKind;            /* nCol entries: one MVIEW_COL_* per visible
+                           ** result column */
+  Trigger *apTrig[3];      /* Synthesized maintenance triggers (INSERT,
+                           ** DELETE, UPDATE); memory-only, owned here */
+  int nCol;                /* Number of VISIBLE result columns */
   u8 bDeferred;            /* True for WITH MAINTENANCE DEFERRED */
+  u8 bTrigBuilt;           /* Maintenance triggers synthesized+attached */
 };
 /* Values returned by sqlite3MViewMaintOption / mvmaint in the grammar */
 #define MVIEW_MAINT_UNSPEC   0    /* No WITH MAINTENANCE clause: eager */
 #define MVIEW_MAINT_EAGER    1
 #define MVIEW_MAINT_DEFERRED 2
+/* What each visible column of a materialized view is, decided by the
+** conformance walk and recorded in MViewInfo.aColKind */
+#define MVIEW_COL_KEY    0   /* GROUP BY expression or constant */
+#define MVIEW_COL_COUNT0 1   /* COUNT(*) */
+#define MVIEW_COL_COUNT  2   /* COUNT(x) */
+#define MVIEW_COL_SUM    3   /* SUM(x): hidden non-null count restores
+                             ** the NULL-when-empty result */
+#define MVIEW_COL_TOTAL  4   /* TOTAL(x): self-maintaining */
+#define MVIEW_COL_AVG    5   /* AVG(x): hidden sum + non-null count */
   void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Token*,
                           Select*,int,int);
   void sqlite3DropMView(Parse*, Token*, SrcList*, int);
   int sqlite3MViewMaintOption(Parse*, Token*, Token*);
   const char *sqlite3MViewFindDependent(sqlite3*, int, const char*);
-  void sqlite3MViewHashClear(Hash*);
+  void sqlite3MViewHashClear(sqlite3*, Hash*);
   void sqlite3UnlinkAndDeleteMView(sqlite3*, int, const char*);
   void sqlite3MViewCodeCheck(Parse*, Vdbe*, const char*, const char*);
   void sqlite3MViewCodeList(Parse*, Vdbe*, const char*);
+  void sqlite3MViewSynthTriggers(Parse*, Table*);
 #else
 # define sqlite3MViewFindDependent(A,B,C) 0
-# define sqlite3MViewHashClear(A)
+# define sqlite3MViewHashClear(A,B)
 # define sqlite3UnlinkAndDeleteMView(A,B,C)
+# define sqlite3MViewSynthTriggers(A,B)
 #endif
 
 void sqlite3SubProgramUnref(sqlite3*, SubProgram*);

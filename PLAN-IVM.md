@@ -112,6 +112,101 @@ CREATE INDEX); creation never automatic.
   acceptance test); proc interplay pinned — a body write maintains the
   view, the cache exclusion appears in `proc_check` (the documented
   tradeoff, tested not just written), own-transaction reads exact.
+
+  **P3 EXECUTION NOTES (design worked 2026-08-12; Sean ruled hidden
+  columns — "akin to our materialized views being a real table").**
+  - *Storage:* visible result columns + hidden (`COLFLAG_HIDDEN` +
+    `TF_HasHidden`; `IsHiddenColumn` already honors the flag in this
+    build — star expansion, NATURAL/USING, table_info all skip, and
+    ONLY mview creation ever sets it on an ordinary table; the
+    `__hidden__` name magic stays off).  Layout, in order after the
+    visible columns: `ivm$count` (COUNT(*) liveness, always); per SUM
+    column i an `ivm$n$i` (count of non-null arg, to restore NULL);
+    per AVG column j an `ivm$s$j` + `ivm$n$j` (visible avg = s/n,
+    NULL at n=0, CAST REAL division).  COUNT/TOTAL need nothing.
+  - *Key index:* auto UNIQUE index on the visible key columns, named
+    `sqlite_autoindex_<view>_N` via `sqlite3CreateIndex(pTblName=0)`
+    — the table-constraint precedent, so NULL-sql schema row, orphan
+    reload, .dump and VACUUM exclusion all arrive free.  Population
+    precedes it in the CREATE program, so `sqlite3RefillIndex` is
+    emitted after population.  Key-less views: no index; their single
+    group row exists from population (aggregate over empty = one row)
+    and never dies.
+  - *Delta application is per-row and that is a FEATURE:* for a
+    one-row delta the definition's own outputs ARE the hidden deltas
+    (delta avg over one row = the value; n-delta = value IS NOT NULL;
+    ivm$count-delta = 1), so trigger bodies synthesize from the
+    STORED TEXT with zero expression surgery.
+  - *Trigger shape (per mview, on the base):* AFTER INSERT / DELETE /
+    UPDATE.  The delta select is the definition text UNCHANGED,
+    prefixed `WITH "<base>"(<cols>) AS (VALUES(NEW…))` — the CTE
+    SHADOWS the base table (verified empirically, with UPDATE-FROM
+    and IS-matching, in newcte.tcl 2026-08-12).  Application is
+    UPDATE-combine-FROM-delta with `IS` key matching, THEN
+    INSERT-if-absent (NOT EXISTS) — never ON CONFLICT, because UNIQUE
+    treats NULL keys as distinct while GROUP BY treats them as one
+    group.  DELETE side subtracts, then a keyed
+    `DELETE … WHERE ivm$count<=0` (skipped for key-less views).
+    UPDATE = OLD-side then NEW-side.
+  - *Synthesis mechanics:* full CREATE TRIGGER text, sub-parsed
+    (declare_vtab-style Parse) under a fork flag that makes
+    FinishTrigger build-but-not-persist (no trigHash, no schema row,
+    no codegen); attached to the base's pTrigger list ONCE, LAZILY,
+    from sqlite3TriggerList (schema mutex held there), keyed on a
+    TF-flag set at registration; owned by MViewInfo, freed by the
+    registry teardown (which must also unlink from the base's list).
+    Lazy synthesis means xfer/truncate self-disable automatically and
+    the proc body-cache exclusion + proc_check naming arrive with no
+    new code (ivm1 7.1).
+  - *VACUUM cannot double-maintain:* registration happens only on the
+    schema-RELOAD path; vacuum executes DDL directly, so the vacuum
+    db has an empty registry, no flags, no triggers — the content
+    copy is clean.  Restore-from-dump maintains correctly by
+    construction regardless of statement order.
+  - *HAVING moves to Tier 2* (DESIGN-IVM amended, dated): a group
+    failing HAVING must be absent from the table yet keep
+    accumulating, and with row-as-storage there is nowhere to
+    accumulate.  Refused at CREATE with the reason; the Tier-2 path
+    is a per-group base rescan on absent-group deltas (the MIN/MAX
+    cost class, index advisory and all).
+  - *view_list:* eager views flip pending/stale from NULL to 0/0 —
+    measured-by-construction once triggers exist.  Deferred views
+    stay NULL until P4.
+  - *Order of work:* registration/walk (kinds, TF flag, HAVING) →
+    CREATE (hidden cols, augmented population from a PRE-RESOLUTION
+    dup — the resolved tree cannot be re-prepped — auto index +
+    refill) → synthesis → view_list → gates.
+
+  **EXECUTED 2026-08-12.** ivm1 3/24: 5.x (including the acceptance
+  storm) and 7.x green; the remaining red is exactly 6.x (P4).  The
+  key index rides an engine-emitted `OP_SqlExec CREATE UNIQUE INDEX`
+  placed after EndTable's schema reload, so an ordinary CREATE INDEX
+  builds and fills it — no register plumbing.  Three bugs found and
+  fixed on the way, each caught by an instrument: (1)
+  `sqlite3TriggersExist` short-circuits on `pTrigger==0` before ever
+  reaching the lazy-synthesis hook — the hook moved above the
+  short-circuit; (2) `sqlite3RunParser`'s own tail FREES
+  `pParse->pNewTrigger`, so the sub-parse hand-off returned freed
+  memory that read as garbage trigger-ops (found when printing the
+  fields segfaulted; the earlier symptom, mask=0, was that garbage
+  being compared); (3) every sub-parse leaves an EMPTY but allocated
+  Vdbe from statement-completion codegen — unfinalized it pinned the
+  whole connection as a zombie at close, which is why BOTH leak
+  components (77KB connection + 33KB triggers) traced to one line;
+  `sqlite3_next_stmt` showing three empty-SQL statements was the
+  tell.  The maintenance-write exemption is a flag carried by the
+  synthesized Trigger into its body's sub-parse
+  (`Trigger.bMViewMaint` → `Parse.bMViewMaintProg`) so USER triggers
+  writing a view still refuse.  VACUUM: synthesis is suppressed under
+  DBFLAG_Vacuum and the view content is copied with an EXPLICIT
+  column list built from table_xinfo, because `SELECT *` skips hidden
+  columns — the generic copy would have silently dropped the
+  bookkeeping.  Verified by a 11-leg matrix (SUM-to-zero vs all-NULL
+  distinguished; AVG NULL semantics; group-key moves; whole-group
+  death; reopen re-synthesis; VACUUM + post-vacuum maintenance; proc
+  interplay with the named cache exclusion; view_list eager 0/0
+  measured; transactional rollback), the oracle judging every leg at
+  0 differ, and a MEMDEBUG build reporting all allocations freed.
 - **P4 — deferred.** Same triggers, log application
   (`sqlite_ivm_<name>_log` weighted rows), `PRAGMA view_refresh`,
   pending/stale surfaces; view_check on a stale view says STALE before

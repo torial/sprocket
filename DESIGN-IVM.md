@@ -152,6 +152,19 @@ SUM+COUNT, quotient emitted on read); `WHERE` (filters the delta before
 application); `HAVING` (visibility over maintained groups); deterministic
 expressions in keys and arguments; single base table.
 
+**AMENDMENT 2026-08-12 (P3 implementation; kethiv above, qere here):
+HAVING moves to Tier 2.**  This section placed HAVING in Tier 1 as mere
+"visibility over maintained groups", and implementation showed that
+reading is wrong: a group that fails HAVING must be ABSENT from the
+stored table (reads are ordinary table reads) while its aggregates KEEP
+ACCUMULATING so it can reappear.  Under the ruled storage model — the
+row IS the storage (Q4 + the hidden-columns ruling) — an absent group
+has nowhere to accumulate.  v1 therefore refuses HAVING at CREATE, by
+name, with the fix (filter at query time over the maintained view).
+The Tier-2 path when wanted: on a delta for an absent group, rescan
+that one group from the base to rebuild its accumulators — the same
+cost class as MIN/MAX-on-delete, served by the same R7 index advisory.
+
 ```sql
 -- insert (alice, 50):  balance += 50, entries += 1     -- O(1)
 -- delete (alice, 50):  balance -= 50, entries -= 1     -- O(1)

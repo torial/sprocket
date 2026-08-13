@@ -119,6 +119,123 @@ static void mviewRenderCall(StrAccum *pStr, const Expr *pExpr){
 }
 
 /*
+** Append the hidden bookkeeping columns to a materialized view's Table:
+** always "ivm$count" (the COUNT(*) group-liveness counter), plus per
+** SUM column i an "ivm$n$i" (count of non-null arguments, which is what
+** lets SUM return to NULL when they are all gone), plus per AVG column
+** j an "ivm$s$j" and "ivm$n$j" (the visible average is s/n).  The
+** columns carry COLFLAG_HIDDEN: star expansion, NATURAL/USING joins and
+** table_info skip them; explicit reads and table_xinfo see them, which
+** is the honest arrangement for engine bookkeeping.
+**
+** Runs at CREATE and at every schema load (both re-derive columns), so
+** the stored rows always match the derived shape.
+*/
+static int mviewAppendHiddenCols(
+  Parse *pParse,
+  Table *p,                /* The view's table; nCol==nVis on entry */
+  int nVis,                /* Number of visible result columns */
+  const u8 *aColKind       /* Conformance-walk kinds, nVis entries */
+){
+  sqlite3 *db = pParse->db;
+  int nHidden = 1;         /* ivm$count */
+  int i, j;
+  Column *aNew;
+  for(i=0; i<nVis; i++){
+    if( aColKind[i]==MVIEW_COL_SUM ) nHidden += 1;
+    if( aColKind[i]==MVIEW_COL_AVG ) nHidden += 2;
+  }
+  aNew = sqlite3DbRealloc(db, p->aCol, (nVis+nHidden)*sizeof(Column));
+  if( aNew==0 ) return SQLITE_NOMEM;
+  p->aCol = aNew;
+  memset(&p->aCol[nVis], 0, nHidden*sizeof(Column));
+  j = nVis;
+  for(i=0; i<=nVis; i++){
+    char *zName = 0;
+    char cAff = 0;
+    if( i==nVis ){
+      /* Emitted last so the loop shape stays simple; position does not
+      ** matter as long as CREATE and reload agree, and they run the
+      ** same code.  Placed after the per-column hiddens. */
+      zName = sqlite3MPrintf(db, "ivm$count");
+      cAff = SQLITE_AFF_INTEGER;
+      /* fall through to the append below */
+    }else if( aColKind[i]==MVIEW_COL_SUM ){
+      zName = sqlite3MPrintf(db, "ivm$n$%d", i);
+      cAff = SQLITE_AFF_INTEGER;
+    }else if( aColKind[i]==MVIEW_COL_AVG ){
+      zName = sqlite3MPrintf(db, "ivm$s$%d", i);
+      if( zName==0 ) return SQLITE_NOMEM;
+      p->aCol[j].zCnName = zName;
+      p->aCol[j].hName = sqlite3StrIHash(zName);
+      p->aCol[j].affinity = SQLITE_AFF_NUMERIC;
+      p->aCol[j].colFlags = COLFLAG_HIDDEN;
+      p->aCol[j].szEst = 1;
+      j++;
+      zName = sqlite3MPrintf(db, "ivm$n$%d", i);
+      cAff = SQLITE_AFF_INTEGER;
+    }else{
+      continue;
+    }
+    if( zName==0 ) return SQLITE_NOMEM;
+    p->aCol[j].zCnName = zName;
+    p->aCol[j].hName = sqlite3StrIHash(zName);
+    p->aCol[j].affinity = cAff;
+    p->aCol[j].colFlags = COLFLAG_HIDDEN;
+    p->aCol[j].szEst = 1;
+    j++;
+  }
+  assert( j==nVis+nHidden );
+  p->nCol = p->nNVCol = (i16)(nVis+nHidden);
+  p->tabFlags |= TF_HasHidden;
+  return SQLITE_OK;
+}
+
+/*
+** Append to pSel's result list the aggregate expressions that compute
+** the hidden bookkeeping columns, IN THE SAME ORDER as
+** mviewAppendHiddenCols lays them out: per SUM column count(arg), per
+** AVG column sum(arg) then count(arg), then count(*) last.  pSel must
+** be an UNRESOLVED tree (a dup taken before sqlite3ResultSetOfSelect):
+** appending to a resolved tree would leave the new aggregates
+** unresolved forever, because a prepared Select is never prepped twice.
+*/
+static void mviewAugmentSelect(
+  Parse *pParse,
+  Select *pSel,            /* Pre-resolution dup of the definition */
+  int nVis,
+  const u8 *aColKind
+){
+  static const Token tkCount = { "count", 5 };
+  static const Token tkSum   = { "sum", 3 };
+  sqlite3 *db = pParse->db;
+  int i;
+  for(i=0; i<nVis; i++){
+    Expr *pArg, *pAgg;
+    ExprList *pArgs;
+    if( aColKind[i]!=MVIEW_COL_SUM && aColKind[i]!=MVIEW_COL_AVG ){
+      continue;
+    }
+    assert( pSel->pEList->a[i].pExpr->op==TK_FUNCTION );
+    assert( ExprUseXList(pSel->pEList->a[i].pExpr) );
+    if( aColKind[i]==MVIEW_COL_AVG ){
+      pArg = sqlite3ExprDup(db,
+                pSel->pEList->a[i].pExpr->x.pList->a[0].pExpr, 0);
+      pArgs = sqlite3ExprListAppend(pParse, 0, pArg);
+      pAgg = sqlite3ExprFunction(pParse, pArgs, &tkSum, 0);
+      pSel->pEList = sqlite3ExprListAppend(pParse, pSel->pEList, pAgg);
+    }
+    pArg = sqlite3ExprDup(db,
+              pSel->pEList->a[i].pExpr->x.pList->a[0].pExpr, 0);
+    pArgs = sqlite3ExprListAppend(pParse, 0, pArg);
+    pAgg = sqlite3ExprFunction(pParse, pArgs, &tkCount, 0);
+    pSel->pEList = sqlite3ExprListAppend(pParse, pSel->pEList, pAgg);
+  }
+  pSel->pEList = sqlite3ExprListAppend(pParse, pSel->pEList,
+                    sqlite3ExprFunction(pParse, 0, &tkCount, 0));
+}
+
+/*
 ** Context threaded through the conformance walk below.
 */
 typedef struct MViewWalk MViewWalk;
@@ -267,17 +384,20 @@ static int mviewCheckDeterministic(MViewWalk *p, Expr *pExpr){
 }
 
 /*
-** Is pExpr a Tier-1 maintainable aggregate call: COUNT(*), COUNT(x),
-** SUM(x), TOTAL(x) or AVG(x), not DISTINCT, over deterministic arguments?
-** If yes return 1.  If it is an aggregate but not maintainable, refuse
-** with the named reason and return 0.  If it is not an aggregate call at
-** all, return 0 silently (caller applies the GROUP BY rule instead).
+** Classify pExpr, known to be TK_AGG_FUNCTION, as one of the Tier-1
+** maintainable aggregates and return its MVIEW_COL_* kind.  On anything
+** outside the subset, refuse with the named reason and return 0 with
+** p->rc set.
 */
-static int mviewCheckAggregate(MViewWalk *p, Expr *pExpr){
+static int mviewAggColKind(MViewWalk *p, Expr *pExpr){
   const char *zFunc;
-  if( pExpr->op!=TK_AGG_FUNCTION ) return 0;
+  int nArg;
+  int kind;
+  assert( pExpr->op==TK_AGG_FUNCTION );
   assert( !ExprHasProperty(pExpr, EP_IntValue) );
   zFunc = pExpr->u.zToken;
+  nArg = (ExprUseXList(pExpr) && pExpr->x.pList)
+            ? pExpr->x.pList->nExpr : 0;
   if( ExprHasProperty(pExpr, EP_Distinct) ){
     mviewRefuse(p, "%s(DISTINCT) requires tracking a per-group multiset "
                    "(Tier 3, not yet supported)", zFunc);
@@ -292,37 +412,27 @@ static int mviewCheckAggregate(MViewWalk *p, Expr *pExpr){
                    "(Tier 2, not yet supported)", zFunc);
     return 0;
   }
-  if( sqlite3_stricmp(zFunc,"count")!=0
-   && sqlite3_stricmp(zFunc,"sum")!=0
-   && sqlite3_stricmp(zFunc,"total")!=0
-   && sqlite3_stricmp(zFunc,"avg")!=0
-  ){
+  if( sqlite3_stricmp(zFunc,"count")==0 ){
+    kind = nArg==0 ? MVIEW_COL_COUNT0 : MVIEW_COL_COUNT;
+  }else if( sqlite3_stricmp(zFunc,"sum")==0 ){
+    kind = MVIEW_COL_SUM;
+  }else if( sqlite3_stricmp(zFunc,"total")==0 ){
+    kind = MVIEW_COL_TOTAL;
+  }else if( sqlite3_stricmp(zFunc,"avg")==0 ){
+    kind = MVIEW_COL_AVG;
+  }else{
     mviewRefuse(p, "%s() is not incrementally maintainable "
                    "(v1 supports count, sum, total, avg)", zFunc);
     return 0;
   }
   /* Arguments must be deterministic (COUNT(*) has none) */
-  if( ExprUseXList(pExpr) && pExpr->x.pList ){
+  if( nArg>0 ){
     int i;
-    for(i=0; i<pExpr->x.pList->nExpr; i++){
+    for(i=0; i<nArg; i++){
       if( mviewCheckDeterministic(p, pExpr->x.pList->a[i].pExpr) ) return 0;
     }
   }
-  return p->rc==SQLITE_OK;
-}
-
-/*
-** Expression-walker: refuse any aggregate that is not Tier-1.  Used for
-** HAVING, where aggregates appear nested inside comparisons.
-*/
-static int mviewHavingExprCb(Walker *pWalker, Expr *pExpr){
-  MViewWalk *p = (MViewWalk*)pWalker->u.pMViewWalk;
-  if( p->rc!=SQLITE_OK ) return WRC_Abort;
-  if( pExpr->op==TK_AGG_FUNCTION ){
-    mviewCheckAggregate(p, pExpr);
-    return p->rc==SQLITE_OK ? WRC_Prune : WRC_Abort;
-  }
-  return mviewDetExprCb(pWalker, pExpr);
+  return kind;
 }
 
 /*
@@ -334,7 +444,8 @@ static int mviewHavingExprCb(Walker *pWalker, Expr *pExpr){
 static int mviewCheckSelect(
   Parse *pParse,
   const char *zName,       /* View name for messages */
-  Select *pSelect          /* The prepared definition */
+  Select *pSelect,         /* The prepared definition */
+  u8 *aColKind             /* OUT: one MVIEW_COL_* per result column */
 ){
   MViewWalk sWalk;
   SrcItem *pItem;
@@ -408,9 +519,12 @@ static int mviewCheckSelect(
   for(i=0; i<pSelect->pEList->nExpr; i++){
     Expr *pE = pSelect->pEList->a[i].pExpr;
     if( pE->op==TK_AGG_FUNCTION ){
-      if( !mviewCheckAggregate(&sWalk, pE) ) return sWalk.rc;
+      int kind = mviewAggColKind(&sWalk, pE);
+      if( sWalk.rc ) return sWalk.rc;
+      aColKind[i] = (u8)kind;
       continue;
     }
+    aColKind[i] = MVIEW_COL_KEY;
     /* Aggregates nested inside larger expressions are a Tier-2+ shape:
     ** the raw aggregate would need hidden storage to re-derive the
     ** expression on maintenance.  EP_Agg is set by name resolution on
@@ -446,15 +560,15 @@ static int mviewCheckSelect(
     }
   }
 
-  /* HAVING: deterministic, and any aggregate inside it must be Tier-1 */
+  /* HAVING is Tier 2 (DESIGN-IVM amendment 2026-08-12): a group that
+  ** fails HAVING must be absent from the stored table yet keep
+  ** accumulating so it can reappear, and with row-as-storage an absent
+  ** group has nowhere to accumulate. */
   if( pSelect->pHaving ){
-    Walker w;
-    memset(&w, 0, sizeof(w));
-    w.xExprCallback = mviewHavingExprCb;
-    w.xSelectCallback = mviewDetSelectCb;
-    w.u.pMViewWalk = &sWalk;
-    sqlite3WalkExpr(&w, pSelect->pHaving);
-    if( sWalk.rc ) return sWalk.rc;
+    mviewRefuse(&sWalk, "HAVING requires storage for the groups it "
+        "hides (Tier 2, not yet supported); filter at query time over "
+        "the maintained view instead");
+    return sWalk.rc;
   }
 
   return sWalk.rc;
@@ -516,23 +630,22 @@ static void mviewCodePopulate(Parse *pParse, Table *p, Select *pSelect){
 static void mviewRegister(
   Parse *pParse,
   Table *p,                /* The view's table object */
-  const char *zBase,       /* Name of the base table */
+  Table *pBase,            /* The base table (gets TF_MViewBase) */
   int bDeferred,
-  Select *pSelect,         /* Resolved definition (for the key flags) */
+  int nCol,                /* Number of VISIBLE result columns */
+  const u8 *aColKind,      /* The conformance walk's column kinds */
   const char *zSelDef,     /* Definition SELECT text */
   int nSelDef              /* Length of zSelDef */
 ){
   MViewInfo *pInfo, *pOld;
   sqlite3 *db = pParse->db;
   sqlite3_int64 nName = sqlite3Strlen30(p->zName)+1;
-  sqlite3_int64 nBase = sqlite3Strlen30(zBase)+1;
-  int nCol = pSelect->pEList->nExpr;
-  int i;
+  sqlite3_int64 nBase = sqlite3Strlen30(pBase->zName)+1;
   assert( db->init.busy );
   assert( sqlite3SchemaMutexHeld(db, 0, p->pSchema) );
-  /* One allocation: struct, strings, then the key-flag array.  The hash
-  ** keys off pInfo->zName rather than the Table's own name so the entry
-  ** never points into memory the table teardown frees. */
+  /* One allocation: struct, strings, then the column-kind array.  The
+  ** hash keys off pInfo->zName rather than the Table's own name so the
+  ** entry never points into memory the table teardown frees. */
   pInfo = sqlite3MallocZero(sizeof(MViewInfo)+nName+nBase+nSelDef+1+nCol);
   if( pInfo==0 ){
     sqlite3OomFault(db);
@@ -541,17 +654,17 @@ static void mviewRegister(
   pInfo->zName = (char*)&pInfo[1];
   memcpy(pInfo->zName, p->zName, nName);
   pInfo->zBase = pInfo->zName + nName;
-  memcpy(pInfo->zBase, zBase, nBase);
+  memcpy(pInfo->zBase, pBase->zName, nBase);
   pInfo->zSelDef = pInfo->zBase + nBase;
   memcpy(pInfo->zSelDef, zSelDef, nSelDef);
   pInfo->zSelDef[nSelDef] = 0;
-  pInfo->aIsKey = (u8*)(pInfo->zSelDef + nSelDef + 1);
+  pInfo->aColKind = (u8*)(pInfo->zSelDef + nSelDef + 1);
+  memcpy(pInfo->aColKind, aColKind, nCol);
   pInfo->nCol = nCol;
-  for(i=0; i<nCol; i++){
-    pInfo->aIsKey[i] =
-        (u8)(pSelect->pEList->a[i].pExpr->op!=TK_AGG_FUNCTION);
-  }
   pInfo->bDeferred = (u8)(bDeferred!=0);
+  /* The base table now has a dependent: TriggerList consults the
+  ** registry for it (eager maintenance), and ALTER/DROP refuse. */
+  pBase->tabFlags |= TF_MViewBase;
   pOld = sqlite3HashInsert(&p->pSchema->mviewHash, pInfo->zName, pInfo);
   if( pOld ){
     if( pOld==pInfo ){          /* OOM inside HashInsert */
@@ -565,13 +678,28 @@ static void mviewRegister(
 }
 
 /*
+** Free one MViewInfo, including its synthesized maintenance triggers.
+** The triggers were built by a CREATE-statement sub-parse, which
+** disables lookaside (the createkw action), so freeing them through
+** any sqlite3* -- including callback.c's zeroed stand-in -- is sound.
+*/
+static void mviewInfoFree(sqlite3 *db, MViewInfo *pInfo){
+  int i;
+  if( pInfo==0 ) return;
+  for(i=0; i<3; i++){
+    sqlite3DeleteTrigger(db, pInfo->apTrig[i]);
+  }
+  sqlite3_free(pInfo);
+}
+
+/*
 ** Free every MViewInfo in an mviewHash and reset the hash.  Called from
 ** the schema-clearing paths in callback.c.
 */
-void sqlite3MViewHashClear(Hash *pHash){
+void sqlite3MViewHashClear(sqlite3 *db, Hash *pHash){
   HashElem *pElem;
   for(pElem=sqliteHashFirst(pHash); pElem; pElem=sqliteHashNext(pElem)){
-    sqlite3_free(sqliteHashData(pElem));
+    mviewInfoFree(db, (MViewInfo*)sqliteHashData(pElem));
   }
   sqlite3HashClear(pHash);
 }
@@ -579,7 +707,10 @@ void sqlite3MViewHashClear(Hash *pHash){
 /*
 ** Remove one view's registry entry, if present.  Called when the table
 ** object is unlinked (see sqlite3UnlinkAndDeleteTable in build.c), which
-** covers every drop path.
+** covers every drop path.  The synthesized triggers are unlinked from
+** the base table's trigger list before they are freed: the schema reset
+** that follows a DROP re-derives everything, but the base's list must
+** never hold a freed pointer even briefly.
 */
 void sqlite3UnlinkAndDeleteMView(sqlite3 *db, int iDb, const char *zName){
   Hash *pHash;
@@ -587,7 +718,25 @@ void sqlite3UnlinkAndDeleteMView(sqlite3 *db, int iDb, const char *zName){
   assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
   pHash = &db->aDb[iDb].pSchema->mviewHash;
   pInfo = sqlite3HashInsert(pHash, zName, 0);
-  sqlite3_free(pInfo);
+  if( pInfo && pInfo->bTrigBuilt ){
+    Table *pBase = sqlite3FindTable(db, pInfo->zBase,
+                                    db->aDb[iDb].zDbSName);
+    if( pBase ){
+      Trigger **pp = &pBase->pTrigger;
+      while( *pp ){
+        int i, isMine = 0;
+        for(i=0; i<3; i++){
+          if( *pp==pInfo->apTrig[i] ) isMine = 1;
+        }
+        if( isMine ){
+          *pp = (*pp)->pNext;
+        }else{
+          pp = &(*pp)->pNext;
+        }
+      }
+    }
+  }
+  mviewInfoFree(db, pInfo);
 }
 
 /*
@@ -641,7 +790,10 @@ void sqlite3CreateMView(
   int iDb;
   sqlite3 *db = pParse->db;
   Table *pSelTab;    /* Result-set shape of the definition */
-  const char *zBase = 0;
+  Table *pBase = 0;  /* The single base table */
+  Select *pSelDup = 0; /* Pre-resolution copy, for population */
+  u8 *aColKind = 0;  /* Conformance walk's per-column kinds */
+  int nVis = 0;      /* Number of visible result columns */
 
   if( pMat->n!=12 || sqlite3_strnicmp(pMat->z, "materialized", 12)!=0 ){
     sqlite3ErrorMsg(pParse, "near \"%T\": syntax error "
@@ -706,6 +858,14 @@ void sqlite3CreateMView(
     goto create_mview_fail;
   }
 
+  /* A pre-resolution copy for population: the appended bookkeeping
+  ** aggregates must go through name resolution WITH the rest of the
+  ** tree, and a prepared Select is never prepped twice. */
+  if( !db->init.busy ){
+    pSelDup = sqlite3SelectDup(db, pSelect, 0);
+    if( pSelDup==0 ) goto create_mview_fail;
+  }
+
   /* Derive the column list from the definition.  This runs at CREATE and
   ** again at every schema load (the stored DDL keeps the SELECT), which
   ** is why the base table must outlive the view. */
@@ -717,21 +877,47 @@ void sqlite3CreateMView(
   pSelTab->nCol = 0;
   pSelTab->aCol = 0;
   sqlite3DeleteTable(db, pSelTab);
+  nVis = p->nCol;
+
+  /* The ivm$ column namespace belongs to the bookkeeping */
+  {
+    int i;
+    for(i=0; i<nVis; i++){
+      if( sqlite3_strnicmp(p->aCol[i].zCnName, "ivm$", 4)==0 ){
+        sqlite3ErrorMsg(pParse, "%s cannot be incrementally maintained: "
+            "column names beginning with ivm$ are reserved for "
+            "maintenance bookkeeping (rename %s)",
+            p->zName, p->aCol[i].zCnName);
+        goto create_mview_fail;
+      }
+    }
+  }
 
   /* Tier-1 conformance: everything outside the maintainable subset is
   ** refused by name, with the fix, before anything is written. */
-  if( mviewCheckSelect(pParse, p->zName, pSelect) ) goto create_mview_fail;
+  aColKind = sqlite3DbMallocRawNN(db, nVis);
+  if( aColKind==0 ) goto create_mview_fail;
+  if( mviewCheckSelect(pParse, p->zName, pSelect, aColKind) ){
+    goto create_mview_fail;
+  }
   assert( pSelect->pSrc->nSrc==1 && pSelect->pSrc->a[0].pSTab!=0 );
-  zBase = pSelect->pSrc->a[0].pSTab->zName;
+  pBase = pSelect->pSrc->a[0].pSTab;
 
-  /* Population: run the definition into the new root page. */
+  /* The hidden bookkeeping columns, at CREATE and at every load */
+  if( mviewAppendHiddenCols(pParse, p, nVis, aColKind) ){
+    goto create_mview_fail;
+  }
+
+  /* Population: run the augmented definition into the new root page. */
   if( !db->init.busy ){
     if( IN_SPECIAL_PARSE ){
       pParse->rc = SQLITE_ERROR;
       pParse->nErr++;
       goto create_mview_fail;
     }
-    mviewCodePopulate(pParse, p, pSelect);
+    mviewAugmentSelect(pParse, pSelDup, nVis, aColKind);
+    if( pParse->nErr || db->mallocFailed ) goto create_mview_fail;
+    mviewCodePopulate(pParse, p, pSelDup);
     if( pParse->nErr ) goto create_mview_fail;
   }
 
@@ -758,6 +944,40 @@ void sqlite3CreateMView(
   sqlite3EndTable(pParse, 0, &sEnd, 0, 0);
   if( pParse->nErr ) goto create_mview_fail;
 
+  if( !db->init.busy ){
+    /* The key index, emitted AFTER EndTable so it executes after the
+    ** OP_ParseSchema reload: at that point the view is a real,
+    ** populated table and an ordinary CREATE UNIQUE INDEX both builds
+    ** and fills it.  Key-less views (whole-table aggregates) hold
+    ** exactly one row forever and need no index. */
+    int i, nKey = 0;
+    for(i=0; i<nVis; i++) if( aColKind[i]==MVIEW_COL_KEY ) nKey++;
+    if( nKey>0 ){
+      Vdbe *v = sqlite3GetVdbe(pParse);
+      sqlite3_str *pStr = sqlite3_str_new(db);
+      char *zSql;
+      sqlite3_str_appendf(pStr,
+         "CREATE UNIQUE INDEX \"%w\".\"ivm$%w$key\" ON \"%w\"(",
+         db->aDb[iDb].zDbSName, p->zName, p->zName);
+      {
+        int nOut = 0;
+        for(i=0; i<nVis; i++){
+          if( aColKind[i]!=MVIEW_COL_KEY ) continue;
+          sqlite3_str_appendf(pStr, "%s\"%w\"", nOut++ ? "," : "",
+                              p->aCol[i].zCnName);
+        }
+      }
+      sqlite3_str_append(pStr, ")", 1);
+      zSql = sqlite3_str_finish(pStr);
+      if( zSql==0 || v==0 ){
+        sqlite3_free(zSql);
+        sqlite3OomFault(db);
+        goto create_mview_fail;
+      }
+      sqlite3VdbeAddOp4(v, OP_SqlExec, 0x0001, 0, 0, zSql, P4_DYNAMIC);
+    }
+  }
+
   /* Register in the in-memory mview registry.  Only the init path runs
   ** this: a live CREATE re-parses its own row via OP_ParseSchema, so the
   ** registry has exactly one write path. */
@@ -771,11 +991,13 @@ void sqlite3CreateMView(
       nSelDef--;
     }
     /* EndTable consumed pNewTable into the schema; p remains valid. */
-    mviewRegister(pParse, p, zBase, (p->tabFlags & TF_MViewDeferred)!=0,
-                  pSelect, zSelDef, nSelDef);
+    mviewRegister(pParse, p, pBase, (p->tabFlags & TF_MViewDeferred)!=0,
+                  nVis, aColKind, zSelDef, nSelDef);
   }
 
 create_mview_fail:
+  sqlite3DbFree(db, aColKind);
+  sqlite3SelectDelete(db, pSelDup);
   sqlite3SelectDelete(db, pSelect);
 }
 
@@ -855,6 +1077,337 @@ exit_drop_mview:
 }
 
 /*
+** ---------------------------------------------------------------------
+** Eager maintenance: the synthesized triggers (P3).
+**
+** Three AFTER triggers per eager view, built as SQL TEXT and compiled
+** by a private sub-parse, never persisted: no schema row, no trigHash
+** entry, not droppable, rebuilt from the stored definition at every
+** schema load (lazily, on the first statement that asks the base table
+** for its triggers).  The construction leans on one identity: for a
+** ONE-ROW delta the definition's own outputs are the bookkeeping
+** deltas (the avg of one row is the value; its non-null count is the
+** value IS NOT NULL; its group count is 1), so the stored definition
+** text is used UNCHANGED -- a CTE named after the base table shadows
+** it with a single NEW/OLD row.
+**
+** Application per delta row: UPDATE-combine (FROM the delta, keys
+** matched with IS -- never ON CONFLICT, because UNIQUE treats NULL
+** keys as distinct while GROUP BY treats them as one group), then for
+** inserts an INSERT-if-absent, and for deletes a keyed removal of
+** groups whose ivm$count reached zero.  Key-less views hold exactly
+** one row from population and never insert or die.
+*/
+
+/*
+** Append the DELTA subquery for one affected row:
+**   (WITH "base"(cols) AS (VALUES(ROW.cols))
+**    SELECT d.*, <bookkeeping>, 1 AS "ivm$count" FROM (
+**    <definition text>
+**    ) AS d)
+** zRow is "NEW" or "OLD".  Newlines around the definition text keep a
+** trailing -- comment in the stored text from swallowing the wrapper.
+*/
+static void mviewAppendDelta(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  const Table *pBase,
+  const char *zRow
+){
+  int i;
+  sqlite3_str_appendf(pStr, "(WITH \"%w\"(", pBase->zName);
+  for(i=0; i<pBase->nCol; i++){
+    sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                        pBase->aCol[i].zCnName);
+  }
+  sqlite3_str_appendall(pStr, ") AS (VALUES(");
+  for(i=0; i<pBase->nCol; i++){
+    sqlite3_str_appendf(pStr, "%s%s.\"%w\"", i ? "," : "", zRow,
+                        pBase->aCol[i].zCnName);
+  }
+  sqlite3_str_appendall(pStr, ")) SELECT d.*");
+  for(i=0; i<pInfo->nCol; i++){
+    const char *zC = pView->aCol[i].zCnName;
+    if( pInfo->aColKind[i]==MVIEW_COL_SUM ){
+      sqlite3_str_appendf(pStr,
+         ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i);
+    }else if( pInfo->aColKind[i]==MVIEW_COL_AVG ){
+      sqlite3_str_appendf(pStr,
+         ", d.\"%w\" AS \"ivm$s$%d\""
+         ", (d.\"%w\" IS NOT NULL) AS \"ivm$n$%d\"", zC, i, zC, i);
+    }
+  }
+  sqlite3_str_appendf(pStr,
+     ", 1 AS \"ivm$count\" FROM (\n%s\n) AS d)", pInfo->zSelDef);
+}
+
+/*
+** Append the SET list combining the view's current row with delta row
+** d, adding (cSign='+') or subtracting (cSign='-').  Every view-side
+** reference is qualified: d carries the same column names.
+*/
+static void mviewAppendCombine(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  char cSign
+){
+  const char *zV = pView->zName;
+  int i, n = 0;
+  for(i=0; i<pInfo->nCol; i++){
+    const char *zC = pView->aCol[i].zCnName;
+    switch( pInfo->aColKind[i] ){
+      case MVIEW_COL_KEY:
+        break;
+      case MVIEW_COL_COUNT0:
+      case MVIEW_COL_COUNT:
+      case MVIEW_COL_TOTAL:
+        sqlite3_str_appendf(pStr,
+           "%s\"%w\" = \"%w\".\"%w\" %c d.\"%w\"",
+           n++ ? ", " : "", zC, zV, zC, cSign, zC);
+        break;
+      case MVIEW_COL_SUM:
+        sqlite3_str_appendf(pStr,
+           "%s\"%w\" = CASE WHEN \"%w\".\"ivm$n$%d\" %c d.\"ivm$n$%d\" = 0"
+           " THEN NULL ELSE coalesce(\"%w\".\"%w\",0) %c"
+           " coalesce(d.\"%w\",0) END"
+           ", \"ivm$n$%d\" = \"%w\".\"ivm$n$%d\" %c d.\"ivm$n$%d\"",
+           n++ ? ", " : "", zC, zV, i, cSign, i,
+           zV, zC, cSign, zC,
+           i, zV, i, cSign, i);
+        break;
+      case MVIEW_COL_AVG:
+        sqlite3_str_appendf(pStr,
+           "%s\"%w\" = CASE WHEN \"%w\".\"ivm$n$%d\" %c d.\"ivm$n$%d\" = 0"
+           " THEN NULL ELSE"
+           " (coalesce(\"%w\".\"ivm$s$%d\",0) %c coalesce(d.\"ivm$s$%d\",0))"
+           " / CAST(\"%w\".\"ivm$n$%d\" %c d.\"ivm$n$%d\" AS REAL) END"
+           ", \"ivm$s$%d\" = coalesce(\"%w\".\"ivm$s$%d\",0) %c"
+           " coalesce(d.\"ivm$s$%d\",0)"
+           ", \"ivm$n$%d\" = \"%w\".\"ivm$n$%d\" %c d.\"ivm$n$%d\"",
+           n++ ? ", " : "", zC, zV, i, cSign, i,
+           zV, i, cSign, i,
+           zV, i, cSign, i,
+           i, zV, i, cSign, i,
+           i, zV, i, cSign, i);
+        break;
+    }
+  }
+  sqlite3_str_appendf(pStr,
+     "%s\"ivm$count\" = \"%w\".\"ivm$count\" %c d.\"ivm$count\"",
+     n ? ", " : "", zV, cSign);
+}
+
+/*
+** Append the key-match predicate "view"."k" IS <alias>."k" AND ... --
+** or the constant 1 for a key-less view.
+*/
+static void mviewAppendKeyMatch(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  const char *zAlias
+){
+  int i, n = 0;
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
+    sqlite3_str_appendf(pStr, "%s\"%w\".\"%w\" IS %s.\"%w\"",
+       n++ ? " AND " : "", pView->zName, pView->aCol[i].zCnName,
+       zAlias, pView->aCol[i].zCnName);
+  }
+  if( n==0 ) sqlite3_str_append(pStr, "1", 1);
+}
+
+/*
+** Append the two (or one) maintenance steps for one side of a delta:
+** bAdd!=0 -> combine-add then INSERT-if-absent (zRow=="NEW");
+** bAdd==0 -> combine-subtract then keyed group-death (zRow=="OLD").
+*/
+static void mviewAppendSteps(
+  sqlite3_str *pStr,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  const Table *pBase,
+  int bAdd,
+  int nKey
+){
+  const char *zRow = bAdd ? "NEW" : "OLD";
+  int i;
+
+  sqlite3_str_appendf(pStr, "UPDATE \"%w\" SET ", pView->zName);
+  mviewAppendCombine(pStr, pInfo, pView, bAdd ? '+' : '-');
+  sqlite3_str_appendall(pStr, " FROM ");
+  mviewAppendDelta(pStr, pInfo, pView, pBase, zRow);
+  sqlite3_str_appendall(pStr, " AS d WHERE ");
+  mviewAppendKeyMatch(pStr, pInfo, pView, "d");
+  sqlite3_str_appendall(pStr, "; ");
+
+  if( bAdd ){
+    if( nKey>0 ){
+      sqlite3_str_appendf(pStr, "INSERT INTO \"%w\"(", pView->zName);
+      for(i=0; i<pView->nCol; i++){
+        sqlite3_str_appendf(pStr, "%s\"%w\"", i ? "," : "",
+                            pView->aCol[i].zCnName);
+      }
+      sqlite3_str_appendall(pStr, ") SELECT * FROM ");
+      mviewAppendDelta(pStr, pInfo, pView, pBase, zRow);
+      sqlite3_str_appendall(pStr,
+         " AS dd WHERE NOT EXISTS(SELECT 1 FROM ");
+      sqlite3_str_appendf(pStr, "\"%w\" WHERE ", pView->zName);
+      mviewAppendKeyMatch(pStr, pInfo, pView, "dd");
+      sqlite3_str_appendall(pStr, "); ");
+    }
+    /* key-less: the single group row has existed since population and
+    ** the UPDATE above always finds it */
+  }else{
+    if( nKey>0 ){
+      sqlite3_str_appendf(pStr,
+         "DELETE FROM \"%w\" WHERE \"%w\".\"ivm$count\"<=0",
+         pView->zName, pView->zName);
+      for(i=0; i<pInfo->nCol; i++){
+        if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
+        sqlite3_str_appendf(pStr, " AND \"%w\".\"%w\" IS (SELECT \"%w\" FROM ",
+           pView->zName, pView->aCol[i].zCnName, pView->aCol[i].zCnName);
+        mviewAppendDelta(pStr, pInfo, pView, pBase, zRow);
+        sqlite3_str_appendall(pStr, " AS dx)");
+      }
+      sqlite3_str_appendall(pStr, "; ");
+    }
+    /* key-less: the single group row never dies (GROUP BY-less
+    ** aggregates yield one row even over an empty table) */
+  }
+}
+
+/*
+** Build the CREATE TRIGGER text for one maintenance trigger.
+** op: 0=INSERT, 1=DELETE, 2=UPDATE.  Caller frees.
+*/
+static char *mviewBuildTriggerSql(
+  sqlite3 *db,
+  const MViewInfo *pInfo,
+  const Table *pView,
+  const Table *pBase,
+  const char *zDbName,
+  int op
+){
+  static const char *azOp[] = { "INSERT", "DELETE", "UPDATE" };
+  static const char *azSuf[] = { "ins", "del", "upd" };
+  sqlite3_str *pStr = sqlite3_str_new(db);
+  int i, nKey = 0;
+  for(i=0; i<pInfo->nCol; i++){
+    if( pInfo->aColKind[i]==MVIEW_COL_KEY ) nKey++;
+  }
+  sqlite3_str_appendf(pStr,
+     "CREATE TRIGGER \"%w\".\"ivm$%w$%s\" AFTER %s ON \"%w\" BEGIN ",
+     zDbName, pView->zName, azSuf[op], azOp[op], pBase->zName);
+  if( op!=0 ){  /* DELETE and UPDATE subtract the OLD row */
+    mviewAppendSteps(pStr, pInfo, pView, pBase, 0, nKey);
+  }
+  if( op!=1 ){  /* INSERT and UPDATE add the NEW row */
+    mviewAppendSteps(pStr, pInfo, pView, pBase, 1, nKey);
+  }
+  sqlite3_str_appendall(pStr, "END");
+  return sqlite3_str_finish(pStr);
+}
+
+/*
+** Compile one synthesized CREATE TRIGGER through a private sub-parse.
+** pParse->bMViewTrigSynth makes sqlite3FinishTrigger() hand the built
+** object back instead of persisting it (see trigger.c).  The
+** authorizer is suspended: these are engine internals, like OP_SqlExec
+** with the 0x0001 flag.  Returns the Trigger or 0 with an error left
+** in pOuter.
+*/
+static Trigger *mviewParseTrigger(Parse *pOuter, const char *zSql){
+  sqlite3 *db = pOuter->db;
+  Parse sParse;
+  Trigger *pRet;
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  sqlite3_xauth xAuth = db->xAuth;
+  db->xAuth = 0;
+#endif
+  sqlite3ParseObjectInit(&sParse, db);
+  sParse.bMViewTrigSynth = 1;
+  sParse.nQueryLoop = 1;
+  sqlite3RunParser(&sParse, zSql);
+  pRet = sParse.pNewTrigger;
+  sParse.pNewTrigger = 0;
+  if( sParse.pVdbe ){
+    /* Statement-completion codegen allocates a Vdbe even for a parse
+    ** that emits nothing.  Left unfinalized it would pin the whole
+    ** connection open as a zombie at close. */
+    sqlite3VdbeFinalize(sParse.pVdbe);
+    sParse.pVdbe = 0;
+  }
+  if( pRet==0 && pOuter->nErr==0 ){
+    sqlite3ErrorMsg(pOuter,
+       "internal error: maintenance trigger for a materialized view "
+       "failed to compile: %s", sParse.zErrMsg ? sParse.zErrMsg : "?");
+  }
+  sqlite3DbFree(db, sParse.zErrMsg);
+  sqlite3ParseObjectReset(&sParse);
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  db->xAuth = xAuth;
+#endif
+  return pRet;
+}
+
+/*
+** Ensure the maintenance triggers for every EAGER materialized view
+** over pTab exist and are linked into pTab's trigger list.  Called
+** lazily from sqlite3TriggerList() -- by the time any statement wants
+** the base table's triggers, the whole schema is loaded and the
+** registry is populated.  Idempotent; schema mutex is held by the
+** caller's caller.  Never runs during schema load or inside its own
+** sub-parse.
+*/
+void sqlite3MViewSynthTriggers(Parse *pParse, Table *pTab){
+  sqlite3 *db = pParse->db;
+  HashElem *he;
+  Schema *pSchema = pTab->pSchema;
+  int iDb;
+  if( db->init.busy || pParse->bMViewTrigSynth ) return;
+  if( pParse->nErr ) return;
+  /* During VACUUM the rebuilt views receive their content by an
+  ** explicit engine copy (see vacuum.c); maintenance triggers on the
+  ** vacuum-side base tables would apply every delta twice. */
+  if( db->mDbFlags & DBFLAG_Vacuum ) return;
+  iDb = sqlite3SchemaToIndex(db, pSchema);
+  if( NEVER(iDb<0) ) return;
+  for(he=sqliteHashFirst(&pSchema->mviewHash); he;
+      he=sqliteHashNext(he)){
+    MViewInfo *pInfo = (MViewInfo*)sqliteHashData(he);
+    Table *pView;
+    int k;
+    if( pInfo->bTrigBuilt || pInfo->bDeferred ) continue;
+    if( sqlite3_stricmp(pInfo->zBase, pTab->zName)!=0 ) continue;
+    pView = sqlite3FindTable(db, pInfo->zName, db->aDb[iDb].zDbSName);
+    if( NEVER(pView==0) ) continue;
+    for(k=0; k<3; k++){
+      char *zSql = mviewBuildTriggerSql(db, pInfo, pView, pTab,
+                                        db->aDb[iDb].zDbSName, k);
+      if( zSql==0 ){
+        sqlite3OomFault(db);
+        return;
+      }
+      pInfo->apTrig[k] = mviewParseTrigger(pParse, zSql);
+      sqlite3_free(zSql);
+      if( pInfo->apTrig[k]==0 ) return;
+      pInfo->apTrig[k]->bMViewMaint = 1;
+    }
+    /* All three built: link them into the base's list so every DML
+    ** compile sees them (and so the xfer/truncate fast paths disable
+    ** themselves, which is a correctness dependency here). */
+    for(k=0; k<3; k++){
+      pInfo->apTrig[k]->pNext = pTab->pTrigger;
+      pTab->pTrigger = pInfo->apTrig[k];
+    }
+    pInfo->bTrigBuilt = 1;
+  }
+}
+
+/*
 ** Append the comma-separated key-column list of pInfo, using the CTE
 ** column aliases mv$0..mv$N.  If the view has no key columns (a
 ** whole-table aggregate), append the constant 1: there is exactly one
@@ -863,7 +1416,7 @@ exit_drop_mview:
 static void mviewAppendKeyList(sqlite3_str *pStr, const MViewInfo *pInfo){
   int i, n = 0;
   for(i=0; i<pInfo->nCol; i++){
-    if( !pInfo->aIsKey[i] ) continue;
+    if( pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
     if( n++ ) sqlite3_str_append(pStr, ",", 1);
     sqlite3_str_appendf(pStr, "\"mv$%d\"", i);
   }
@@ -883,7 +1436,7 @@ static void mviewAppendRowRender(
 ){
   int i, n = 0;
   for(i=0; i<pInfo->nCol; i++){
-    if( bKeysOnly && !pInfo->aIsKey[i] ) continue;
+    if( bKeysOnly && pInfo->aColKind[i]!=MVIEW_COL_KEY ) continue;
     if( n++ ) sqlite3_str_appendall(pStr, "||','||");
     sqlite3_str_appendf(pStr, "quote(\"mv$%d\")", i);
   }
@@ -1049,11 +1602,17 @@ void sqlite3MViewCodeList(Parse *pParse, Vdbe *v, const char *zDb){
       apMV[k] = pT;
     }
     for(j=0; j<nMV; j++){
-      sqlite3VdbeMultiLoad(v, 1, "ssss",
-         apMV[j]->zName,
-         apMV[j]->bDeferred ? "deferred" : "eager",
-         (const char*)0,      /* pending: unmeasured until capture */
-         (const char*)0);     /* stale:   unmeasured until capture */
+      if( apMV[j]->bDeferred ){
+        /* No capture mechanism exists for deferred views yet:
+        ** unmeasured is spelled NULL, never a reassuring zero */
+        sqlite3VdbeMultiLoad(v, 1, "ssss",
+           apMV[j]->zName, "deferred", (const char*)0, (const char*)0);
+      }else{
+        /* Eager: maintained inside every writing statement, so zero
+        ** pending and never stale -- true by construction */
+        sqlite3VdbeMultiLoad(v, 1, "ssii",
+           apMV[j]->zName, "eager", 0, 0);
+      }
     }
     sqlite3DbFree(db, apMV);
   }

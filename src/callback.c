@@ -519,7 +519,7 @@ void sqlite3SchemaClear(void *p){
     sqlite3HashClear(&tempProc);
   }
 #endif
-  sqlite3MViewHashClear(&pSchema->mviewHash);
+  sqlite3MViewHashClear(&xdb, &pSchema->mviewHash);
   sqlite3HashInit(&pSchema->tblHash);
   for(pElem=sqliteHashFirst(&temp1); pElem; pElem=sqliteHashNext(pElem)){
     Table *pTab = sqliteHashData(pElem);

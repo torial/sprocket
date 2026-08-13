@@ -9472,6 +9472,9 @@ static int do_meta_command(const char *zLine, ShellState *p){
         "SELECT sql FROM sqlite_schema AS o "
         "WHERE (%s) AND sql NOT NULL"
         "  AND type IN ('index','trigger','view','proc','mview') "
+        /* A materialized view's ivm$ maintenance index is re-created
+        ** by its own CREATE statement; replaying it would collide */
+        "  AND NOT(type='index' AND name LIKE 'ivm$%%') "
         /* DESC puts 'mview' after 'proc'/'view'/'trigger' but before
         ** 'index', so indexes on materialized views restore last */
         "ORDER BY type COLLATE NOCASE DESC",

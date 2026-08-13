@@ -305,9 +305,12 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
       zDbMain
   );
   if( rc!=SQLITE_OK ) goto end_of_vacuum;
+  /* A materialized view's own maintenance index (ivm$*) is created by
+  ** its CREATE statement above; replaying its schema row would be a
+  ** duplicate. */
   rc = execSqlF(db, pzErrMsg,
       "SELECT sql FROM \"%w\".sqlite_schema"
-      " WHERE type='index'",
+      " WHERE type='index' AND name NOT LIKE 'ivm$%%'",
       zDbMain
   );
   if( rc!=SQLITE_OK ) goto end_of_vacuum;
@@ -321,8 +324,32 @@ SQLITE_NOINLINE int sqlite3RunVacuum(
       "SELECT'INSERT INTO %s.'||quote(name)"
       "||' SELECT*FROM\"%w\".'||quote(name)"
       "FROM %s.sqlite_schema "
-      "WHERE type IN('table','mview')AND coalesce(rootpage,1)>0",
+      "WHERE type='table'AND coalesce(rootpage,1)>0",
       zDbVacuum, zDbMain, zDbVacuum
+  );
+  if( rc!=SQLITE_OK ){
+    assert( (db->mDbFlags & DBFLAG_Vacuum)!=0 );
+    db->mDbFlags &= ~DBFLAG_Vacuum;
+    goto end_of_vacuum;
+  }
+
+  /* Copy materialized-view content (fork).  SELECT * skips the hidden
+  ** bookkeeping columns, so the column list is spelled out from
+  ** table_xinfo -- identical text on both sides of the INSERT, so the
+  ** positional match is guaranteed by construction.  The vacuum-side
+  ** views were created empty above: their base tables had no rows yet,
+  ** and DBFLAG_Vacuum suppresses maintenance triggers, so this copy is
+  ** the single writer. */
+  rc = execSqlF(db, pzErrMsg,
+      "SELECT'INSERT INTO %s.'||quote(m.name)||'('||"
+      "(SELECT group_concat('\"'||replace(x.name,'\"','\"\"')||'\"')"
+      " FROM pragma_table_xinfo(m.name,%Q) AS x)"
+      "||')SELECT '||"
+      "(SELECT group_concat('\"'||replace(x.name,'\"','\"\"')||'\"')"
+      " FROM pragma_table_xinfo(m.name,%Q) AS x)"
+      "||' FROM \"%w\".'||quote(m.name)"
+      " FROM %s.sqlite_schema AS m WHERE m.type='mview'",
+      zDbVacuum, zDbMain, zDbMain, zDbMain, zDbVacuum
   );
   assert( (db->mDbFlags & DBFLAG_Vacuum)!=0 );
   db->mDbFlags &= ~DBFLAG_Vacuum;

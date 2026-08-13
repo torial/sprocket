@@ -58,6 +58,13 @@ Trigger *sqlite3TriggerList(Parse *pParse, Table *pTab){
   HashElem *p;              /* Loop variable for TEMP triggers */
 
   assert( pParse->disableTriggers==0 );
+#ifndef SQLITE_OMIT_VIEW
+  if( pTab->tabFlags & TF_MViewBase ){
+    /* fork: materialized views over this table maintain themselves
+    ** through synthesized triggers, built lazily on the first ask */
+    sqlite3MViewSynthTriggers(pParse, pTab);
+  }
+#endif
   pTmpSchema = pParse->db->aDb[1].pSchema;
   p = sqliteHashFirst(&pTmpSchema->trigHash);
   pList = pTab->pTrigger;
@@ -362,6 +369,13 @@ void sqlite3FinishTrigger(
     pTrig = 0;
   }else
 #endif
+  if( pParse->bMViewTrigSynth ){
+    /* fork: a synthesized materialized-view maintenance trigger is
+    ** handed back to its synthesizer -- no schema row, no trigHash
+    ** entry, no codegen.  It lives in the view's registry entry. */
+    pParse->pNewTrigger = pTrig;
+    pTrig = 0;
+  }else
 
   /* if we are not initializing,
   ** build the sqlite_schema entry
@@ -423,7 +437,8 @@ void sqlite3FinishTrigger(
 
 triggerfinish_cleanup:
   sqlite3DeleteTrigger(db, pTrig);
-  assert( IN_RENAME_OBJECT || !pParse->pNewTrigger );
+  assert( IN_RENAME_OBJECT || pParse->bMViewTrigSynth
+          || !pParse->pNewTrigger );
   sqlite3DeleteTriggerStep(db, pStepList);
 }
 
@@ -879,6 +894,13 @@ Trigger *sqlite3TriggersExist(
   int *pMask              /* OUT: Mask of TRIGGER_BEFORE|TRIGGER_AFTER */
 ){
   assert( pTab!=0 );
+#ifndef SQLITE_OMIT_VIEW
+  if( (pTab->tabFlags & TF_MViewBase)!=0 && !pParse->disableTriggers ){
+    /* fork: synthesize materialized-view maintenance triggers before
+    ** the no-triggers short-circuit below can conclude there are none */
+    sqlite3MViewSynthTriggers(pParse, pTab);
+  }
+#endif
   if( (pTab->pTrigger==0 && !tempTriggersExist(pParse->db))
    || pParse->disableTriggers
   ){
@@ -1293,6 +1315,9 @@ static TriggerPrg *codeRowTrigger(
   sSubParse.eTriggerOp = pTrigger->op;
   sSubParse.nQueryLoop = pParse->nQueryLoop;
   sSubParse.prepFlags = pParse->prepFlags;
+  /* fork: a synthesized maintenance program is the one writer a
+  ** materialized view accepts */
+  sSubParse.bMViewMaintProg = pTrigger->bMViewMaint;
   sSubParse.oldmask = 0;
   sSubParse.newmask = 0;
 

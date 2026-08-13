@@ -127,6 +127,7 @@ int sqlite3IsReadOnly(Parse *pParse, Table *pTab, Trigger *pTrigger){
   ** VACUUM, whose rebuild copies the view's content like a table's. */
   if( IsMView(pTab)
    && pParse->nested==0
+   && !pParse->bMViewMaintProg
    && sqlite3WritableSchema(pParse->db)==0
    && (pParse->db->mDbFlags & DBFLAG_Vacuum)==0
   ){

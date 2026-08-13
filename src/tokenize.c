@@ -753,7 +753,9 @@ int sqlite3RunParser(Parse *pParse, const char *zSql){
     */
     sqlite3DeleteTable(db, pParse->pNewTable);
   }
-  if( pParse->pNewTrigger && !IN_RENAME_OBJECT ){
+  if( pParse->pNewTrigger && !IN_RENAME_OBJECT
+   && !pParse->bMViewTrigSynth  /* fork: mview.c takes ownership */
+  ){
     sqlite3DeleteTrigger(db, pParse->pNewTrigger);
   }
   if( pParse->pVList ) sqlite3DbNNFreeNN(db, pParse->pVList);
