@@ -1,0 +1,112 @@
+# 2026-08-13
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-QUEUE Q0 -- the queued-write database mode.  THIS FILE IS
+# WRITTEN RED, ON PURPOSE, BEFORE THE FEATURE EXISTS: on first run the
+# pragmas below do not exist (SQLite ignores unknown pragmas silently,
+# so the expectations see {} where the contract demands an answer).
+#
+# Do not adjust an expectation here to make the suite pass.  If an
+# expectation is wrong, PLAN-QUEUE.md changes first, with the reason.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix queue1
+
+# --- healthy file: mode off, everything ordinary ---
+do_execsql_test 1.0 {
+  PRAGMA journal_mode=wal2;
+  CREATE TABLE t(a INTEGER, b TEXT);
+  INSERT INTO t VALUES(1,'one');
+} {wal2}
+do_execsql_test 1.1 {
+  PRAGMA queue_mode;
+} {0}
+do_execsql_test 1.2 {
+  PRAGMA queue_writer;
+} {0}
+
+# --- declaration, and what the other connection sees ---
+sqlite3 db2 test.db
+do_execsql_test 2.0 {
+  PRAGMA queue_writer=ON;
+} {1}
+do_execsql_test 2.1 {
+  PRAGMA queue_writer;
+} {1}
+do_test 2.2 {
+  db2 eval { PRAGMA queue_mode }
+} {1}
+do_test 2.3 {
+  catchsql { INSERT INTO t VALUES(2,'two') } db2
+} {1 {database is in queued-write mode; writes go through the queue owner (see PRAGMA queue_mode), or wait for the queue connection to close}}
+do_test 2.4 {
+  db2 eval { SELECT a, b FROM t ORDER BY a }
+} {1 one}
+# The declarant itself writes freely -- that is the whole point.
+do_execsql_test 2.5 {
+  INSERT INTO t VALUES(2,'two');
+  SELECT count(*) FROM t;
+} {2}
+
+# --- a second declarant coexists; the mode outlives the first ---
+do_test 3.0 {
+  db2 eval { PRAGMA queue_writer=ON }
+} {1}
+do_test 3.1 {
+  db2 eval { INSERT INTO t VALUES(3,'three'); SELECT count(*) FROM t }
+} {3}
+do_execsql_test 3.2 {
+  PRAGMA queue_writer=OFF;
+} {0}
+do_test 3.3 {
+  db2 eval { PRAGMA queue_mode }
+} {1}
+# ...and with the mode still held by db2, THIS connection is now the
+# outsider: refused with the same sentence.
+do_catchsql_test 3.4 {
+  INSERT INTO t VALUES(4,'four');
+} {1 {database is in queued-write mode; writes go through the queue owner (see PRAGMA queue_mode), or wait for the queue connection to close}}
+
+# --- release by close, not only by pragma: abandonment is impossible ---
+do_test 4.0 {
+  db2 close
+  execsql { PRAGMA queue_mode }
+} {0}
+do_execsql_test 4.1 {
+  INSERT INTO t VALUES(5,'five');
+  SELECT count(*) FROM t;
+} {4}
+
+# --- rollback-mode refusal: the substrate is the WAL shm, say so ---
+do_test 5.0 {
+  forcedelete rb.db
+  sqlite3 db3 rb.db
+  set r [catchsql { PRAGMA queue_writer=ON } db3]
+  db3 close
+  forcedelete rb.db
+  set r
+} {1 {queued-write mode requires WAL; set PRAGMA journal_mode=wal2 first}}
+
+# --- reads never gated: a reader while the mode is held ---
+sqlite3 db2 test.db
+do_execsql_test 6.0 {
+  PRAGMA queue_writer=ON;
+} {1}
+do_test 6.1 {
+  sqlite3 db4 test.db
+  set r [db4 eval { SELECT count(*) FROM t }]
+  db4 close
+  set r
+} {4}
+db2 close
+
+finish_test
