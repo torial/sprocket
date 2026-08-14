@@ -1,0 +1,13 @@
+{
+  "name": "sprocket-node",
+  "private": true,
+  "version": "0.1.0",
+  "description": "N-API addon under procgen's generated TypeScript client (PLAN-TSGEN); statically links the sprocket fork.",
+  "scripts": {
+    "build": "node-gyp rebuild"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^24.0.0"
+  }
+}

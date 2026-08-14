@@ -72,12 +72,16 @@ def main() -> int:
     with open(client, "w", newline="") as f:
         f.write(g1)
     shutil.copy(checks_src, os.path.join(work, "checks.ts"))
+    # ESM: nodenext treats .ts as CommonJS without this, which forbids
+    # the generated client's import.meta
+    with open(os.path.join(work, "package.json"), "w") as f:
+        f.write('{"type": "module"}\n')
     print(f"generated: {len(g1)} bytes, byte-identical on regen")
 
     # 2 -- the type layer must CHECK
     run([tsc, "--noEmit", "--strict", "--module", "nodenext",
          "--moduleResolution", "nodenext", "--target", "es2022",
-         "--types", "node",
+         "--types", "node", "--allowImportingTsExtensions",
          os.path.join(work, "client.ts"), os.path.join(work, "checks.ts")],
         cwd=addon_dir)
     print("tsc --strict: clean")

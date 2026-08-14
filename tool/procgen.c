@@ -503,6 +503,118 @@ static void pynestCtorArgs(Col *aCol, int nCol, ZNest *aN, int nN, int iSet){
   }
 }
 
+
+/* ---------------------------------------------------------------------
+** TypeScript emitter helpers (PLAN-TSGEN).  The client is typed
+** interfaces over the N-API addon (tool/napi), whose segments() has the
+** exact contract of the Python runtime's _segments -- the two clients
+** differ in language, never in semantics.  INTEGER types as
+** `number | bigint`: the addon returns BigInt past 2^53-1 because a
+** double cannot hold 2^60, and the type must say so.
+** --------------------------------------------------------------------- */
+static const char *tsTypeName(CType t){
+  switch( t ){
+    case T_INT:  return "number | bigint";
+    case T_REAL: return "number";
+    case T_TEXT: return "string";
+    case T_BLOB: return "Uint8Array";
+    default:     return "unknown";
+  }
+}
+
+static int tsKeyword(const char *z){
+  static const char *azKw[] = {
+    "break","case","catch","class","const","continue","debugger","default",
+    "delete","do","else","enum","export","extends","false","finally","for",
+    "function","if","import","in","instanceof","new","null","return","super",
+    "switch","this","throw","true","try","typeof","var","void","while","with",
+    "let","static","yield","await","implements","interface","package",
+    "private","protected","public",
+    /* names the generated scope already owns: */
+    "connect","Db","ProcError","SqlValue","db","undefined"
+  };
+  int i;
+  for(i=0; i<(int)(sizeof(azKw)/sizeof(azKw[0])); i++){
+    if( strcmp(z, azKw[i])==0 ) return 1;
+  }
+  return 0;
+}
+static void emitTsIdentBuf(char *zBuf, int nBuf, const char *z){
+  int i, j = 0;
+  if( z==0 || z[0]==0 ){ sqlite3_snprintf(nBuf, zBuf, "_"); return; }
+  if( isdigit((unsigned char)z[0]) && j<nBuf-1 ) zBuf[j++] = '_';
+  for(i=0; z[i] && j<nBuf-2; i++){
+    unsigned char c = (unsigned char)z[i];
+    zBuf[j++] = (isalnum(c) || c=='_') ? (char)c : '_';
+  }
+  zBuf[j] = 0;
+  if( tsKeyword(zBuf) && j<nBuf-2 ){ zBuf[j] = '_'; zBuf[j+1] = 0; }
+}
+static void emitTsIdent(const char *z){
+  char zBuf[128];
+  emitTsIdentBuf(zBuf, sizeof(zBuf), z);
+  fputs(zBuf, out);
+}
+static void emitTsCap(const char *z){
+  char zBuf[128];
+  emitTsIdentBuf(zBuf, sizeof(zBuf), z);
+  if( zBuf[0]>='a' && zBuf[0]<='z' ) zBuf[0] = (char)(zBuf[0]-'a'+'A');
+  fputs(zBuf, out);
+}
+
+/* Interfaces, POST-ORDER so every Child[] names one declared above. */
+static void tsnestStructs(Col *aCol, int nCol, ZNest *aN, int nN,
+                          const char *zProc, int iSet){
+  int k, i;
+  for(k=0; k<nN; k++){
+    if( aN[k].iParentSet!=iSet ) continue;
+    tsnestStructs(aCol, nCol, aN, nN, zProc, aN[k].iSet);
+    fputs("export interface ", out);
+    emitTsCap(zProc); emitTsCap(aN[k].zCol);
+    fputs(" {\n", out);
+    for(i=0; i<nCol; i++){
+      if( aCol[i].iSet!=aN[k].iSet ) continue;
+      fputs("  ", out); emitTsIdent(aCol[i].zName);
+      if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+        fprintf(out, ": %s | null;\n", tsTypeName(typeOf(aCol[i].zDecl)));
+      }else{
+        fputs(": ", out); emitTsCap(zProc); emitTsCap(aCol[i].zName);
+        fputs("[];\n", out);
+      }
+    }
+    fputs("}\n\n", out);
+  }
+}
+
+/* Object-literal members for one set's rows: value columns read from
+** the row record by RAW name with a narrowing assertion, nested members
+** looked up in the child bucket keyed by this set's parent-key column. */
+static void tsnestCtorArgs(Col *aCol, int nCol, ZNest *aN, int nN, int iSet){
+  int i, nSeen = 0;
+  for(i=0; i<nCol; i++){
+    if( aCol[i].iSet!=iSet ) continue;
+    if( nSeen++ ) fputs(", ", out);
+    emitTsIdent(aCol[i].zName); fputs(": ", out);
+    if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+      fputs("_r[", out); emitPyStr(aCol[i].zName);
+      fprintf(out, "] as %s | null", tsTypeName(typeOf(aCol[i].zDecl)));
+    }else{
+      int j;
+      for(j=0; j<nN; j++){
+        if( aN[j].iParentSet==iSet
+         && sqlite3_stricmp(aN[j].zCol, aCol[i].zName)==0 ) break;
+      }
+      if( j<nN ){
+        fprintf(out, "_b%d.get(_r[", aN[j].iSet);
+        emitPyStr(aN[j].zKParent);
+        fputs("]) ?? []", out);
+      }else{
+        fputs("[]", out);   /* unreachable; see pynestCtorArgs */
+      }
+    }
+  }
+}
+
 int main(int argc, char **argv){
   sqlite3 *db = 0;
   sqlite3_stmt *pList = 0;
@@ -520,27 +632,27 @@ int main(int argc, char **argv){
     for(a=1; a<argc; a++){
       if( strcmp(argv[a], "--lang")==0 ){
         if( a+1>=argc ){
-          fprintf(stderr, "procgen: --lang needs a value (c, zebra, or python)\n");
+          fprintf(stderr, "procgen: --lang needs a value (c, zebra, python, or ts)\n");
           return 1;
         }
         zLang = argv[++a];
       }else if( argv[a][0]=='-' ){
         fprintf(stderr, "procgen: unknown option %s\n"
-                        "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n",
+                        "usage: procgen [--lang c|zebra|python|ts] DATABASE [> out.h]\n",
                         argv[a]);
         return 1;
       }else if( zDb==0 ){
         zDb = argv[a];
       }else{
         fprintf(stderr, "procgen: unexpected argument %s (database is %s)\n"
-                        "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n",
+                        "usage: procgen [--lang c|zebra|python|ts] DATABASE [> out.h]\n",
                         argv[a], zDb);
         return 1;
       }
     }
   }
   if( zDb==0 ){
-    fprintf(stderr, "usage: procgen [--lang c|zebra|python] DATABASE [> out.h]\n");
+    fprintf(stderr, "usage: procgen [--lang c|zebra|python|ts] DATABASE [> out.h]\n");
     return 1;
   }
 #ifdef _WIN32
@@ -710,6 +822,49 @@ int main(int argc, char **argv){
       "def connect(db_path: str, dll_path: str) -> Db:\n"
       "    return Db(db_path, dll_path)\n"
       "\n\n", out);
+  }else if( strcmp(zLang, "ts")==0 ){
+    fprintf(out,
+      "// GENERATED by tool/procgen.c from \"%s\" -- do not edit.\n"
+      "// Regenerating an unchanged schema produces byte-identical output, so a\n"
+      "// diff here means the database's procedure contract actually moved.\n"
+      "//\n"
+      "// Runs on Node over the N-API addon (tool/napi), which statically\n"
+      "// links the fork -- stock SQLite cannot execute CALL, so a\n"
+      "// self-contained substrate is the only spelling that does not lie\n"
+      "// about its requirements.  Dependencies are ARGUMENTS:\n"
+      "// connect(dbPath, addonPath).  Nothing is discovered from ambient\n"
+      "// state.\n"
+      "\n"
+      "import { createRequire } from \"node:module\";\n"
+      "\n"
+      "export type SqlValue = number | bigint | string | Uint8Array | null;\n"
+      "type Row = Record<string, SqlValue>;\n"
+      "interface Addon {\n"
+      "  open(path: string): unknown;\n"
+      "  close(h: unknown): void;\n"
+      "  segments(h: unknown, sql: string, params?: unknown[]): Row[][];\n"
+      "}\n"
+      "\n"
+      "export class ProcError extends Error {}\n"
+      "\n"
+      "export class Db {\n"
+      "  private h: unknown;\n"
+      "  private addon: Addon;\n"
+      "  constructor(dbPath: string, addonPath: string) {\n"
+      "    const req = createRequire(import.meta.url);\n"
+      "    this.addon = req(addonPath) as Addon;\n"
+      "    this.h = this.addon.open(dbPath);\n"
+      "  }\n"
+      "  _segments(sql: string, params: unknown[] = []): Row[][] {\n"
+      "    return this.addon.segments(this.h, sql, params);\n"
+      "  }\n"
+      "  close(): void { this.addon.close(this.h); }\n"
+      "}\n"
+      "\n"
+      "export function connect(dbPath: string, addonPath: string): Db {\n"
+      "  return new Db(dbPath, addonPath);\n"
+      "}\n"
+      "\n", zDb);
   }else if( strcmp(zLang, "zebra")==0 ){
     fprintf(out,
       "# GENERATED by tool/procgen.c from \"%s\" -- do not edit.\n"
@@ -940,6 +1095,134 @@ int main(int argc, char **argv){
     ** bucket-based (see pynestStructs above).  Only shape 1 is emitted,
     ** as in the other emitters.
     ** --------------------------------------------------------------------- */
+    if( strcmp(zLang, "ts")==0 ){
+      ZNest aNest[32];
+      int nNest = 0, iN;
+      int nEmitted = 0, bDeep = 0;
+      sqlite3_stmt *pNest = 0;
+      if( sqlite3_prepare_v2(db,
+            "SELECT resultset_index, \"column\", key_child, key_parent"
+            "  FROM pragma_proc_nested(?1) ORDER BY resultset_index",
+            -1, &pNest, 0)!=SQLITE_OK ){
+        die("prepare proc_nested", db);
+      }
+      sqlite3_bind_text(pNest, 1, zProc, -1, SQLITE_TRANSIENT);
+      while( sqlite3_step(pNest)==SQLITE_ROW && nNest<32 ){
+        aNest[nNest].iSet     = sqlite3_column_int(pNest, 0);
+        aNest[nNest].iParentSet = 0;
+        aNest[nNest].zCol     = sqlite3_mprintf("%s", sqlite3_column_text(pNest,1));
+        aNest[nNest].zKChild  = sqlite3_mprintf("%s", sqlite3_column_text(pNest,2));
+        aNest[nNest].zKParent = sqlite3_mprintf("%s", sqlite3_column_text(pNest,3));
+        nNest++;
+      }
+      sqlite3_finalize(pNest);
+      znestAssign(aCol, nCol, aNest, nNest, 1, 0);
+      for(iN=0; iN<nNest; iN++){
+        if( aNest[iN].iParentSet>1 ) bDeep = 1;
+      }
+
+      fprintf(out, "// ---- procedure %s ----\n", zProc);
+      tsnestStructs(aCol, nCol, aNest, nNest, zProc, 1);
+
+      fputs("export interface ", out); emitTsCap(zProc); fputs("Row {\n", out);
+      for(i=0; i<nCol; i++){
+        if( aCol[i].iSet!=1 ) continue;
+        fputs("  ", out); emitTsIdent(aCol[i].zName);
+        if( aCol[i].zDecl && aCol[i].zDecl[0] ){
+          fprintf(out, ": %s | null;\n", tsTypeName(typeOf(aCol[i].zDecl)));
+        }else{
+          fputs(": ", out); emitTsCap(zProc); emitTsCap(aCol[i].zName);
+          fputs("[];\n", out);
+        }
+        nEmitted++;
+      }
+      if( nEmitted==0 ){
+        fputs("  _empty?: null;\n", out);       /* RETURNS NOTHING */
+      }
+      fputs("}\n\n", out);
+
+      fputs("export function ", out); emitTsIdent(zProc); fputs("(db: Db", out);
+      for(i=0; i<nCol; i++){
+        if( aCol[i].iSet!=0 ) continue;
+        fputs(", ", out); emitTsIdent(aCol[i].zName);
+        fprintf(out, ": %s | null", tsTypeName(typeOf(aCol[i].zDecl)));
+      }
+      fputs("): ", out); emitTsCap(zProc); fputs("Row[] {\n", out);
+
+      fprintf(out, "  const _segs = db._segments(\"CALL %s(", zProc);
+      for(i=0; i<nParam; i++) fprintf(out, "%s?", i?",":"");
+      fputs(")", out);
+      if( nNest && !bDeep ){
+        int nSeen = 0;
+        fputs(" RETURNING ", out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=1 ) continue;
+          if( aCol[i].zDecl==0 || aCol[i].zDecl[0]==0 ) continue;
+          if( nSeen++ ) fputs(", ", out);
+          emitIdent(aCol[i].zName);
+        }
+      }else if( nNest ){
+        fputs(" RETURNING *", out);
+      }
+      fputs("\"", out);
+      if( nParam>0 ){
+        int nSeen = 0;
+        fputs(", [", out);
+        for(i=0; i<nCol; i++){
+          if( aCol[i].iSet!=0 ) continue;
+          if( nSeen++ ) fputs(", ", out);
+          emitTsIdent(aCol[i].zName);
+        }
+        fputc(']', out);
+      }
+      fputs(");\n", out);
+
+      if( nSet>0 ){
+        fputs("  if (_segs.length !== ", out);
+        fprintf(out, "%d) {\n", nSet);
+        fprintf(out,
+          "    throw new ProcError(`%s: expected %d segments, "
+          "got ${_segs.length}`);\n", zProc, nSet);
+        fputs("  }\n", out);
+      }else{
+        fputs("  return [];\n}\n\n", out);      /* RETURNS NOTHING */
+        goto ts_done;
+      }
+
+      /* Buckets, deepest first: pre-order set numbering guarantees every
+      ** child bucket exists before the set that consumes it. */
+      for(iN=nNest-1; iN>=0; iN--){
+        fprintf(out, "  const _b%d = new Map<SqlValue, ", aNest[iN].iSet);
+        emitTsCap(zProc); emitTsCap(aNest[iN].zCol);
+        fputs("[]>();\n", out);
+        fprintf(out, "  for (const _r of _segs[%d]) {\n", aNest[iN].iSet-1);
+        fputs("    const _k = _r[", out); emitPyStr(aNest[iN].zKChild);
+        fputs("];\n", out);
+        fprintf(out, "    let _a = _b%d.get(_k);\n", aNest[iN].iSet);
+        fprintf(out,
+          "    if (_a === undefined) { _a = []; _b%d.set(_k, _a); }\n",
+          aNest[iN].iSet);
+        fputs("    _a.push({ ", out);
+        tsnestCtorArgs(aCol, nCol, aNest, nNest, aNest[iN].iSet);
+        fputs(" });\n  }\n", out);
+      }
+      fputs("  const _out: ", out); emitTsCap(zProc);
+      fputs("Row[] = [];\n", out);
+      fputs("  for (const _r of _segs[0]) {\n    _out.push({ ", out);
+      tsnestCtorArgs(aCol, nCol, aNest, nNest, 1);
+      fputs(" });\n  }\n  return _out;\n}\n\n", out);
+
+ts_done:
+      for(iN=0; iN<nNest; iN++){
+        sqlite3_free(aNest[iN].zCol);
+        sqlite3_free(aNest[iN].zKChild);
+        sqlite3_free(aNest[iN].zKParent);
+      }
+      for(i=0; i<nCol; i++){ sqlite3_free(aCol[i].zName); sqlite3_free(aCol[i].zDecl); }
+      free(aCol);
+      continue;
+    }
+
     if( strcmp(zLang, "python")==0 ){
       ZNest aNest[32];
       int nNest = 0, iN;
@@ -1189,7 +1472,9 @@ python_done:
   sqlite3_finalize(pList);
   sqlite3_close(db);
 
-  if( strcmp(zLang, "zebra")!=0 ){
+  if( strcmp(zLang, "c")==0 ){
+    /* The C header guard.  Python tolerated it as a comment for a
+    ** while; TypeScript rightly refused (TS18016). */
     fputs("#endif /* PROCGEN_CLIENT_H */\n", out);
   }
   return 0;

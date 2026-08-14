@@ -1,0 +1,6 @@
+node_modules/
+build/
+tstest_work/
+npmi.log
+gyp.log
+package-lock.json
