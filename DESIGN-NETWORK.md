@@ -194,6 +194,82 @@ Two consequences worth carrying forward:
 wal2 does **not** provide concurrent writers. It bounds space and tail latency,
 not throughput. Multiple writers remain `BEGIN CONCURRENT`'s job.
 
+### 1a. The queue, designed — *sketch of 2026-08-13, decisions with reasons*
+
+*From a design conversation with Sean; recorded before any transport code
+exists so the build starts from rulings, not re-derivation.  The theme:
+v1 is deliberately simple, and every deferred sophistication sits behind
+an interface that does not change when it arrives.*
+
+**v1 drains per-item: each queue item runs in its own BEGIN
+IMMEDIATE/COMMIT.**  This dissolves batch failure coupling — item 7's
+constraint violation rolls back item 7 and reports to waiter 7; no
+savepoint choreography, no error-attribution machinery.  The classic
+objection (one fsync per item) mostly does not apply at our settings:
+in WAL with `synchronous=NORMAL`, COMMIT is a WAL append, not an fsync.
+The batched drain (savepoint per item, one commit per batch) is the
+recorded v2, adopted only if measured commit overhead demands it — and
+it is invisible to callers, because the queue's interface is "submit an
+item, await its result" under either strategy.
+
+**Requests are synchronous, one in flight per connection.**  A
+connection submits and blocks; it physically cannot enqueue a second.
+Consequences, all free: queue depth is bounded by connection count,
+each connection's writes apply in order, and backpressure is built in.
+Pipelining and async submission are later versions, noted and not
+designed here.
+
+**The work unit is closed — a CALL, not a conversation.**  An open
+`BEGIN … think … COMMIT` would hold the singleton writer hostage and
+never enters the queue.  Procedures-as-API (part 3) is what makes this
+constraint nearly free: the fork already has the closed unit.
+
+**Queue discipline is a DATABASE mode, not connection courtesy**
+(Sean's requirement, 2026-08-13): while any queue-writer connection has
+the database, interactive write transactions on it are refused with the
+reason and the fix, and the mode releases when the last queue
+connection closes.  Transport-level policy cannot enforce this — an
+out-of-band CLI writes straight to the file — so honest enforcement is
+engine-level, and the fork already owns the exact choke point: the
+runtime write gate at OP_Transaction built for degrade-at-load
+(DOCKET #9).  The natural home for the cross-process flag is the
+shm/wal-index region, which is visible to every connection of the file
+and vanishes with the last one — giving "until the queue connections
+close" and crash-recovery semantics by construction rather than by
+bookkeeping.  Candidate spelling: a `queue_writer` declaration on the
+transport's connections plus the gate refusing other writers while any
+declarant lives.  This is the one piece of the queue that is engine
+work; it is small, and it belongs to the transport campaign, not to
+this sketch.
+
+**Priorities, when they come, reorder only the waiting line.**  A
+priority lane protects high-priority p99 under load, but no priority
+shortens the item currently executing — head-of-line blocking is a
+property of the running item.  So priority ships only alongside a bound
+on item duration (chunk large deletes/updates; procs make a
+bounded-transaction loop natural) and aging so low priority cannot
+starve.  v1 is FIFO.
+
+**Nothing is acknowledged before its durability point.**  The waiter
+unblocks when its item's COMMIT returns (v1) or its batch's commit
+returns (v2).  A crash loses only work nobody was told succeeded.
+
+**The truth surface ships with v1, not after it**: queue depth (how
+many connections are blocked on writes now), oldest waiter age (the
+head-of-line detector — alarm on this, not on depth), last commit
+latency and checkpoint lag (is it us or the storage), and, once
+batching exists, last batch size (is the amortization real).  Served
+where the operator already looks — pragma-style through the transport.
+
+**Relation to BEGIN CONCURRENT**: this design is the pre-registered
+position of DOCKET 5b.  The queue delivers the batching benefit with
+zero engine changes and no conflict semantics; BC only pays when
+multiple OS processes need long concurrent write transactions against
+one file, and eager IVM's write amplification makes BC's page-level
+optimism a conflict magnet on precisely this fork's databases.  If the
+queue ships and no such multi-process demand appears, BC is never
+taken.
+
 ### 2. Shard-per-tenant with key routing — *application, no engine change*
 
 One database file per tenant/customer/room. Writer contention disappears

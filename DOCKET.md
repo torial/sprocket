@@ -1634,6 +1634,20 @@ Multiple optimistic writers with page-level conflict detection. Also current
 and mergeable, but it changes what group commit should look like, so it belongs
 to the Phase 5 design conversation rather than to this one.
 
+**Pre-registered position, 2026-08-13** (design conversation with Sean;
+sketch at DESIGN-NETWORK.md §1a): the group-commit write queue likely
+makes BC permanently unnecessary for this fork.  Three legs: (1) BC
+isolates poorly — its page-read tracking is cross-cutting through
+btree/pager/wal with no narrow seam, and both BC and wal2 modify
+`wal.c`, so carrying the pair means hand-owning a merge upstream
+abandoned in 2019; (2) eager IVM write-amplifies onto shared view and
+index pages, turning BC's page-level optimism into a retry storm on
+exactly this fork's databases; (3) the queue delivers write batching
+with zero engine change, and BC only pays when multiple OS processes
+need long concurrent write transactions on one file — a demand no
+current consumer has.  Decision stays open until Phase 5, but the
+default is now NO unless that demand materializes.
+
 ## 6. System-versioned temporal tables — *SQLite has no story here at all*
 
 SQL:2011 `AS OF` / `FOR SYSTEM_TIME`. Every row carries a validity interval;
