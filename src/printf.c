@@ -1517,6 +1517,24 @@ static void renderLogMsg(int iErrCode, const char *zFormat, va_list ap){
                            sqlite3StrAccumFinish(&acc));
 }
 
+#ifndef SQLITE_OMIT_DEFAULT_LOG
+/*
+** Fork (UNGIT): the default destination for sqlite3_log when no
+** callback is registered.  Upstream DISCARDS these messages, and they
+** are precisely the reports that have no connection to land on --
+** "API called with NULL prepared statement", corruption notices,
+** unraveling WAL recoveries.  A truth the library holds must be
+** visible where the user already looks; stderr is that place for a
+** process that never subscribed.  Register any callback (including a
+** no-op) to take ownership of the channel; define
+** SQLITE_OMIT_DEFAULT_LOG for stdio-less platforms.
+*/
+static void sqlite3DefaultLog(void *pArg, int iErrCode, const char *zMsg){
+  (void)pArg;
+  fprintf(stderr, "sqlite3 log (%d): %s\n", iErrCode, zMsg);
+}
+#endif
+
 /*
 ** Format and write a message to the log if logging is enabled.
 */
@@ -1527,6 +1545,17 @@ void sqlite3_log(int iErrCode, const char *zFormat, ...){
     renderLogMsg(iErrCode, zFormat, ap);
     va_end(ap);
   }
+#ifndef SQLITE_OMIT_DEFAULT_LOG
+  else{
+    StrAccum acc;
+    char zMsg[SQLITE_MAX_LOG_MESSAGE];
+    sqlite3StrAccumInit(&acc, 0, zMsg, sizeof(zMsg), 0);
+    va_start(ap, zFormat);
+    sqlite3_str_vappendf(&acc, zFormat, ap);
+    va_end(ap);
+    sqlite3DefaultLog(0, iErrCode, sqlite3StrAccumFinish(&acc));
+  }
+#endif
 }
 
 #if defined(SQLITE_DEBUG) || defined(SQLITE_HAVE_OS_TRACE)
