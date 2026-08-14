@@ -177,8 +177,16 @@ wins.
 
 ## 3. Nested result shapes — *MetaKit's idea, and an open design question*
 
-**Status: designed. Three POCs and eight rulings; implementation planned in
-`PLAN-NESTED.md` (seven phases, tests written first). Not yet built.**
+**Status: BUILT — and this line was stale long enough to mislead a
+ledger (caught 2026-08-13).** PLAN-NESTED phases 1–6 DONE by 2026-08-05;
+depth ≥ 2 landed via PLAN-DEPTH (COMPLETE 2026-08-08, procdeep 19/19,
+Mosaic depth-2 typed client reproducing the case study); projection
+executed via PLAN-PROJECTION (2026-08-11); 3i/3f/3e followed 2026-08-12.
+`procgen` recurses depth-N and emits C, Zebra, and Python.  Still open
+in this family: 3h (interleaved segments — napkin only, the one design
+that gets both laziness and one round trip) and the balanced-
+misattribution checksum (recorded as a separate feature).  The original
+design record follows.
 
 ### The problem it solves
 
