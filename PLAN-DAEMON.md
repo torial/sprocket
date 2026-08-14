@@ -74,11 +74,20 @@ inspection.*
 - **D4 — gates**: the full self-test matrix green; fork sweep
   unaffected (the daemon is tool-only — the engine does not change in
   this campaign); the matrix run on Linux via the WSL path.
-- **D5 — the consumer leg**: what Graze actually calls.  Scoped after
-  D4 against `zebra-sprocket`'s current client shape — the in-process
-  FFI client remains right for Graze-as-server; the wire client's
-  first consumer may be tooling/tests rather than Graze itself.
-  Decide with the artifact in view, not from memory.
+- **D5 — the consumer leg — RESOLVED 2026-08-14, artifact in view.**
+  Read `graze/mosaicclient.zbr` and `zebra-sprocket/generated_atlas.zbr`
+  before deciding: Graze consumes generated typed clients over
+  in-process FFI (`d.query_segments("CALL ...")`, client-side stitch),
+  and since Graze IS a server that shape is architecturally right, not
+  a stopgap — it keeps it.  The daemon's consumers are out-of-process
+  tooling and the future TypeScript story (N-API local / wire browser,
+  DOCKET #2's sequencing).  The "visible log channel by default"
+  ruling (Sean, same day) landed in the ENGINE (`printf.c`:
+  `sqlite3_log` -> stderr when unregistered), so every consumer —
+  Graze's DLL, Python's ctypes, sprocketd, any future embedder —
+  inherits it with zero client changes; that engine default IS this
+  phase's deliverable, placed one layer down from where the plan
+  guessed it would live.
 
 ## The self-test matrix (D0, written before the daemon exists)
 

@@ -102,6 +102,15 @@ every result against the same CALL issued by hand.
 
 ## Semantics worth knowing
 
+- **`sqlite3_log` prints to stderr by default** (fork-wide behavior,
+  2026-08-14).  Upstream discards log messages until a callback is
+  registered — and they are precisely the reports with no connection to
+  land on: "API called with NULL prepared statement", corruption
+  notices, WAL recovery events.  Every embedder of this fork — the CLI,
+  the DLL through any FFI, your own C — sees them without setup.
+  Register any callback (a no-op included) to take ownership of the
+  channel; build with `SQLITE_OMIT_DEFAULT_LOG` for stdio-less
+  platforms.
 - **Name resolution**: inside body statements, columns shadow
   parameters/variables. A bare identifier is a column wherever a column by
   that name is in scope, otherwise a variable. (Same practical rule as MySQL;
