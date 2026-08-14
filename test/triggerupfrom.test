@@ -86,10 +86,12 @@ do_execsql_test 2.3 {
 
 db close
 sqlite3 db ""
+# Fork (DOCKET #9 degrade-at-load): the cross-database trigger dead-marks
+# at ATTACH-load instead of refusing the file; the SELECT sees the data.
 do_catchsql_test 2.4 {
   ATTACH 'test.db' AS yyy;
   SELECT * FROM t1;
-} {1 {malformed database schema (tr3) - trigger tr3 cannot reference objects in database main}}
+} {0 {1 two one 3 {} three 4 {} four 5 {} {} 10 y {} 20 y {}}}
 
 #-------------------------------------------------------------------------
 reset_db

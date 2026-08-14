@@ -88,6 +88,24 @@ successors' files.
   gate stands down, schema surgery can remove the dead rows, and the
   next open is healthy.  The spec pins the full repair story.
 
+## Post-campaign corrections (2026-08-14, found by the QUEUE campaign's veryquick)
+
+- **The 41-suite sweep was too narrow a gate for this campaign, and the
+  full price arrived a day late.**  veryquick's corrupt2/corruptL/
+  corruptM/triggerupfrom pin the OLD whole-file refusal on object-level
+  schema corruption — 15 legs — and degrade shipped without running
+  them.  All 15 are the ruled posture working as decided ("genuinely
+  corrupt files announce themselves through integrity_check and the
+  dead_list rather than through a refusal to open"); they are re-pinned
+  with fork annotations.  The lesson is recorded here so the next
+  loader-touching campaign runs veryquick BEFORE claiming inertness.
+- **Empty retained reasons, fixed.**  Upstream signals "the schema row
+  and its CREATE statement disagree" with a deliberately EMPTY error
+  message (build.c's two `sqlite3ErrorMsg(pParse,"")` sites), leaving
+  the words to corruptSchema.  The degrade path retained "" verbatim —
+  `unusable in this build ()` — an empty reading as an answer.  The
+  loader now spells the condition; corruptM-131/171 pin it.
+
 ## Phases
 
 *All four EXECUTED 2026-08-13, one session.  Receipts: degrade1 0/20;

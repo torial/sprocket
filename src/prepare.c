@@ -257,7 +257,17 @@ int sqlite3InitCallback(void *pInit, int argc, char **argv, char **NotUsed){
         ** user is present to receive it, and nothing broken persists.
         ** Structural damage (bad rootpages, orphan indexes, a corrupt
         ** schema table) keeps the old hard-failure paths below. */
-        sqlite3DeadMark(db, iDb, argv[1], argv[0], sqlite3_errmsg(db));
+        const char *zReason = sqlite3_errmsg(db);
+        if( zReason==0 || zReason[0]==0 ){
+          /* Upstream's init-time checks signal "the schema row and its
+          ** CREATE statement disagree" with a deliberately EMPTY error
+          ** message, leaving the words to corruptSchema (build.c, both
+          ** sqlite3ErrorMsg(pParse,"") sites).  Retaining "" would make
+          ** the dead_list read as if no reason existed; spell the
+          ** condition instead.  (corruptM-131/171 caught this.) */
+          zReason = "schema row disagrees with its CREATE statement";
+        }
+        sqlite3DeadMark(db, iDb, argv[1], argv[0], zReason);
       }else{
         corruptSchema(pData, argv, sqlite3_errmsg(db));
       }

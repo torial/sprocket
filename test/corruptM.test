@@ -18,6 +18,11 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 set testprefix corruptM
 
+# Fork (DOCKET #9 degrade-at-load): object-level schema corruption now
+# dead-marks and the file OPENS -- reads work, dead names refuse with the
+# retained reason, writes are gated file-wide.  Every catchsql expectation
+# below is re-pinned from the old whole-file refusal to that contract.
+
 # These tests deal with corrupt database files
 #
 database_may_be_corrupt
@@ -52,7 +57,7 @@ do_test corruptM-102 {
   open_db2_and_catchsql {
     PRAGMA quick_check;
   }
-} {1 {malformed database schema (t1)}}
+} {0 ok}
 
 do_execsql_test corruptM-110 {
   UPDATE sqlite_master SET tbl_name='tx' WHERE name='t1';
@@ -62,7 +67,7 @@ do_test corruptM-111 {
   open_db2_and_catchsql {
     PRAGMA quick_check;
   }
-} {1 {malformed database schema (t1)}}
+} {0 ok}
 do_execsql_test corruptM-112 {
   UPDATE sqlite_master SET tbl_name='t1', type='tabl' WHERE name='t1';
   SELECT type, name, tbl_name, '|' FROM sqlite_master;
@@ -71,7 +76,7 @@ do_test corruptM-113 {
   open_db2_and_catchsql {
     PRAGMA quick_check;
   }
-} {1 {malformed database schema (t1)}}
+} {0 ok}
 do_execsql_test corruptM-114 {
   UPDATE sqlite_master SET tbl_name='t9',type='table',name='t9'WHERE name='t1';
   SELECT type, name, tbl_name, '|' FROM sqlite_master;
@@ -80,7 +85,7 @@ do_test corruptM-114 {
   open_db2_and_catchsql {
     PRAGMA quick_check;
   }
-} {1 {malformed database schema (t9)}}
+} {0 ok}
 
 do_execsql_test corruptM-120 {
   UPDATE sqlite_master SET name='t1',tbl_name='T1' WHERE name='t9';
@@ -102,7 +107,7 @@ do_test corruptM-131 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (t1)}}
+} {1 {t1 is present but unusable in this build (schema row disagrees with its CREATE statement); a newer build can use or remove it}}
 
 do_execsql_test corruptM-140 {
   UPDATE sqlite_master SET type='table', tbl_name='t1' WHERE name='t1';
@@ -114,7 +119,7 @@ do_test corruptM-141 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (i1)}}
+} {0 {ok 111 222 333 15 22}}
 
 do_execsql_test corruptM-150 {
   UPDATE sqlite_master SET type='table', tbl_name='t1' WHERE name='i1';
@@ -125,7 +130,7 @@ do_test corruptM-151 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (i1)}}
+} {0 {ok 111 222 333 15 22}}
 
 do_execsql_test corruptM-160 {
   UPDATE sqlite_master SET type='view', tbl_name='t1' WHERE name='i1';
@@ -136,7 +141,7 @@ do_test corruptM-161 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (i1)}}
+} {0 {ok 111 222 333 15 22}}
 
 do_execsql_test corruptM-170 {
   UPDATE sqlite_master SET type='index', tbl_name='t1' WHERE name='i1';
@@ -148,7 +153,7 @@ do_test corruptM-171 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (v2)}}
+} {1 {v2 is present but unusable in this build (schema row disagrees with its CREATE statement); a newer build can use or remove it}}
 
 do_execsql_test corruptM-180 {
   UPDATE sqlite_master SET type='view',name='v3',tbl_name='v3' WHERE name='v2';
@@ -159,7 +164,7 @@ do_test corruptM-181 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (v3)}}
+} {1 {no such table: v2}}
 
 do_execsql_test corruptM-190 {
   UPDATE sqlite_master SET type='view',name='v2',tbl_name='v2' WHERE name='v3';
@@ -171,7 +176,7 @@ do_test corruptM-191 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (r1)}}
+} {0 {ok 111 222 333 15 22}}
 do_execsql_test corruptM-192 {
   UPDATE sqlite_master SET type='trigger',tbl_name='v2' WHERE name='r1';
   SELECT type, name, tbl_name, '|' FROM sqlite_master;
@@ -181,6 +186,6 @@ do_test corruptM-193 {
     PRAGMA quick_check;
     SELECT * FROM t1, v2;
   }
-} {1 {malformed database schema (r1)}}
+} {0 {ok 111 222 333 15 22}}
 
 finish_test

@@ -149,7 +149,7 @@ do_test corrupt2-2.1 {
     $::presql
     SELECT * FROM sqlite_master;
   " db2
-} {1 {malformed database schema (a3) - index a3 already exists}}
+} {0 {table abc abc 2 {CREATE TABLE abc(a, b, c)} index a3 abc 3 {CREATE INDEX a3 ON abc(a)} index a3 abc 4 {CREATE INDEX a3 ON abc(b)}}}
 
 db2 close
 

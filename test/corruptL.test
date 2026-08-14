@@ -637,7 +637,7 @@ do_catchsql_test 6.1 {
     INSERT INTO t1(b) VALUES(1);
     INSERT INTO t1(b) VALUES(2);
   COMMIT;
-} {1 {malformed database schema (t1b) - invalid rootpage}}
+} {1 {database contains objects this build cannot maintain (see PRAGMA dead_list); writes are disabled to protect them}}
 
 #-------------------------------------------------------------------------
 reset_db
@@ -728,9 +728,14 @@ do_test 7.0 {
 | end crash-8391315d75edff.db
 }]} {}
 
-do_catchsql_test 7.1 {
-  SELECT * FROM sqlite_master;
-} {1 {malformed database schema (t1x1) - invalid rootpage}}
+# Fork (DOCKET #9 degrade-at-load): the invalid-rootpage index dead-marks
+# and the file OPENS; the old whole-file refusal is gone.  The stored SQL
+# in this fixture carries CRLF line breaks that a brace expectation cannot
+# hold (tcl source-translation strips them), so the leg pins the listing's
+# shape instead of its text.
+do_test 7.1 {
+  catchsql { SELECT type, name FROM sqlite_master; }
+} {0 {table t1 index t1abc index t1x1 table t2 view v1}}
 
 #-------------------------------------------------------------------------
 reset_db
