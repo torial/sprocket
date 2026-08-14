@@ -335,6 +335,17 @@ static int sdExecCall(sqlite3 *db, const unsigned char *aReq, int nReq,
     sqlite3_snprintf(nErr, zErr, "%s", sqlite3_errmsg(db));
     return rc;
   }
+  if( pStmt==0 ){
+    /* prepare("") and prepare of pure whitespace return SQLITE_OK with
+    ** a NULL statement -- upstream contract, load-bearing for
+    ** multi-statement iteration.  Left unchecked, the binds below
+    ** would MISUSE while sqlite3_errmsg still said "not an error"
+    ** (the accurate message goes to sqlite3_log, which sdLogTo routes
+    ** to stderr).  Name the condition where it is born instead. */
+    sqlite3_snprintf(nErr, zErr,
+        "generated CALL SQL was empty (daemon builder bug)");
+    return SQLITE_INTERNAL;
+  }
   for(i=1;i<=nArg;i++){
     unsigned tag = rdU8(&rd);
     switch( tag ){
@@ -776,8 +787,20 @@ static void stFixture(const char *zDb){
   sqlite3_close(db);
 }
 
+/* Route the engine's error log to stderr.  sqlite3_log carries the
+** reports that have no connection to land on -- "API called with NULL
+** prepared statement" and its kin -- and an unregistered log callback
+** silently discards them.  The "not an error" misdirection during this
+** daemon's own debugging was exactly one of these: the accurate
+** message existed and evaporated. */
+static void sdLogTo(void *pArg, int iErrCode, const char *zMsg){
+  (void)pArg;
+  fprintf(stderr, "sprocketd engine log (%d): %s\n", iErrCode, zMsg);
+}
+
 int main(int argc, char **argv){
   WSADATA w;
+  sqlite3_config(SQLITE_CONFIG_LOG, sdLogTo, 0);
   WSAStartup(MAKEWORD(2,2), &w);
 
   if( argc>=2 && strcmp(argv[1], "--selftest")==0 ){
