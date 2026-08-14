@@ -326,6 +326,14 @@ set pragma_def {
   COLS: name type reason
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
 
+  NAME: queue_writer
+  FLAG: NeedSchema Result0
+  IF:   !defined(SQLITE_OMIT_WAL)
+
+  NAME: queue_mode
+  FLAG: NeedSchema Result0
+  IF:   !defined(SQLITE_OMIT_WAL)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

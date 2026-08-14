@@ -734,6 +734,46 @@ void sqlite3Pragma(
     break;
   }
 
+#ifndef SQLITE_OMIT_WAL
+  /*
+  **  PRAGMA [schema.]queue_writer
+  **  PRAGMA [schema.]queue_writer=ON/OFF
+  **
+  ** PLAN-QUEUE (DESIGN-NETWORK 1a).  Declares or renounces this
+  ** connection as a queue writer on the database; while any declarant
+  ** lives, write transactions from other connections are refused.
+  ** Both forms report this connection's declaration state.  The mode's
+  ** substrate is the WAL shm region, so rollback-mode databases refuse
+  ** with the fix.
+  */
+  case PragTyp_QUEUE_WRITER: {
+    Pager *pPager = sqlite3BtreePager(pDb->pBt);
+    int b = -1;
+    if( zRight ) b = sqlite3GetBoolean(zRight, 0);
+    if( b>=0 && sqlite3PagerQueueDeclare(pPager, b)!=SQLITE_OK ){
+      sqlite3ErrorMsg(pParse, "queued-write mode requires WAL; "
+                              "set PRAGMA journal_mode=wal2 first");
+      goto pragma_out;
+    }
+    returnSingleInt(v, sqlite3PagerQueueDeclared(pPager));
+    break;
+  }
+
+  /*
+  **  PRAGMA [schema.]queue_mode
+  **
+  ** Reports whether the database is under queued-write discipline
+  ** right now (any connection's declaration counts) -- queryable by
+  ** exactly the connection being refused.
+  */
+  case PragTyp_QUEUE_MODE: {
+    int bActive = 0;
+    (void)sqlite3PagerQueueActive(sqlite3BtreePager(pDb->pBt), &bActive);
+    returnSingleInt(v, bActive);
+    break;
+  }
+#endif /* SQLITE_OMIT_WAL */
+
   /*
   **  PRAGMA [schema.]max_page_count
   **  PRAGMA [schema.]max_page_count=N

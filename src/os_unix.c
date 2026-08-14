@@ -4566,9 +4566,9 @@ struct unixShmNode {
   int nRef;                  /* Number of unixShm objects pointing to this */
   unixShm *pFirst;           /* All unixShm objects pointing to this */
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
-  sqlite3_mutex *aMutex[SQLITE_SHM_NLOCK];
+  sqlite3_mutex *aMutex[SQLITE_SHM_NLOCK+8];  /* +8: fork queue slots (PLAN-QUEUE) */
 #endif
-  int aLock[SQLITE_SHM_NLOCK];  /* # shared locks on slot, -1==excl lock */
+  int aLock[SQLITE_SHM_NLOCK+8];  /* # shared locks on slot, -1==excl lock */
 #ifdef SQLITE_DEBUG
   u8 nextShmId;              /* Next available unixShm.id value */
 #endif
@@ -4717,6 +4717,8 @@ static int unixShmSystemLock(
   assert( pShmNode->nRef>=0 );
   assert( (ofst==UNIX_SHM_DMS && n==1)
        || (ofst>=UNIX_SHM_BASE && ofst+n<=(UNIX_SHM_BASE+SQLITE_SHM_NLOCK))
+       || (ofst>=UNIX_SHM_BASE+SQLITE_SHM_NLOCK+4
+            && ofst+n<=(UNIX_SHM_BASE+SQLITE_SHM_NLOCK+8))  /* fork queue slots */
   );
   if( ofst==UNIX_SHM_DMS ){
     assert( pShmNode->nRef>0 || unixMutexHeld() );
@@ -4817,7 +4819,7 @@ static void unixShmPurge(unixFile *pFd){
     assert( p->pInode==pFd->pInode );
     sqlite3_mutex_free(p->pShmMutex);
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
-    for(i=0; i<SQLITE_SHM_NLOCK; i++){
+    for(i=0; i<SQLITE_SHM_NLOCK+8; i++){
       sqlite3_mutex_free(p->aMutex[i]);
     }
 #endif
@@ -5017,7 +5019,7 @@ static int unixOpenSharedMemory(unixFile *pDbFd){
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
       {
         int ii;
-        for(ii=0; ii<SQLITE_SHM_NLOCK; ii++){
+        for(ii=0; ii<SQLITE_SHM_NLOCK+8; ii++){
           pShmNode->aMutex[ii] = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
           if( pShmNode->aMutex[ii]==0 ){
             rc = SQLITE_NOMEM_BKPT;
@@ -5251,12 +5253,12 @@ static int assertLockingArrayOk(unixShmNode *pShmNode){
   return 1;
 #else
   unixShm *pX;
-  int aLock[SQLITE_SHM_NLOCK];
+  int aLock[SQLITE_SHM_NLOCK+8];
 
   memset(aLock, 0, sizeof(aLock));
   for(pX=pShmNode->pFirst; pX; pX=pX->pNext){
     int i;
-    for(i=0; i<SQLITE_SHM_NLOCK; i++){
+    for(i=0; i<SQLITE_SHM_NLOCK+8; i++){
       if( pX->exclMask & (1<<i) ){
         assert( aLock[i]==0 );
         aLock[i] = -1;
@@ -5302,7 +5304,10 @@ static int unixShmLock(
 
   assert( pShmNode==pDbFd->pInode->pShmNode );
   assert( pShmNode->pInode==pDbFd->pInode );
-  assert( ofst>=0 && ofst+n<=SQLITE_SHM_NLOCK );
+  /* Fork (PLAN-QUEUE): slots 12-15 lockable; 8-11 stay forbidden
+  ** (dead-man switch and live data). */
+  assert( ofst>=0 && ( ofst+n<=SQLITE_SHM_NLOCK
+       || (ofst>=SQLITE_SHM_NLOCK+4 && ofst+n<=SQLITE_SHM_NLOCK+8) ) );
   assert( n>=1 );
   assert( flags==(SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
        || flags==(SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
@@ -5327,7 +5332,8 @@ static int unixShmLock(
 #if defined(SQLITE_ENABLE_SETLK_TIMEOUT) && defined(SQLITE_DEBUG)
   {
     u16 lockMask = (p->exclMask|p->sharedMask);
-    assert( (flags & SQLITE_SHM_UNLOCK) || pDbFd->iBusyTimeout==0 || (
+    assert( ofst>=SQLITE_SHM_NLOCK  /* fork slots follow their own order */
+       || (flags & SQLITE_SHM_UNLOCK) || pDbFd->iBusyTimeout==0 || (
           (ofst!=2 || lockMask==0)
        && (ofst!=1 || lockMask==0 || lockMask==2)
        && (ofst!=0 || lockMask<3)

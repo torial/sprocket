@@ -225,7 +225,11 @@ never enters the queue.  Procedures-as-API (part 3) is what makes this
 constraint nearly free: the fork already has the closed unit.
 
 **Queue discipline is a DATABASE mode, not connection courtesy**
-(Sean's requirement, 2026-08-13): while any queue-writer connection has
+(Sean's requirement, 2026-08-13; **BUILT 2026-08-14** — PLAN-QUEUE.md,
+`test/queue1.test` 0/20: `PRAGMA queue_writer`/`queue_mode`, shm slot
+12 + hint byte 133 inside `WalCkptInfo.notUsed0`, gate at
+OP_Transaction, crash-release inherited from os lock semantics):
+while any queue-writer connection has
 the database, interactive write transactions on it are refused with the
 reason and the fix, and the mode releases when the last queue
 connection closes.  Transport-level policy cannot enforce this — an

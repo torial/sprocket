@@ -7514,6 +7514,39 @@ int sqlite3PagerGetJournalMode(Pager *pPager){
 }
 
 /*
+** PLAN-QUEUE passthroughs: the queued-write database mode lives in the
+** WAL layer (its substrate is the shm region), so a pager with no open
+** WAL has no mode.  Declaring on such a pager is the caller's error to
+** word; the mode queries simply answer "not active".
+*/
+int sqlite3PagerQueueDeclare(Pager *pPager, int onoff){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ) return sqlite3WalQueueDeclare(pPager->pWal, onoff);
+#endif
+  return onoff ? SQLITE_ERROR : SQLITE_OK;
+}
+int sqlite3PagerQueueDeclared(Pager *pPager){
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ) return sqlite3WalQueueDeclared(pPager->pWal);
+#endif
+  return 0;
+}
+int sqlite3PagerQueueActive(Pager *pPager, int *pActive){
+  *pActive = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ) return sqlite3WalQueueActive(pPager->pWal, pActive);
+#endif
+  return SQLITE_OK;
+}
+int sqlite3PagerQueueBlocked(Pager *pPager, int *pBlocked){
+  *pBlocked = 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ) return sqlite3WalQueueBlocked(pPager->pWal, pBlocked);
+#endif
+  return SQLITE_OK;
+}
+
+/*
 ** Return TRUE if the pager is in a state where it is OK to change the
 ** journalmode.  Journalmode changes can only happen when the database
 ** is unmodified.

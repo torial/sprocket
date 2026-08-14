@@ -788,6 +788,7 @@ struct Wal {
   u8 syncHeader;             /* Fsync the WAL header if true */
   u8 padToSectorBoundary;    /* Pad transactions out to the next sector */
   u8 bShmUnreliable;         /* SHM content is read-only and unreliable */
+  u8 bQueueWriter;           /* This connection declared PRAGMA queue_writer */
   WalIndexHdr hdr;           /* Wal-index header for current transaction */
   u32 minFrame;              /* Ignore wal frames before this one */
   u32 iReCksum;              /* On commit, recalculate checksums from here */
@@ -3132,6 +3133,12 @@ int sqlite3WalClose(
     assert( walAssertLockmask(pWal) );
     pWal->bClosing = 1;
 
+    /* A queue-writer declaration (PLAN-QUEUE) is released here so the
+    ** os-layer lock accounting is clean before the shm unmaps; the os
+    ** would drop the lock at handle close anyway, which is the crash
+    ** path's guarantee. */
+    sqlite3WalQueueDeclare(pWal, 0);
+
     /* If an EXCLUSIVE lock can be obtained on the database file (using the
     ** ordinary, rollback-mode locking methods, this guarantees that the
     ** connection associated with this log file is the only connection to
@@ -5384,6 +5391,153 @@ int sqlite3WalExclusiveMode(Wal *pWal, int op){
 */
 int sqlite3WalHeapMemory(Wal *pWal){
   return (pWal && pWal->exclusiveMode==WAL_HEAPMEMORY_MODE );
+}
+
+/*
+** PLAN-QUEUE (DESIGN-NETWORK 1a): the queued-write database mode.
+**
+** A queue writer declares itself with PRAGMA queue_writer=ON.  The
+** declaration is a SHARED os lock on shm-lock slot WAL_QUEUE_LOCK --
+** byte 132 of the wal-index, the first byte of WalCkptInfo.notUsed0,
+** reserved space no build reads or writes -- held for the life of the
+** connection.  The os releases file locks on handle close and process
+** death, so a crashed or closed declarant releases the mode by
+** construction: abandonment is impossible rather than unlikely.
+**
+** Byte 133 (notUsed0's second byte) is the HINT: nonzero while some
+** declarant probably holds the mode.  The write gate reads the hint
+** from the mapped shm -- one memory read, so databases nobody declares
+** on pay essentially nothing -- and only when it is set pays the
+** try-EXCLUSIVE probe on the lock slot that tells the truth.  A probe
+** that finds the slot unlocked clears a hint left stale by a crashed
+** declarant.  Two racing probers can each transiently see the other's
+** probe as BUSY and refuse one write spuriously; the race is momentary
+** and resolves toward refusal, never toward a barge-in.
+**
+** These locks deliberately bypass walLockShared()/walLockExclusive():
+** the SEH lockMask exists to release TRANSIENT locks after a caught
+** fault, and the declaration is LIFETIME -- a fault in an unrelated
+** wal operation must not silently drop the mode while the declarant
+** lives.  Slot 8 (byte 128) is the os layers' dead-man switch and
+** bytes 129-131 are live data (nBackfillAttempted); slots 12-15 are
+** the only lockable bytes that overlay reserved space.
+*/
+#define WAL_QUEUE_LOCK 12
+
+/* The hint byte in the mapped wal-index.  Requires apWiData[0]. */
+static volatile u8 *walQueueHint(Wal *pWal){
+  return ((volatile u8*)walCkptInfo(pWal))
+         + offsetof(WalCkptInfo,notUsed0) + 1;
+}
+
+/* True if the wal-index is mapped and shm locks are meaningful. */
+static int walQueueUsable(Wal *pWal){
+  return pWal->exclusiveMode==WAL_NORMAL_MODE
+      && pWal->nWiData>0 && pWal->apWiData[0]!=0;
+}
+
+/*
+** Declare (onoff=1) or renounce (onoff=0) this connection as a queue
+** writer.  Idempotent in both directions.
+*/
+int sqlite3WalQueueDeclare(Wal *pWal, int onoff){
+  int rc = SQLITE_OK;
+  if( onoff ){
+    if( pWal->bQueueWriter ) return SQLITE_OK;
+    if( pWal->exclusiveMode!=WAL_NORMAL_MODE ){
+      /* locking_mode=EXCLUSIVE: no other connection can reach the file
+      ** at all, so the declaration is trivially satisfied locally. */
+      pWal->bQueueWriter = 1;
+      return SQLITE_OK;
+    }
+    if( pWal->nWiData<=0 || pWal->apWiData[0]==0 ){
+      /* Map the wal-index (running recovery if the shm is new) by
+      ** passing through an empty read transaction.  Outside SEH_TRY:
+      ** it carries its own. */
+      int dummy = 0;
+      rc = sqlite3WalBeginReadTransaction(pWal, &dummy);
+      if( rc==SQLITE_OK ) sqlite3WalEndReadTransaction(pWal);
+      if( rc!=SQLITE_OK ) return rc;
+      if( pWal->nWiData<=0 || pWal->apWiData[0]==0 ) return SQLITE_ERROR;
+    }
+    rc = sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                          SQLITE_SHM_LOCK|SQLITE_SHM_SHARED);
+    if( rc==SQLITE_OK ){
+      SEH_TRY {
+        *walQueueHint(pWal) = 1;
+      }
+      SEH_EXCEPT( rc = walHandleException(pWal); )
+      if( rc==SQLITE_OK ){
+        pWal->bQueueWriter = 1;
+      }else{
+        sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                         SQLITE_SHM_UNLOCK|SQLITE_SHM_SHARED);
+      }
+    }
+  }else{
+    if( !pWal->bQueueWriter ) return SQLITE_OK;
+    pWal->bQueueWriter = 0;
+    if( !walQueueUsable(pWal) ) return SQLITE_OK;
+    sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                     SQLITE_SHM_UNLOCK|SQLITE_SHM_SHARED);
+    /* If no declarant remains, clear the hint so future write
+    ** transactions pay only the memory read.  BUSY means another
+    ** declarant lives and the hint stays true. */
+    if( SQLITE_OK==sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                          SQLITE_SHM_LOCK|SQLITE_SHM_EXCLUSIVE) ){
+      SEH_TRY {
+        *walQueueHint(pWal) = 0;
+      }
+      SEH_EXCEPT( (void)walHandleException(pWal); )
+      sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                       SQLITE_SHM_UNLOCK|SQLITE_SHM_EXCLUSIVE);
+    }
+  }
+  return rc;
+}
+
+/* Did THIS connection declare? */
+int sqlite3WalQueueDeclared(Wal *pWal){
+  return pWal->bQueueWriter!=0;
+}
+
+/*
+** Is the queued-write mode active on this database right now?  Reads
+** the hint first; probes the lock slot for the truth only when the
+** hint is set, clearing a hint a crashed declarant left behind.
+*/
+int sqlite3WalQueueActive(Wal *pWal, int *pActive){
+  int rc = SQLITE_OK;
+  *pActive = 0;
+  if( pWal->bQueueWriter ){ *pActive = 1; return SQLITE_OK; }
+  if( !walQueueUsable(pWal) ) return SQLITE_OK;
+  SEH_TRY {
+    if( *walQueueHint(pWal) ){
+      if( SQLITE_OK==sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                            SQLITE_SHM_LOCK|SQLITE_SHM_EXCLUSIVE) ){
+        *walQueueHint(pWal) = 0;
+        sqlite3OsShmLock(pWal->pDbFd, WAL_QUEUE_LOCK, 1,
+                         SQLITE_SHM_UNLOCK|SQLITE_SHM_EXCLUSIVE);
+      }else{
+        *pActive = 1;
+      }
+    }
+  }
+  SEH_EXCEPT( rc = walHandleException(pWal); )
+  /* On an shm fault the answer is the ERROR, never a fabricated
+  ** verdict: the caller propagates rc and the wal healing machinery
+  ** treats it like any other faulted shm access.  (walseh1 caught the
+  ** first cut returning "mode active" here.) */
+  return rc;
+}
+
+/*
+** Set *pBlocked if a write transaction by this connection must be
+** refused: the mode is active and this connection is not a declarant.
+*/
+int sqlite3WalQueueBlocked(Wal *pWal, int *pBlocked){
+  if( pWal->bQueueWriter ){ *pBlocked = 0; return SQLITE_OK; }
+  return sqlite3WalQueueActive(pWal, pBlocked);
 }
 
 #ifdef SQLITE_ENABLE_SNAPSHOT

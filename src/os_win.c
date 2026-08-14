@@ -4398,7 +4398,12 @@ static int winShmLock(
   pShmNode = p->pShmNode;
   if( NEVER(pShmNode==0) ) return SQLITE_IOERR_SHMLOCK;
 
-  assert( ofst>=0 && ofst+n<=SQLITE_SHM_NLOCK );
+  /* Fork (PLAN-QUEUE): slots 12-15 -- bytes overlaying the wal-index's
+  ** reserved notUsed0 field -- are lockable in addition to the standard
+  ** SQLITE_SHM_NLOCK.  Slots 8-11 stay forbidden: byte 128 is the
+  ** dead-man switch and 129-131 are live data. */
+  assert( ofst>=0 && ( ofst+n<=SQLITE_SHM_NLOCK
+       || (ofst>=SQLITE_SHM_NLOCK+4 && ofst+n<=SQLITE_SHM_NLOCK+8) ) );
   assert( n>=1 );
   assert( flags==(SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
        || flags==(SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
@@ -4421,7 +4426,8 @@ static int winShmLock(
 #if defined(SQLITE_ENABLE_SETLK_TIMEOUT) && defined(SQLITE_DEBUG)
   {
     u16 lockMask = (p->exclMask|p->sharedMask);
-    assert( (flags & SQLITE_SHM_UNLOCK) || pDbFd->iBusyTimeout==0 || (
+    assert( ofst>=SQLITE_SHM_NLOCK  /* fork slots follow their own order */
+       || (flags & SQLITE_SHM_UNLOCK) || pDbFd->iBusyTimeout==0 || (
           (ofst!=2 || lockMask==0)
        && (ofst!=1 || lockMask==0 || lockMask==2)
        && (ofst!=0 || lockMask<3)

@@ -4174,6 +4174,26 @@ case OP_Transaction: {
       goto abort_due_to_error;
     }
 
+    /* Queued-write mode (PLAN-QUEUE): while any connection holds a
+    ** queue_writer declaration on this database, write transactions
+    ** from non-declarants are refused.  Checked after BeginTrans so
+    ** the wal-index is mapped; the fast path is one shm byte read.
+    ** SQLITE_BUSY because the condition clears when the owner closes.
+    ** An shm fault during the check propagates as the I/O error it is
+    ** -- same handling BeginTrans would get -- never as a refusal. */
+    if( pOp->p2 ){
+      int bQBlocked = 0;
+      rc = sqlite3PagerQueueBlocked(sqlite3BtreePager(pBt), &bQBlocked);
+      if( rc!=SQLITE_OK ) goto abort_due_to_error;
+      if( bQBlocked ){
+        rc = SQLITE_BUSY;
+        sqlite3VdbeError(p, "database is in queued-write mode; writes go "
+           "through the queue owner (see PRAGMA queue_mode), or wait for "
+           "the queue connection to close");
+        goto abort_due_to_error;
+      }
+    }
+
     if( p->usesStmtJournal
      && pOp->p2
      && (db->autoCommit==0 || db->nVdbeRead>1)

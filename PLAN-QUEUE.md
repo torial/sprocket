@@ -113,6 +113,21 @@ this paragraph as the reason.
 
 ## Phases
 
+*ALL EXECUTED 2026-08-14, one session from ruling to green.  Receipts:
+queue1 0/20; walseh1 0/260; sweep 42/42 both regimes; veryquick clean
+(see the final commit).  Two corrections the gates bought:*
+
+- *The first cut's SEH exception path FABRICATED a "mode active"
+  verdict when the shm read faulted — a spurious queue refusal where
+  the truth was an I/O error.  walseh1's fault injection caught it
+  (three legs, the refusal message verbatim in the transcript).  The
+  API is now rc-plus-out-param the whole way down, and a faulted check
+  propagates exactly what BeginTrans would.  A fallback VALUE on a path
+  feeding a decision — the instrument sin, in engine code.*
+- *veryquick also surfaced the DEGRADE campaign's unpaid gate (15
+  corrupt-family re-pins + the empty-reason fix), recorded in
+  PLAN-DEGRADE's post-campaign corrections.*
+
 - **Q0 — the spec, red.**  `test/queue1.test`, written before any code:
   declaration + refusal + release + reporting pragmas + rollback-mode
   refusal + healthy inertness + two-connection crash-release (close

@@ -130,6 +130,12 @@ int sqlite3WalExclusiveMode(Wal *pWal, int op);
 */
 int sqlite3WalHeapMemory(Wal *pWal);
 
+/* PLAN-QUEUE: the queued-write database mode (see wal.c) */
+int sqlite3WalQueueDeclare(Wal *pWal, int onoff);
+int sqlite3WalQueueDeclared(Wal *pWal);
+int sqlite3WalQueueActive(Wal *pWal, int *pActive);
+int sqlite3WalQueueBlocked(Wal *pWal, int *pBlocked);
+
 #ifdef SQLITE_ENABLE_SNAPSHOT
 int sqlite3WalSnapshotGet(Wal *pWal, sqlite3_snapshot **ppSnapshot);
 void sqlite3WalSnapshotOpen(Wal *pWal, sqlite3_snapshot *pSnapshot);
