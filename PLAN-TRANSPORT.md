@@ -19,6 +19,7 @@ context loss — if you are a later session picking this up, this file plus
 | Wire **transport** phase 5 (group commit) | done, `tool/proc_queue.c`, 6 checks |
 | Wire **transport** phase 6 (shard routing) | done, `tool/proc_shard.c`, 9 checks |
 | **All six phases complete** | 2026-08-03 |
+| Phase 5 queue + the queued-write ENGINE mode (PLAN-QUEUE) | integrated 2026-08-14: wqOpen declares `queue_writer=ON` (checked, refuses to run unprotected) and the self-test proves the engine refuses an out-of-band writer while the queue lives -- 14 checks |
 
 The durable argument is **data-dependent control flow**, not batching
 (pipelining supplies batching). Do not let the transport work drift back into

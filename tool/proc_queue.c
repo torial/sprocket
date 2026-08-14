@@ -146,6 +146,29 @@ static WriteQueue *wqOpen(const char *zFile, int nBatchMax){
   ** starves a classic-WAL checkpointer. */
   sqlite3_exec(q->db, "PRAGMA journal_mode=wal2;", 0, 0, 0);
   sqlite3_exec(q->db, "PRAGMA synchronous=NORMAL;", 0, 0, 0);
+  /* The queued-write DATABASE MODE (PLAN-QUEUE, 2026-08-14): declare this
+  ** connection the queue writer, so the ENGINE refuses out-of-band writers
+  ** while this queue lives -- transport policy cannot stop a stray CLI,
+  ** the mode can.  Checked when declared, not discovered broken at use:
+  ** if the declaration did not take (rollback-mode file, old engine),
+  ** the queue refuses to open rather than run unprotected. */
+  {
+    sqlite3_stmt *pQw = 0;
+    int bDeclared = 0;
+    if( sqlite3_prepare_v2(q->db, "PRAGMA queue_writer=ON;", -1, &pQw, 0)
+          ==SQLITE_OK
+     && sqlite3_step(pQw)==SQLITE_ROW ){
+      bDeclared = sqlite3_column_int(pQw, 0);
+    }
+    sqlite3_finalize(pQw);
+    if( !bDeclared ){
+      fprintf(stderr, "wqOpen: PRAGMA queue_writer=ON did not take on %s; "
+              "refusing to run an unprotected queue\n", zFile);
+      sqlite3_close(q->db);
+      sqlite3_free(q);
+      return 0;
+    }
+  }
   sqlite3_busy_timeout(q->db, 5000);
   sqlite3_commit_hook(q->db, commitHook, q);
   InitializeCriticalSection(&q->mx);
@@ -258,9 +281,20 @@ static int gatedRun(const char *zFile, int nBatchMax, int nItem,
   int i, nCommits, spins;
 
   DeleteFileA(zFile);
+  /* The schema exists before the queue owns the file -- which is also
+  ** what the engine requires: queue_writer's substrate is the WAL shm,
+  ** and a brand-new EMPTY database has no WAL until its first write.
+  ** (The checked declaration in wqOpen caught this ordering when the
+  ** CREATE lived after it: it refused to run unprotected.) */
+  {
+    sqlite3 *dbBoot = 0;
+    if( sqlite3_open(zFile, &dbBoot)!=SQLITE_OK ) return -1;
+    sqlite3_exec(dbBoot, "PRAGMA journal_mode=wal2;"
+                         "CREATE TABLE t(who INT, seq INT);", 0, 0, 0);
+    sqlite3_close(dbBoot);
+  }
   q = wqOpen(zFile, nBatchMax);
   if( q==0 ) return -1;
-  sqlite3_exec(q->db, "CREATE TABLE t(who INT, seq INT);", 0, 0, 0);
 
   /* Close the gate, then let every producer queue exactly one item. */
   ResetEvent(q->hGate);
@@ -328,7 +362,53 @@ int main(int argc, char **argv){
   check(nRows==64, "all 64 durable at K=1");
   check(c==64, "CONTROL: K=1 gives one transaction per item");
 
+  /* The queued-write DATABASE MODE, dogfooded (PLAN-QUEUE, 2026-08-14).
+  ** While the queue's connection lives, an out-of-band writer must be
+  ** refused BY THE ENGINE.  Three phases so the probe is seen able to
+  ** both succeed and fail: before the queue a write works (the probe can
+  ** go green), during the queue it is refused with the pinned message
+  ** (red for the right reason; busy_timeout 0 so the refusal is
+  ** immediate, since the gate's code is SQLITE_BUSY by design), and
+  ** after wqClose the same write works again (release is by connection
+  ** lifetime, nothing to clean up). Reads stay un-gated throughout. */
+  {
+    sqlite3 *dbProbe = 0;
+    WriteQueue *q;
+    int rc;
+    DeleteFileA("q_d.db");
+    check( sqlite3_open("q_d.db", &dbProbe)==SQLITE_OK, "probe opens" );
+    sqlite3_busy_timeout(dbProbe, 0);
+    sqlite3_exec(dbProbe, "PRAGMA journal_mode=wal2;", 0, 0, 0);
+    rc = sqlite3_exec(dbProbe,
+            "CREATE TABLE t(who INT, seq INT);"
+            "INSERT INTO t VALUES(-1,-1);", 0, 0, 0);
+    check( rc==SQLITE_OK, "CONTROL: out-of-band write works BEFORE the queue" );
+
+    q = wqOpen("q_d.db", 8);
+    check( q!=0, "queue opens and declares queue_writer" );
+    rc = sqlite3_exec(dbProbe, "INSERT INTO t VALUES(-2,-2);", 0, 0, 0);
+    check( rc==SQLITE_BUSY, "out-of-band write REFUSED while the queue lives" );
+    check( strstr(sqlite3_errmsg(dbProbe), "queued-write mode")!=0,
+           "the refusal names the mode and the fix" );
+    {
+      sqlite3_stmt *pSel = 0;
+      rc = sqlite3_prepare_v2(dbProbe, "SELECT count(*) FROM t", -1, &pSel, 0);
+      check( rc==SQLITE_OK && sqlite3_step(pSel)==SQLITE_ROW,
+             "reads are never gated" );
+      sqlite3_finalize(pSel);
+    }
+    check( wqSubmit(q, "INSERT INTO t VALUES(0,0);")==SQLITE_OK,
+           "the queue itself writes freely" );
+    wqClose(q);
+    rc = sqlite3_exec(dbProbe, "INSERT INTO t VALUES(-3,-3);", 0, 0, 0);
+    check( rc==SQLITE_OK, "out-of-band write works again AFTER wqClose" );
+    sqlite3_close(dbProbe);
+    printf("  queued-write mode: engine refuses the barge-in the queue "
+           "cannot see\n");
+  }
+
   DeleteFileA("q_a.db"); DeleteFileA("q_b.db"); DeleteFileA("q_c.db");
+  DeleteFileA("q_d.db");
   printf("\n%s: %d checks, %d failures\n",
          nFail ? "PROC_QUEUE FAILED" : "PROC_QUEUE OK", nCheck, nFail);
   return nFail ? 1 : 0;

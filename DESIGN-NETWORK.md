@@ -369,12 +369,18 @@ magnitude more than any protocol choice. Optimize placement before transport.
   payload: **301 bytes with shapes, 196 without — 34.9% saved**, and the
   shape-free stream decodes to a bit-identical checksum.
 
-- **There is still no transport.** Ascending in ambition:
-  an HTTP/JSON front (rqlite's approach); a PostgreSQL-wire shim so existing
-  client libraries work unchanged; or a purpose-built binary protocol with
-  pipelining (libSQL's Hrana). Whatever the choice, **support pipelining** —
-  it is cheap, it is orthogonal to procedures, and per the reframing above the
-  two solve different problems.
+- **The transport phases are PROVEN but not INTEGRATED** *(this bullet
+  previously said "there is still no transport," which went stale on
+  2026-08-03 when PLAN-TRANSPORT's six phases completed — framing,
+  TCP loopback CALL, arguments, the shape-cache handshake, the
+  group-commit queue, shard routing; each a self-testing harness in
+  `tool/proc_*.c`, and the queue now declares the queued-write engine
+  mode of §1a)*.  What remains is one production daemon composing
+  them, plus ratifying the protocol posture: purpose-built binary
+  (the proven path) vs an HTTP/JSON front vs a PostgreSQL-wire shim.
+  Whatever the choice, **support pipelining** — it is cheap, it is
+  orthogonal to procedures, and per the reframing above the two solve
+  different problems.
 - **`sqlite3_proc_next_resultset()` is not reachable from loadable
   extensions**, deliberately — see README-PROCS.md for the ABI reasoning. A
   network server is a statically-linked embedder, so this does not affect it.
