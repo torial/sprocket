@@ -19,6 +19,96 @@
 ** Fill the InitData structure with an error message that indicates
 ** that the database is corrupt.
 */
+/*
+** Degrade-at-load (DOCKET #9, Posture 2).  When the loader below meets
+** an object it cannot parse or validate -- a newer fork's syntax, a
+** definition whose base has vanished -- the object is DEAD-MARKED here
+** instead of failing the whole file: name, type, and the refusal
+** reason are retained (one allocation each, plain malloc: schemas may
+** be shared), the rest of the schema loads, and the file opens.
+** sqlite3LocateTable refuses dead names with the retained reason;
+** sqlite3BeginWriteOperation refuses ALL writes to a schema carrying
+** dead objects, because this build cannot know which live tables feed
+** them.  PRAGMA dead_list is the surface.
+*/
+void sqlite3DeadMark(
+  sqlite3 *db,
+  int iDb,
+  const char *zName,
+  const char *zType,
+  const char *zReason
+){
+  Schema *pSchema = db->aDb[iDb].pSchema;
+  DeadObj *pDead, *pOld;
+  sqlite3_int64 nName, nType, nReason;
+  char *zOut;
+  if( NEVER(pSchema==0) || zName==0 ) return;
+  if( zType==0 ) zType = "?";
+  if( zReason==0 ) zReason = "could not be loaded";
+  nName = sqlite3Strlen30(zName)+1;
+  nType = sqlite3Strlen30(zType)+1;
+  nReason = sqlite3Strlen30(zReason)+1;
+  pDead = sqlite3MallocZero(sizeof(DeadObj)+nName+nType+nReason);
+  if( pDead==0 ){
+    sqlite3OomFault(db);
+    return;
+  }
+  zOut = (char*)&pDead[1];
+  pDead->zName = zOut;   memcpy(zOut, zName, nName);     zOut += nName;
+  pDead->zType = zOut;   memcpy(zOut, zType, nType);     zOut += nType;
+  pDead->zReason = zOut; memcpy(zOut, zReason, nReason);
+  pOld = sqlite3HashInsert(&pSchema->deadHash, pDead->zName, pDead);
+  if( pOld ){
+    if( pOld==pDead ){
+      sqlite3OomFault(db);
+      sqlite3_free(pDead);
+    }else{
+      sqlite3_free(pOld);
+    }
+  }
+}
+
+/* Free every DeadObj in a deadHash and reset it (schema teardown) */
+void sqlite3DeadHashClear(Hash *pHash){
+  HashElem *pElem;
+  for(pElem=sqliteHashFirst(pHash); pElem; pElem=sqliteHashNext(pElem)){
+    sqlite3_free(sqliteHashData(pElem));
+  }
+  sqlite3HashClear(pHash);
+}
+
+/*
+** Find a dead object by name.  zDb narrows the search to one database
+** when non-NULL; otherwise every attached schema is consulted.
+*/
+const DeadObj *sqlite3DeadFind(
+  sqlite3 *db,
+  const char *zName,
+  const char *zDb
+){
+  int i;
+  for(i=0; i<db->nDb; i++){
+    Schema *pSchema = db->aDb[i].pSchema;
+    DeadObj *pDead;
+    if( pSchema==0 ) continue;
+    if( zDb && sqlite3StrICmp(zDb, db->aDb[i].zDbSName)!=0 ) continue;
+    pDead = (DeadObj*)sqlite3HashFind(&pSchema->deadHash, zName);
+    if( pDead ) return pDead;
+  }
+  return 0;
+}
+
+/* Number of dead objects in database iDb's schema */
+int sqlite3DeadCount(sqlite3 *db, int iDb){
+  Schema *pSchema = db->aDb[iDb].pSchema;
+  int n = 0;
+  HashElem *pElem;
+  if( pSchema==0 ) return 0;
+  for(pElem=sqliteHashFirst(&pSchema->deadHash); pElem;
+      pElem=sqliteHashNext(pElem)) n++;
+  return n;
+}
+
 static void corruptSchema(
   InitData *pData,     /* Initialization context */
   char **azObj,        /* Type and name of object being parsed */
@@ -150,13 +240,26 @@ int sqlite3InitCallback(void *pInit, int argc, char **argv, char **NotUsed){
     if( SQLITE_OK!=rc ){
       if( db->init.orphanTrigger ){
         assert( iDb==1 );
-      }else{
+      }else if( rc==SQLITE_NOMEM ){
         if( rc > pData->rc ) pData->rc = rc;
-        if( rc==SQLITE_NOMEM ){
-          sqlite3OomFault(db);
-        }else if( rc!=SQLITE_INTERRUPT && (rc&0xFF)!=SQLITE_LOCKED ){
-          corruptSchema(pData, argv, sqlite3_errmsg(db));
-        }
+        sqlite3OomFault(db);
+      }else if( rc==SQLITE_INTERRUPT || (rc&0xFF)==SQLITE_LOCKED ){
+        if( rc > pData->rc ) pData->rc = rc;
+      }else if( (pData->mInitFlags & INITFLAG_FullLoad)!=0
+             && (pData->mInitFlags & INITFLAG_AlterMask)==0 ){
+        /* Degrade-at-load (DOCKET #9): an object this build cannot
+        ** parse or validate -- a newer fork's syntax, a vanished base
+        ** -- is DEAD-MARKED with the reason retained, and the load
+        ** continues.  One unreadable object no longer makes the whole
+        ** file refuse to open.  ONLY on a full schema load: an object
+        ** being re-parsed right after its own CREATE or ALTER
+        ** (OP_ParseSchema) gets the immediate error instead -- the
+        ** user is present to receive it, and nothing broken persists.
+        ** Structural damage (bad rootpages, orphan indexes, a corrupt
+        ** schema table) keeps the old hard-failure paths below. */
+        sqlite3DeadMark(db, iDb, argv[1], argv[0], sqlite3_errmsg(db));
+      }else{
+        corruptSchema(pData, argv, sqlite3_errmsg(db));
       }
     }
     db->init.azInit = sqlite3StdType; /* Any array of string ptrs will do */
@@ -234,7 +337,7 @@ int sqlite3InitOne(sqlite3 *db, int iDb, char **pzErrMsg, u32 mFlags){
   initData.iDb = iDb;
   initData.rc = SQLITE_OK;
   initData.pzErrMsg = pzErrMsg;
-  initData.mInitFlags = mFlags;
+  initData.mInitFlags = mFlags | INITFLAG_FullLoad;
   initData.nInitRow = 0;
   initData.mxPage = 0;
   sqlite3InitCallback(&initData, 5, (char **)azArg, 0);

@@ -42,7 +42,61 @@ successors' files.
 - The degrade path must be INERT on healthy files: zero behavior
   change, zero measurable load cost.
 
+## Q0 corrections from first contact (2026-08-13, same session)
+
+- **Deaths cascade, and the cascade is honest**: a dead mview's auto
+  key index cannot load either (its table never did), so it dead-marks
+  too, with the dead-name refusal as its retained reason — the chain
+  reads correctly ("ivm$x$key: x is present but unusable…").  The spec
+  now pins the cascaded rows rather than pretending three deaths were
+  three.
+- **The write gate moved from compile time to runtime.**  The first
+  placement (sqlite3BeginWriteOperation) misfired on a pure SELECT:
+  vtab schema-cookie bookkeeping (sqlite3VtabUsesAllSchemas) books
+  write intents without meaning user writes, so reading
+  pragma_dead_list through its own vtab form tripped the gate that
+  exists to protect the file the pragma describes.  The honest choke
+  is OP_Transaction with the write flag: it fires exactly when a
+  statement opens a write transaction on the degraded database, never
+  on bookkeeping, and grants per-database granularity (a healthy main
+  writes fine beside a degraded ATTACH) for free.
+- Parser-position pedantry in two pinned messages (the invented syntax
+  dies where the grammar actually stops, not where I guessed) and a
+  join-fixture arithmetic slip (u lacked the b=2 row), both mine.
+- **Degrade belongs to FULL schema load only, never to the incremental
+  re-parse of an object this build just wrote.**  Caught by upstream's
+  own view-29 (forum daa2c728cc): `CREATE VIEW IF NOT EXISTS IF AS
+  SELECT null` parses live but its stored text will not round-trip;
+  upstream detects that inside the CREATE via OP_ParseSchema and
+  aborts it, persisting nothing.  The first degrade cut swallowed that
+  error, PERSISTED the broken view as dead, and locked the file
+  read-only — strictly worse than the disease, and a healthy-file
+  behavior change (the inertness gate caught it; the charter forbids
+  it).  Fix: a new `INITFLAG_FullLoad` bit set only by
+  sqlite3InitOne; initCallback degrades only when it is set and no
+  ALTER-reparse flag is (ALTER's re-parse also wants its immediate
+  error).  At a live CREATE the user is present to receive the error;
+  degrade exists for meeting a FOREIGN file, and foreign files only
+  arrive via full load.
+- **The write gate exempts `writable_schema=ON` — otherwise a file
+  whose dead object NO build can parse is frozen forever.**  A
+  dangling mview (base vanished under schema surgery) dead-marks in
+  every build, old and new alike; with an absolute gate, every build
+  refuses writes, so no one can ever delete the corpse.  The fork's
+  declared expert exception (mview write protection already honors
+  writable_schema) is the escape hatch: under writable_schema=ON the
+  gate stands down, schema surgery can remove the dead rows, and the
+  next open is healthy.  The spec pins the full repair story.
+
 ## Phases
+
+*All four EXECUTED 2026-08-13, one session.  Receipts: degrade1 0/20;
+full sweep 41/41 suites clean, DEBUG=3 and release both (the 41st is
+degrade1 itself, now in the roster).  The corrections above were paid
+for by the gates working as designed: the first sweep caught view-29
+(2/123) in both regimes, which forced the FullLoad distinction, which
+exposed the frozen-forever trap, which produced the writable_schema
+repair story — three findings from one red suite.*
 
 - **Q0 — the spec, red.**  `test/degrade1.test`: future-syntax fixtures
   planted via writable_schema (an invented mview clause, an invented

@@ -1517,6 +1517,8 @@ struct Schema {
   Hash trigHash;       /* All triggers indexed by name */
   Hash procHash;       /* All stored procedures indexed by name */
   Hash mviewHash;      /* MViewInfo for all materialized views, by name */
+  Hash deadHash;       /* DeadObj for objects this build could not load
+                       ** (degrade-at-load, DOCKET #9) */
   Hash fkeyHash;       /* All foreign keys by referenced table name */
   Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
   u8 file_format;      /* Schema format version for this file */
@@ -4481,6 +4483,10 @@ typedef struct {
 #define INITFLAG_AlterDrop     0x0002  /* Reparse after a DROP COLUMN */
 #define INITFLAG_AlterAdd      0x0003  /* Reparse after an ADD COLUMN */
 #define INITFLAG_AlterDropCons 0x0004  /* Reparse after an ADD COLUMN */
+#define INITFLAG_FullLoad      0x0008  /* Full schema load (sqlite3InitOne),
+                                       ** not an incremental OP_ParseSchema
+                                       ** re-parse: the only path where
+                                       ** degrade-at-load applies */
 
 /* Tuning parameters are set using SQLITE_TESTCTRL_TUNE and are controlled
 ** on debug-builds of the CLI using ".testctrl tune ID VALUE".  Tuning
@@ -5633,6 +5639,21 @@ struct MViewInfo {
 # define sqlite3UnlinkAndDeleteMView(A,B,C)
 # define sqlite3MViewSynthTriggers(A,B)
 #endif
+
+/* Degrade-at-load (DOCKET #9, Posture 2): objects the loader could not
+** parse or validate are DEAD-MARKED -- name, type and the retained
+** refusal reason -- instead of failing the whole file.  A schema with
+** any dead object is read-only in this build. */
+typedef struct DeadObj DeadObj;
+struct DeadObj {
+  char *zName;             /* Object name; also the hash key */
+  char *zType;             /* The schema row's type column */
+  char *zReason;           /* The loader's error, retained verbatim */
+};
+void sqlite3DeadMark(sqlite3*, int, const char*, const char*, const char*);
+void sqlite3DeadHashClear(Hash*);
+const DeadObj *sqlite3DeadFind(sqlite3*, const char*, const char*);
+int sqlite3DeadCount(sqlite3*, int);
 
 void sqlite3SubProgramUnref(sqlite3*, SubProgram*);
 int sqlite3JoinType(Parse*, Token*, Token*, Token*);

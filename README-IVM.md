@@ -141,13 +141,29 @@ refresh is whoever runs the pragma.
 
 ## Sharp edges
 
-- **A database containing any materialized view is unreadable AT OPEN
-  by binaries that do not understand it** — stock SQLite and older
-  fork builds alike fail schema load with "malformed database schema",
-  and the lockout covers every table in the file.  Found by dogfood
-  the first morning (DOCKET #9, with three candidate postures awaiting
-  a ruling).  Until then: a db with mviews is
-  exactly-this-fork-version-or-nothing.
+- **Version skew (DOCKET #9, ruled Posture 2, degrade-at-load).**
+  Stock SQLite cannot open any database containing fork objects
+  (procs, mviews): the whole schema load fails.  That is accepted —
+  stock was already locked out by procedures, and the ruling's
+  deciding fact was that no deployed file would actually gain stock
+  access.  WITHIN the fork's own lineage the story is now graceful:
+  from this build forward, an object a build cannot parse or validate
+  is DEAD-MARKED at load instead of failing the file — everything
+  else opens and reads, `PRAGMA dead_list` names each dead object
+  with the retained reason, touching one by name refuses with that
+  reason and the fix, and the database is READ-ONLY while it carries
+  dead objects (an older build cannot know which live tables feed
+  them; the write refusal fires exactly when a statement opens a
+  write transaction on the degraded database).  `writable_schema=ON`
+  stands the gate down — the declared expert exception, and the only
+  way any build can remove a dead object NO build parses (a mview
+  whose base vanished) — so no file is ever frozen beyond repair.
+  Degrade applies ONLY at full schema load, where foreign files
+  arrive; an object that fails re-parse right after its own CREATE
+  or ALTER still errors immediately and persists nothing (upstream's
+  view-29 round-trip quirk taught this — the first cut swallowed
+  that error and was strictly worse than the disease).  Builds older
+  than the degrade loader still hard-refuse newer files.
 
 - The `ivm$` column-name prefix and the `sqlite_ivm_` table namespace
   are reserved (refused in definitions; protected by the sqlite_ rule).

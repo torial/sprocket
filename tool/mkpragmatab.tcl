@@ -321,6 +321,11 @@ set pragma_def {
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
   IF:   !defined(SQLITE_OMIT_VIEW)
 
+  NAME: dead_list
+  FLAG: NeedSchema Result0 SchemaOpt
+  COLS: name type reason
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+
   NAME: module_list
   FLAG: Result0
   COLS: name

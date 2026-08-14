@@ -1791,6 +1791,50 @@ void sqlite3Pragma(
   }
   break;
 
+  /*
+  **   PRAGMA [schema.]dead_list
+  **
+  ** One row per object the loader DEAD-MARKED (degrade-at-load,
+  ** DOCKET #9): name, schema-row type, and the refusal reason retained
+  ** verbatim.  Empty on a healthy database.  Sorted by name.
+  */
+  case PragTyp_DEAD_LIST: {
+    int ii;
+    pParse->nMem = 3;
+    for(ii=0; ii<db->nDb; ii++){
+      Schema *pSchema = db->aDb[ii].pSchema;
+      HashElem *he;
+      DeadObj **apDead;
+      int nDead = 0, j, k;
+      if( pSchema==0 ) continue;
+      if( zDb && sqlite3StrICmp(zDb, db->aDb[ii].zDbSName)!=0 ) continue;
+      for(he=sqliteHashFirst(&pSchema->deadHash); he;
+          he=sqliteHashNext(he)) nDead++;
+      if( nDead==0 ) continue;
+      apDead = sqlite3DbMallocRawNN(db, nDead*sizeof(DeadObj*));
+      if( apDead==0 ) break;
+      j = 0;
+      for(he=sqliteHashFirst(&pSchema->deadHash); he;
+          he=sqliteHashNext(he)){
+        apDead[j++] = (DeadObj*)sqliteHashData(he);
+      }
+      for(j=1; j<nDead; j++){
+        DeadObj *pT = apDead[j];
+        for(k=j; k>0
+             && sqlite3StrICmp(apDead[k-1]->zName, pT->zName)>0; k--){
+          apDead[k] = apDead[k-1];
+        }
+        apDead[k] = pT;
+      }
+      for(j=0; j<nDead; j++){
+        sqlite3VdbeMultiLoad(v, 1, "sss",
+           apDead[j]->zName, apDead[j]->zType, apDead[j]->zReason);
+      }
+      sqlite3DbFree(db, apDead);
+    }
+  }
+  break;
+
   case PragTyp_PROC_CHECK: {
     int ii;
     pParse->nMem = 4;

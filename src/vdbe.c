@@ -4140,6 +4140,24 @@ case OP_Transaction: {
     }
     goto abort_due_to_error;
   }
+  if( pOp->p2 && sqlite3DeadCount(db, pOp->p1)>0
+   && (db->flags & SQLITE_WriteSchema)==0 ){
+    /* Degrade-at-load (DOCKET #9): this schema carries objects this
+    ** build could not load, and this build cannot know which live
+    ** tables feed them -- the database is read-only here.  Runtime is
+    ** the one honest choke point: it fires exactly when a statement
+    ** opens a write transaction on THIS database, never on the
+    ** compile-time bookkeeping that also books write intents.
+    ** writable_schema=ON stands the gate down -- the fork's declared
+    ** expert exception, and the only way ANY build can ever remove a
+    ** dead object no build parses (e.g. a mview whose base vanished);
+    ** without it such a file would be frozen forever. */
+    rc = SQLITE_READONLY;
+    sqlite3VdbeError(p, "database contains objects this build cannot "
+       "maintain (see PRAGMA dead_list); writes are disabled to "
+       "protect them");
+    goto abort_due_to_error;
+  }
   pDb = &db->aDb[pOp->p1];
   pBt = pDb->pBt;
 

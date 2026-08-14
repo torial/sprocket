@@ -484,11 +484,22 @@ Table *sqlite3LocateTable(
   }
 
   if( p==0 ){
-    const char *zMsg = flags & LOCATE_VIEW ? "no such view" : "no such table";
-    if( zDbase ){
-      sqlite3ErrorMsg(pParse, "%s: %s.%s", zMsg, zDbase, zName);
+    /* Degrade-at-load (DOCKET #9): a name the loader dead-marked gets
+    ** the retained reason and the fix, not "no such table" -- the
+    ** object exists; this build cannot use it. */
+    const DeadObj *pDead = sqlite3DeadFind(db, zName, zDbase);
+    if( pDead ){
+      sqlite3ErrorMsg(pParse, "%s is present but unusable in this "
+         "build (%s); a newer build can use or remove it",
+         zName, pDead->zReason);
     }else{
-      sqlite3ErrorMsg(pParse, "%s: %s", zMsg, zName);
+      const char *zMsg =
+          flags & LOCATE_VIEW ? "no such view" : "no such table";
+      if( zDbase ){
+        sqlite3ErrorMsg(pParse, "%s: %s.%s", zMsg, zDbase, zName);
+      }else{
+        sqlite3ErrorMsg(pParse, "%s: %s", zMsg, zName);
+      }
     }
   }else{
     assert( HasRowid(p) || p->iPKey<0 );

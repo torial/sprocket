@@ -1729,3 +1729,20 @@ Lean, not a ruling: (2) is the engineering sweet spot (graceful within the
 fork's own lineage, where the skew actually bites today); (3) is the one to
 pick only if stock-readability of mview DATA is a real requirement for the
 Zebra/Graze seam -- worth asking the consumers before paying for it.
+
+**BUILT 2026-08-13, same day as the ruling** (PLAN-DEGRADE.md;
+spec `test/degrade1.test`, 0/20).  As shipped: any object-level init
+failure at FULL schema load dead-marks (name, type, retained reason)
+instead of failing the file; `PRAGMA dead_list` is the surface; dead
+names refuse with the reason and the fix; the file is read-only while
+degraded (v1), gated at OP_Transaction per-database, with
+`writable_schema=ON` as the declared repair exception.  Deaths cascade
+honestly (a dead mview's key index dies with it, reasons chained).
+Two first-contact corrections worth remembering: degrade must NOT
+apply to the incremental re-parse after a live CREATE/ALTER (upstream
+view-29 pins the immediate error, which is the better surface), and
+the write gate had to move from compile-time to runtime because vtab
+cookie bookkeeping books write intents that are not writes.  Recorded,
+not built: the v2 degraded-write marker protocol; dead-object DROP.
+Temporal tables (#6), when built, inherit this loader for free --
+older fork builds will open files carrying them, minus the feature.
