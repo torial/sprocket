@@ -375,12 +375,32 @@ magnitude more than any protocol choice. Optimize placement before transport.
   TCP loopback CALL, arguments, the shape-cache handshake, the
   group-commit queue, shard routing; each a self-testing harness in
   `tool/proc_*.c`, and the queue now declares the queued-write engine
-  mode of §1a)*.  What remains is one production daemon composing
-  them, plus ratifying the protocol posture: purpose-built binary
-  (the proven path) vs an HTTP/JSON front vs a PostgreSQL-wire shim.
-  Whatever the choice, **support pipelining** — it is cheap, it is
-  orthogonal to procedures, and per the reframing above the two solve
-  different problems.
+  mode of §1a)*.  What remains is one production daemon composing them.
+
+  **Protocol posture RULED 2026-08-14 (Sean, who applied the same
+  filter to his own protobuf-like queue): the purpose-built binary
+  protocol is the NATIVE protocol.**  The deciding fact is that the
+  usual argument for a standard protocol — "don't make people write
+  clients" — does not apply where clients are GENERATED: procgen's
+  typed clients already eliminate that cost, with types, and the
+  shape-cache handshake (34.9% of bytes, describe-once-by-schema-
+  cookie) is expressible only in a protocol we own.  **HTTP/JSON is a
+  deferred GATEWAY**, not the protocol — built when a browser/curl
+  consumer materializes, as a thin front mapping onto the binary
+  protocol (likely WebSocket-framed binary for browsers, the Hrana
+  conclusion); making it native would put JSON's type erasure at the
+  bottom of the stack where the whole system inherits it.  **The
+  PostgreSQL-wire shim is DECLINED with reasons**: its compatibility
+  surface (OID typing, auth handshakes, portal re-describe semantics,
+  every driver's expectations) buys a capability we replaced with
+  something better; revisit only if a real consumer's ecosystem
+  demands pg compatibility — hypothetical demand is recorded, not
+  built for.  Owned costs, named: protocol versioning discipline from
+  frame one (the schema-cookie mechanism is the model), and auth/TLS
+  is ours rather than inherited (the gateway carries any
+  public-facing story).  Whatever ships, **support pipelining** — it
+  is cheap, it is orthogonal to procedures, and per the reframing
+  above the two solve different problems.
 - **`sqlite3_proc_next_resultset()` is not reachable from loadable
   extensions**, deliberately — see README-PROCS.md for the ABI reasoning. A
   network server is a statically-linked embedder, so this does not affect it.
