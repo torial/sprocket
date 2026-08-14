@@ -1718,6 +1718,13 @@ flips that file to exactly-this-fork-version-or-nothing.
    single-schema-row design, .dump semantics rework, and a stale-table
    hazard handed to stock readers with no staleness surface to consult.
 
+**RULED 2026-08-13: Posture 2 (degrade-at-load), Sean.**  The deciding
+argument was posture 3's conditional benefit: stock-readability is a
+FILE property granted per-feature, and every deployment file already
+carries procs -- the set of files that would actually gain stock access
+is empty.  Degrade-at-load protects the fork's own lineage, which is
+where the skew genuinely bites.  Campaign: PLAN-DEGRADE.md.
+
 Lean, not a ruling: (2) is the engineering sweet spot (graceful within the
 fork's own lineage, where the skew actually bites today); (3) is the one to
 pick only if stock-readability of mview DATA is a real requirement for the
