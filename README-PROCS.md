@@ -82,6 +82,14 @@ CALL pay_down(42, 19.99);
 
 ## Typed clients from the schema
 
+Four emitters: `procgen --lang c|zebra|python|ts`.  The TypeScript
+client (2026-08-14) runs on Node over the N-API addon in `tool/napi`
+(statically linked fork; build with `npm install && npx node-gyp
+rebuild` there).  INTEGER values arrive as `number` within +/-(2^53-1)
+and `BigInt` beyond -- the type says so (`number | bigint`), because a
+double cannot hold 2^60 and silently rounding would fabricate a value.
+Gate: `python tool/procgen_tstest.py DB tool/napi`.
+
 Because declared shapes are validated at CREATE time and exposed through
 `PRAGMA proc_list` / `PRAGMA proc_info`, a database's whole request/response
 contract is machine-readable **without executing anything**:

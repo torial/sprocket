@@ -116,6 +116,12 @@ layer," and it compounds with every phase of the transport plan.
 round-trip test that generates, compiles, and calls; regeneration is
 deterministic (byte-identical for an unchanged schema).
 
+**✅ TypeScript emitter DONE 2026-08-14 (PLAN-TSGEN) — and with it #2's
+done-means is met in FULL: all four emitters (c, zebra, python, ts),
+round-trip gates, deterministic regeneration.**  The N-API addon
+(tool/napi) statically links the fork; INTEGER crosses the JS boundary
+as number within 2^53-1 and BigInt beyond, pinned both directions.
+
 **TypeScript emitter — substrate decided 2026-08-13 (Sean: N-API).**
 Node has no built-in FFI, so the TS client has two legitimate substrates:
 an **N-API addon** (stable ABI across Node majors, plain C, statically
