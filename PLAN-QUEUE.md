@@ -77,6 +77,40 @@ contract calls load-bearing.  P1 measures the os-layer reality before
 committing; if 1 survives contact, 2 and 3 are recorded as rejected with
 this paragraph as the reason.
 
+### P1 MEASURED 2026-08-13 — slot 12 plus a hint byte; slot 8 is a trap
+
+- **"Slot 8" is taken**: `WIN_SHM_DMS`/`UNIX_SHM_DMS` — the dead-man
+  switch — is byte `SHM_BASE+SQLITE_SHM_NLOCK` = 128 on both os layers.
+  Extending the slot range naively would have landed the queue lock on
+  the liveness byte.  Found by grep, not by crash.
+- **wal2 does NOT use extra slots** — its own header comment: the wal2
+  read-locks "use four of the six read-locking slots used by legacy wal
+  mode."  The `<<(SQLITE_SHM_NLOCK+i)` shift that looked like slot
+  extension is SEH cleanup *bookkeeping* (shared locks in the low byte
+  of a mask, exclusive in the high), not lock addressing.
+- **Bytes 129–131 are live data** (`nBackfillAttempted`'s tail);
+  **bytes 132–135 are `WalCkptInfo.notUsed0`** — reserved, never read
+  or written by any build, and inside the byte range the os lock calls
+  can address.  Same reserved-space arrangement `aLock[]` itself uses.
+- **Ruling: the QUEUE lock is byte 132 ("slot 12"); byte 133 is the
+  hint.**  Declarants hold SHARED on slot 12 for connection lifetime
+  (os releases file locks on handle close and process death — crash-
+  release inherited, as hoped).  The write gate's fast path reads hint
+  byte 133 from the mapped shm — one memory read; healthy files pay
+  essentially nothing.  Only when the hint is set does the gate probe
+  slot 12 with a try-EXCLUSIVE for the truth; a probe that finds the
+  lock free clears the stale hint (crashed declarant) and proceeds.
+- **Costs found with it:** the os-layer asserts (`os_win.c:4401`'s
+  `ofst+n<=SQLITE_SHM_NLOCK`, `os_unix.c:4718`, and os_win's
+  WAL-protocol sanity block) must learn the new slot; our lock calls
+  bypass `walLockExclusive`'s SEH `lockMask` bookkeeping, so a
+  `SQLITE_USE_SEH` build would not auto-release the queue lock after a
+  structured-exception fault — either add the mask handling or refuse
+  the pragma under SEH builds; decide in P2, not by default.
+- Options 2 (wal-index flag word alone: no crash-release) and
+  3 (sidecar file: liveness hand-built, new ecosystem surface) are
+  REJECTED for the reasons the leaning paragraph predicted.
+
 ## Phases
 
 - **Q0 — the spec, red.**  `test/queue1.test`, written before any code:

@@ -116,6 +116,14 @@ layer," and it compounds with every phase of the transport plan.
 round-trip test that generates, compiles, and calls; regeneration is
 deterministic (byte-identical for an unchanged schema).
 
+**TypeScript emitter — substrate decided 2026-08-13 (Sean: N-API).**
+Node has no built-in FFI, so the TS client has two legitimate substrates:
+an **N-API addon** (stable ABI across Node majors, plain C, statically
+links the fork — the local client, Python-ctypes' equivalent) and the
+**wire** (the browser client, waits on transport).  One TS emitter, two
+runtimes behind one generated type surface.  Sequenced after the queue
+engine piece; the addon's cost is a per-platform prebuild matrix.
+
 ### ✅ C generator done 2026-08-03 — `tool/procgen.c`
 
 `procgen.exe app.db > app_client.h` emits a self-contained header of `static`
