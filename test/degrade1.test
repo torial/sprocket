@@ -1,0 +1,127 @@
+# 2026-08-13
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-DEGRADE -- degrade-at-load.  THIS FILE IS WRITTEN RED, ON
+# PURPOSE, BEFORE THE FEATURE EXISTS: its first run shows the OLD
+# behavior (one future-syntax object makes the whole file refuse to
+# open), which is the disease this campaign treats.
+#
+# Do not adjust an expectation here to make the suite pass.  If an
+# expectation is wrong, PLAN-DEGRADE.md changes first, with the reason.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix degrade1
+
+# Build a database, then plant THE FUTURE in it via writable_schema:
+# a mview whose DDL carries a clause this build has never heard of
+# (real rootpage -- it was a genuine view first), an object of an
+# invented TYPE entirely, and a mview whose base has vanished.
+do_execsql_test 1.0 {
+  CREATE TABLE t(a TEXT, amt INTEGER);
+  INSERT INTO t VALUES('x',1),('y',2),('x',3);
+  CREATE TABLE u(b INTEGER PRIMARY KEY, note TEXT);
+  INSERT INTO u VALUES(1,'live');
+  CREATE MATERIALIZED VIEW jv AS
+    SELECT t.a, count(*) AS n, total(u.b) AS tb
+      FROM t JOIN u ON u.b = t.amt GROUP BY t.a;
+  CREATE MATERIALIZED VIEW mv_future AS
+    SELECT a, count(*) AS n FROM t GROUP BY a;
+  CREATE MATERIALIZED VIEW mv_dangling AS
+    SELECT a, count(*) AS n FROM t GROUP BY a;
+} {}
+do_execsql_test 1.1 {
+  PRAGMA writable_schema=ON;
+  UPDATE sqlite_schema
+     SET sql='CREATE MATERIALIZED VIEW mv_future WITH FROBNICATION 7 AS SELECT a, count(*) AS n FROM t GROUP BY a'
+   WHERE name='mv_future';
+  UPDATE sqlite_schema
+     SET sql='CREATE MATERIALIZED VIEW mv_dangling AS SELECT a, count(*) AS n FROM no_such_table GROUP BY a'
+   WHERE name='mv_dangling';
+  INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)
+    VALUES('temporal','tt','tt',2,
+           'CREATE TEMPORAL TABLE tt(x INTEGER) WITH SYSTEM VERSIONING');
+  PRAGMA writable_schema=OFF;
+} {}
+
+# --- the heart of the campaign: the file OPENS ---
+db close
+sqlite3 db test.db
+do_execsql_test 2.0 {
+  SELECT a, amt FROM t ORDER BY amt;
+} {x 1 y 2 x 3}
+
+# The dead are LISTED, with the reasons the loader retained.
+do_execsql_test 2.1 {
+  SELECT name, type FROM pragma_dead_list ORDER BY name;
+} {mv_dangling mview mv_future mview tt temporal}
+do_execsql_test 2.2 {
+  SELECT count(*) FROM pragma_dead_list WHERE reason LIKE '%FROBNICATION%';
+} {1}
+do_execsql_test 2.3 {
+  SELECT count(*) FROM pragma_dead_list WHERE reason LIKE '%no_such_table%';
+} {1}
+
+# Touching a dead object refuses by NAME with the retained reason.
+do_catchsql_test 2.4 {
+  SELECT * FROM mv_future;
+} {1 {mv_future is present but unusable in this build (near "FROBNICATION": syntax error); a newer build can use or remove it}}
+do_catchsql_test 2.5 {
+  SELECT * FROM tt;
+} {1 {tt is present but unusable in this build (near "TEMPORAL": syntax error); a newer build can use or remove it}}
+
+# The file is READ-ONLY while it carries dead objects: an older build
+# cannot know which live tables feed them.
+do_catchsql_test 2.6 {
+  INSERT INTO t VALUES('z',9);
+} {1 {database contains objects this build cannot maintain (see PRAGMA dead_list); writes are disabled to protect them}}
+do_catchsql_test 2.7 {
+  DELETE FROM u WHERE b=1;
+} {1 {database contains objects this build cannot maintain (see PRAGMA dead_list); writes are disabled to protect them}}
+
+# Current-tier machinery lives on BESIDE the dead: the join view reads
+# and its oracle still judges.
+do_execsql_test 3.0 {
+  SELECT a, n FROM jv ORDER BY a;
+} {x 1 y 1}
+do_execsql_test 3.1 {
+  SELECT count(*) FROM pragma_view_check('jv') WHERE kind='diff';
+} {0}
+
+# Reopen: the degraded state is stable, not a one-time accident.
+db close
+sqlite3 db test.db
+do_execsql_test 4.0 {
+  SELECT count(*) FROM pragma_dead_list;
+} {3}
+do_execsql_test 4.1 {
+  SELECT a FROM t WHERE amt=2;
+} {y}
+
+# Healthy files are UNTOUCHED by all of this: empty dead_list, writes
+# work, nothing changed.
+do_test 5.0 {
+  forcedelete healthy.db
+  sqlite3 db2 healthy.db
+  db2 eval {
+    CREATE TABLE h(x INTEGER);
+    INSERT INTO h VALUES(1);
+    CREATE MATERIALIZED VIEW hv AS SELECT count(*) AS n FROM h;
+  }
+  set r [list \
+    [db2 eval {SELECT count(*) FROM pragma_dead_list}] \
+    [db2 eval {INSERT INTO h VALUES(2); SELECT n FROM hv}]]
+  db2 close
+  forcedelete healthy.db
+  set r
+} {0 2}
+
+finish_test
