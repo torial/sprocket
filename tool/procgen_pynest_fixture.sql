@@ -40,3 +40,15 @@ BEGIN
   SELECT post_id, cid FROM comments;
   SELECT r_cid, rid, txt FROM replies;
 END;
+
+-- TSGEN addition (2026-08-14): the JS-number boundary.  2^60 does not fit
+-- a double; the TS runtime must return BigInt for it and plain number for
+-- small integers -- pinned by procgen_tscheck.ts.  The python client
+-- generates a bigv() dataclass too and is unaffected (python ints are
+-- arbitrary precision; procgen_pytest.py simply does not call it).
+CREATE TABLE bignum(v INTEGER);
+INSERT INTO bignum VALUES(1152921504606846976);
+CREATE PROCEDURE bigv() RETURNS TABLE(v INTEGER)
+BEGIN
+  SELECT v FROM bignum;
+END;
