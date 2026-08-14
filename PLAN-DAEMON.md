@@ -48,6 +48,22 @@ self-testing in the established tool-harness pattern.
 
 ## Phases
 
+*D0-D4 (Windows) EXECUTED 2026-08-14, same day as D0.  Receipts:
+`tool/sprocketd.c`, selftest 33 checks 0 failures -- the full nine-point
+matrix including the lying-proc backstop with attribution, the 40/40
+malformed-request sweep against the live socket, and count-in ==
+count-out at shutdown.  Serve mode smoked against a real file.  The
+engine was not touched, so the self-test is the campaign gate by the
+tool-harness discipline.  CORRECTION to D4 as planned: the Linux leg
+requires a socket/thread shim (v1 is Winsock + Win32 threads, per the
+"Windows first" decision) and moves to D5's scope rather than being
+faked here.  Two selftest catches worth the record: wbBytes is the
+LENGTH-PREFIXED writer, and using it to build both the wire name field
+(doubled length) and the CALL SQL text (leading NUL -> prepare("")
+returns a NULL statement whose binds MISUSE with a clean errmsg) --
+the same trap in two costumes, both found by the matrix, neither by
+inspection.*
+
 - **D0 — this plan, and the self-test matrix enumerated red** (below).
 - **D1 — skeleton**: config (db path, port), listener, HELLO/version
   handshake, read-only CALL dispatch on reader connections.
