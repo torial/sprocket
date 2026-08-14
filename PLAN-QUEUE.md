@@ -115,7 +115,12 @@ this paragraph as the reason.
 
 *ALL EXECUTED 2026-08-14, one session from ruling to green.  Receipts:
 queue1 0/20; walseh1 0/260; sweep 42/42 both regimes; veryquick clean
-(see the final commit).  Two corrections the gates bought:*
+in BOTH regimes (release 0/393,879; DEBUG=3 0/394,857); and the
+overnight first: a Linux build (WSL Ubuntu) sweeping the full 42-suite
+roster 42/42, so the os_unix.c slot edits are measured rather than
+mechanically-consistent-and-hoped.  The mode is dogfooded into
+tool/proc_queue.c (14 checks), which promptly found the fresh-empty-
+file edge now recorded in README-QUEUE.md.  Two corrections the gates bought:*
 
 - *The first cut's SEH exception path FABRICATED a "mode active"
   verdict when the shm read faulted — a spurious queue refusal where
