@@ -41,6 +41,17 @@ Litestream solved these with GENERATIONS (salt-keyed segment lineages)
 and by never letting the replica live as an openable database until
 restore time.  Any physical design here inherits that shape.
 
+## RULINGS — Sean, 2026-08-15 (partial)
+
+- **Q1: C ruled** — session changesets, commit-sequence order, carried
+  by the queue/daemon machinery.
+- **Q2: ruled as leaned** — read-replicas + PITR in v1; promotion is a
+  v2 campaign.
+- **Q3: ruled as leaned** — `PRAGMA replica_status` (last_seq,
+  last_utc, lag_source); freshness always carries a receipt.
+- Q4: under drill-down (transport/UX tradeoffs) — see below.
+- Q5: restated for clarity; awaiting.
+
 ## The questions for rulings
 
 ### Q1 — Physical or logical?
