@@ -106,6 +106,20 @@ successors' files.
   `unusable in this build ()` — an empty reading as an answer.  The
   loader now spells the condition; corruptM-131/171 pin it.
 
+## Post-campaign correction 2 (2026-08-15, found by TEMPORAL's gates)
+
+- **Dead-marking now UNREGISTERS half-built objects** (prepare.c): an
+  error raised by a grammar ACTION can fire after the object entered
+  the schema hash; upstream never met the corpse because the whole
+  load failed, but degrade keeps the file alive.  Found when the
+  re-planted temporal fixture loaded a queryable corpse; gencol1-15.20
+  turned out to have been passing BY WRITING THROUGH one -- re-pinned
+  to the refusal.  Recorded nuance for a future look: a schema loaded
+  UNDER writable_schema=ON bypasses corruptSchema tolerantly upstream,
+  and degrade's relationship to that load-time flag is unexamined --
+  today's repair story goes through sqlite_schema rows, which needs no
+  live object.
+
 ## Phases
 
 *All four EXECUTED 2026-08-13, one session.  Receipts: degrade1 0/20;

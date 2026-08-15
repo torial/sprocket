@@ -3530,6 +3530,15 @@ void sqlite3CodeDropTable(Parse *pParse, Table *pTab, int iDb, int isView){
   while( pTrigger ){
     assert( pTrigger->pSchema==pTab->pSchema ||
         pTrigger->pSchema==db->aDb[1].pSchema );
+    if( pTrigger->bMViewMaint ){
+      /* Fork: engine-synthesized triggers (temporal capture, mview
+      ** maintenance) are not schema objects -- no row to delete, no
+      ** hash entry to unlink; their registries die with the schema.
+      ** DROP TEMPORAL TABLE is the first drop of a table carrying
+      ** them, and the unlink assert said so. */
+      pTrigger = pTrigger->pNext;
+      continue;
+    }
     sqlite3DropTriggerPtr(pParse, pTrigger);
     pTrigger = pTrigger->pNext;
   }

@@ -478,11 +478,16 @@ do_test gencol1-15.10 {
 |      0: 0d 00 00 00 00 10 00 00 00 00 00 00 00 00 00 00   ................
 | end c27.db
 }]} {}
-do_execsql_test gencol1-15.20 {
+# Fork (DOCKET #9 degrade-at-load + the corpse-removal refinement): the
+# malformed generated-column table dead-marks at load and is REMOVED
+# from the live schema -- this leg had been passing by writing through
+# the half-built corpse.  Repair now goes through sqlite_schema (the
+# degrade1 repair story), not through the broken object.
+do_catchsql_test gencol1-15.20 {
   PRAGMA writable_schema=ON;
   REPLACE INTO t1 VALUES(9);
   SELECT a, quote(b) FROM t1
-} {9 NULL}
+} {1 {t1 is present but unusable in this build (no such column: unknown); a newer build can use or remove it}}
 
 # 2019-12-16 ticket 3b84b42943644d6f
 # When a table is the right table of a LEFT JOIN and the ON clause is

@@ -1672,6 +1672,27 @@ default is now NO unless that demand materializes.
 
 ## 6. System-versioned temporal tables — *SQLite has no story here at all*
 
+**✅ BUILT 2026-08-15 — designed and shipped in two days, POC-first
+(DESIGN-TEMPORAL: eight rulings, Sean; PLAN-TEMPORAL: seven phases).**
+The done-means below is met in full: `FOR SYSTEM_TIME AS OF` (commit
+sequence exact; UTC text resolved through the commit log to
+last-at-or-before), automatic capture at commit via synthesized
+internal triggers under a C-side reserved sequence (POC 1's two
+clock-borne diseases pinned ABSENT by passing tests), retention via
+`sqlite_history_prune` + a watermark whose far side REFUSES, and the
+replay proof: per-commit from-scratch workload replay equals AS OF at
+every checkpoint, with a corruption control kept red-capable forever
+(temporal2).  Receipts: temporal1 0/32, temporal2 0/8, sweeps 44/44
+both regimes, veryquick 0/393,987 release and 0/394,964 DEBUG.
+Version skew inherited from #9 as designed — degrade's fixture
+graduated from fiction to feature and its future was re-planted.
+Along the way temporal EARNED two refinements elsewhere: dead objects
+now unregister their half-built corpses (a gencol1 leg had been
+passing by writing through one), and ALTER's splice arithmetic learned
+non-"CREATE TABLE " heads.  Recorded v1 boundaries in
+README-TEMPORAL.md; era-stamped history schema, BETWEEN, retention
+policies, and temporal mviews are the named v2 shapes.
+
 SQL:2011 `AS OF` / `FOR SYSTEM_TIME`. Every row carries a validity interval;
 updates close the old version and open a new one; queries can ask what the
 table looked like at a past instant.
