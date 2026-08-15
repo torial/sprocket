@@ -1914,6 +1914,8 @@ struct sqlite3 {
 #define DBFLAG_SchemaKnownOk  0x0010  /* Schema is known to be valid */
 #define DBFLAG_InternalFunc   0x0020  /* Allow use of internal functions */
 #define DBFLAG_EncodingFixed  0x0040  /* No longer possible to change enc. */
+#define DBFLAG_TemporalMaint  0x0080  /* Fork: sqlite_history_prune is
+                                      ** writing the shadow it owns */
 
 /*
 ** Bits of the sqlite3.dbOptFlags field that are used by the
@@ -3411,6 +3413,8 @@ struct SrcItem {
     unsigned hadSchema :1;     /* Had u4.zDatabase before u4.pSchema */
     unsigned fromExists :1;    /* Comes from WHERE EXISTS(...) */
   } fg;
+  Expr *pAsOf;      /* Fork (PLAN-TEMPORAL): FOR SYSTEM_TIME AS OF expr,
+                    ** consumed by the expander's shadow rewrite */
   int iCursor;      /* The VDBE cursor number used to access this table */
   Bitmask colUsed;  /* Bit N set if column N used. Details above for N>62 */
   union {
@@ -5648,6 +5652,8 @@ void sqlite3TemporalSynthTriggers(Parse*, Table*);
 void sqlite3TemporalFunctions(sqlite3*);
 void sqlite3TemporalTxnEnd(sqlite3*);
 void sqlite3TemporalTrigFree(sqlite3*, void*);
+void sqlite3SrcListAsOf(Parse*, SrcList*, Expr*);
+void sqlite3TemporalAsOfRewrite(Parse*, Select*, SrcItem*);
   void sqlite3MViewCodeRefresh(Parse*, const char*, const char*);
 #else
 # define sqlite3MViewFindDependent(A,B,C) 0

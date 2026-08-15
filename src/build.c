@@ -2765,8 +2765,18 @@ void sqlite3EndTable(
   if( sqlite3StrNICmp(p->zName, "sqlite_hist_", 12)==0 ){
     /* Fork (PLAN-TEMPORAL): history and its bookkeeping are read-only
     ** to users -- the engine's own programs and nested parses are
-    ** exempted where the flag is consulted. */
+    ** exempted where the flag is consulted.  The interval columns are
+    ** HIDDEN (the ivm$ precedent) so the AS OF rewrite's SELECT * and
+    ** natural joins see only the declared shape; explicit reads still
+    ** work. */
     p->tabFlags |= TF_Readonly;
+    if( p->nCol>=2
+     && sqlite3_stricmp(p->aCol[p->nCol-2].zCnName, "seq_from")==0
+     && sqlite3_stricmp(p->aCol[p->nCol-1].zCnName, "seq_to")==0 ){
+      p->aCol[p->nCol-2].colFlags |= COLFLAG_HIDDEN;
+      p->aCol[p->nCol-1].colFlags |= COLFLAG_HIDDEN;
+      p->tabFlags |= TF_HasHidden;
+    }
   }
   if( tabOpts & TF_Strict ){
     int ii;
@@ -5142,6 +5152,7 @@ void sqlite3SrcListDelete(sqlite3 *db, SrcList *pList){
 
     if( pItem->zName ) sqlite3DbNNFreeNN(db, pItem->zName);
     if( pItem->zAlias ) sqlite3DbNNFreeNN(db, pItem->zAlias);
+    sqlite3ExprDelete(db, pItem->pAsOf);  /* fork */
     if( pItem->fg.isSubquery ){
       sqlite3SubqueryDelete(db, pItem->u4.pSubq);
     }else if( pItem->fg.fixedSchema==0 && pItem->u4.zDatabase!=0 ){
@@ -5287,6 +5298,17 @@ append_from_error:
 ** Add an INDEXED BY or NOT INDEXED clause to the most recently added
 ** element of the source-list passed as the second argument.
 */
+/* Fork (PLAN-TEMPORAL): attach a FOR SYSTEM_TIME AS OF expression to
+** the FROM term just appended.  The expander consumes it. */
+void sqlite3SrcListAsOf(Parse *pParse, SrcList *p, Expr *pAsOf){
+  if( pAsOf==0 ) return;
+  if( p==0 || pParse->nErr ){
+    sqlite3ExprDelete(pParse->db, pAsOf);
+    return;
+  }
+  p->a[p->nSrc-1].pAsOf = pAsOf;
+}
+
 void sqlite3SrcListIndexedBy(Parse *pParse, SrcList *p, Token *pIndexedBy){
   assert( pIndexedBy!=0 );
   if( p && pIndexedBy->n>0 ){

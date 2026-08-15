@@ -6045,6 +6045,13 @@ static int selectExpander(Walker *pWalker, Select *p){
       if( !IsVirtual(pTab) && cannotBeFunction(pParse, pFrom) ){
         return WRC_Abort;
       }
+      /* Fork (PLAN-TEMPORAL): consume FOR SYSTEM_TIME AS OF by
+      ** rewriting this item onto the shadow history table. */
+      if( pFrom->pAsOf ){
+        sqlite3TemporalAsOfRewrite(pParse, p, pFrom);
+        if( pParse->nErr ) return WRC_Abort;
+        pTab = pFrom->pSTab;
+      }
 #if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
       if( !IsOrdinaryTable(pTab) ){
         i16 nCol;

@@ -810,6 +810,25 @@ stl_prefix(A) ::= seltablist(A) joinop(Y).    {
    if( ALWAYS(A && A->nSrc>0) ) A->a[A->nSrc-1].fg.jointype = (u8)Y;
 }
 stl_prefix(A) ::= .                           {A = 0;}
+// Fork (PLAN-TEMPORAL): FOR SYSTEM_TIME AS OF <expr> on a table
+// reference.  FOR is a fallback keyword, so a bare alias named FOR
+// loses to this production -- the fork's standing tradeoff.
+%type temporal_asof {Expr*}
+%destructor temporal_asof {sqlite3ExprDelete(pParse->db, $$);}
+temporal_asof(A) ::= FOR nm(S) AS nm(O) expr(E). {
+  if( S.n==11 && sqlite3_strnicmp(S.z,"SYSTEM_TIME",11)==0
+   && O.n==2 && sqlite3_strnicmp(O.z,"OF",2)==0 ){
+    A = E;
+  }else{
+    sqlite3ErrorMsg(pParse, "expected FOR SYSTEM_TIME AS OF");
+    sqlite3ExprDelete(pParse->db, E);
+    A = 0;
+  }
+}
+seltablist(A) ::= stl_prefix(A) nm(Y) dbnm(D) temporal_asof(T) as(Z) on_using(N). {
+  A = sqlite3SrcListAppendFromTerm(pParse,A,&Y,&D,&Z,0,&N);
+  sqlite3SrcListAsOf(pParse, A, T);
+}
 seltablist(A) ::= stl_prefix(A) nm(Y) dbnm(D) as(Z) on_using(N). {
   A = sqlite3SrcListAppendFromTerm(pParse,A,&Y,&D,&Z,0,&N);
 }

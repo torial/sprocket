@@ -104,8 +104,8 @@ static int tabIsReadOnly(Parse *pParse, Table *pTab){
   db = pParse->db;
   if( (pTab->tabFlags & TF_Readonly)!=0 ){
     return sqlite3WritableSchema(db)==0 && pParse->nested==0
-        && pParse->bMViewMaintProg==0;  /* fork: engine capture programs
-                                        ** write the history they own */
+        && pParse->bMViewMaintProg==0   /* fork: engine capture programs */
+        && (db->mDbFlags & DBFLAG_TemporalMaint)==0; /* and prune */
   }
   assert( pTab->tabFlags & TF_Shadow );
   return sqlite3ReadOnlyShadowTables(db);

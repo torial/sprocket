@@ -139,8 +139,12 @@ do_catchsql_test 7.3 {
 
 # --- prune: explicit, watermarked, and REFUSING rather than
 # fabricating on the far side ---
+# (Surface correction, recorded in PLAN-TEMPORAL: a pragma table-
+# function binds its second argument as the SCHEMA name, so prune is a
+# DIRECTONLY function instead -- it writes, and the wall against views
+# and triggers is exactly right for it.)
 do_execsql_test 8.0 {
-  SELECT pruned FROM pragma_history_prune('t', 2);
+  SELECT sqlite_history_prune('t', 2);
 } {1}
 do_execsql_test 8.1 {
   SELECT watermark FROM pragma_history_list WHERE name='t';

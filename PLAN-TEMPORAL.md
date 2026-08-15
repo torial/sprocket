@@ -66,6 +66,14 @@ under a reserved sequence.**
 
 ## Q0 corrections from first contact (2026-08-15)
 
+- P5 surface correction: `pragma_history_prune('t', 2)` is impossible
+  as spelled -- a pragma table-function binds argument two as the
+  SCHEMA name (the pragma_table_info convention).  Prune is the
+  DIRECTONLY function `sqlite_history_prune(tbl, upto)` instead, which
+  is also more honest: it WRITES, and DIRECTONLY's wall against views,
+  triggers, and tainted schema is precisely the right fence for a
+  destructive maintenance verb.
+
 - The spec's 1.0 listing predates the watermark storage decision: a
   `sqlite_hist_meta` table exists (WITHOUT ROWID, so no autoindex row),
   and the pin now includes it.

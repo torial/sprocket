@@ -307,11 +307,23 @@ static void temporalReserveFunc(
   }
 }
 
+static void temporalAsofFunc(sqlite3_context*, int, sqlite3_value**);
+static void temporalPruneFunc(sqlite3_context*, int, sqlite3_value**);
+
 void sqlite3TemporalFunctions(sqlite3 *db){
   sqlite3_create_function(db, "sqlite_temporal_seq", 0,
       SQLITE_UTF8|SQLITE_DIRECTONLY, 0, temporalSeqFunc, 0, 0);
   sqlite3_create_function(db, "sqlite_temporal_reserve", 1,
       SQLITE_UTF8|SQLITE_DIRECTONLY, 0, temporalReserveFunc, 0, 0);
+  /* The AS OF resolver is NOT DIRECTONLY: a user view legitimately
+  ** contains FOR SYSTEM_TIME, and the function is read-only with its
+  ** own watermark integrity. */
+  sqlite3_create_function(db, "sqlite_temporal_asof", 2,
+      SQLITE_UTF8, 0, temporalAsofFunc, 0, 0);
+  /* Prune WRITES, so it is DIRECTONLY -- never reachable from views,
+  ** triggers, or tainted schema. */
+  sqlite3_create_function(db, "sqlite_history_prune", 2,
+      SQLITE_UTF8|SQLITE_DIRECTONLY, 0, temporalPruneFunc, 0, 0);
 }
 
 /*
@@ -321,6 +333,200 @@ void sqlite3TemporalFunctions(sqlite3 *db){
 */
 void sqlite3TemporalTxnEnd(sqlite3 *db){
   db->pendingHistSeq = 0;
+}
+
+/* ------------------------------- P4: FOR SYSTEM_TIME AS OF ------------- */
+
+/* One-value integer query with one bound argument (text or value).
+** The nested prepare/step on the same connection between the outer
+** statement's steps is legal; the resolver runs once per query because
+** the rewrite wraps it in an uncorrelated scalar subquery. */
+static sqlite3_int64 temporalQueryI64(
+  sqlite3 *db, const char *zSql, const char *zText, sqlite3_value *pVal
+){
+  sqlite3_stmt *pStmt = 0;
+  sqlite3_int64 v = 0;
+  if( sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0)==SQLITE_OK && pStmt ){
+    if( zText ) sqlite3_bind_text(pStmt, 1, zText, -1, SQLITE_TRANSIENT);
+    if( pVal ) sqlite3_bind_value(pStmt, 1, pVal);
+    if( sqlite3_step(pStmt)==SQLITE_ROW ){
+      v = sqlite3_column_int64(pStmt, 0);
+    }
+  }
+  sqlite3_finalize(pStmt);
+  return v;
+}
+
+/*
+** sqlite_temporal_asof(V, TBL): resolve V -- an integer commit seq, or
+** a UTC text timestamp resolved through the commit log to the last
+** commit at-or-before that instant -- and enforce TBL's prune
+** watermark: an answer from pruned history would be fabricated, so it
+** REFUSES (DESIGN-TEMPORAL Q6).
+*/
+static void temporalAsofFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  const char *zTbl = (const char*)sqlite3_value_text(argv[1]);
+  sqlite3_int64 s, wm;
+  int vt = sqlite3_value_type(argv[0]);
+  UNUSED_PARAMETER(argc);
+  if( vt==SQLITE_INTEGER ){
+    s = sqlite3_value_int64(argv[0]);
+  }else if( vt==SQLITE_TEXT ){
+    s = temporalQueryI64(db,
+        "SELECT coalesce(max(seq),0) FROM main.sqlite_hist_commits"
+        " WHERE utc <= ?1", 0, argv[0]);
+  }else{
+    sqlite3_result_error(ctx, "FOR SYSTEM_TIME AS OF requires an integer "
+        "sequence or a UTC text timestamp", -1);
+    return;
+  }
+  wm = temporalQueryI64(db,
+      "SELECT coalesce(max(watermark),0) FROM main.sqlite_hist_meta"
+      " WHERE tbl = ?1", zTbl, 0);
+  if( s < wm ){
+    char *zMsg = sqlite3_mprintf(
+        "history of %s is pruned before seq %lld; the answer would be "
+        "fabricated", zTbl ? zTbl : "?", wm);
+    if( zMsg ){
+      sqlite3_result_error(ctx, zMsg, -1);
+      sqlite3_free(zMsg);
+    }else{
+      sqlite3_result_error_nomem(ctx);
+    }
+    return;
+  }
+  sqlite3_result_int64(ctx, s);
+}
+
+/*
+** sqlite_history_prune(TBL, UPTO): raise TBL's watermark to UPTO and
+** delete the closed intervals wholly before it.  Open intervals (the
+** present) always survive.  Returns the number of history rows
+** removed.  Explicit and owned by its caller (DESIGN-TEMPORAL Q6);
+** AS OF earlier than the watermark refuses in the resolver.
+*/
+static void temporalPruneFunc(
+  sqlite3_context *ctx, int argc, sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(ctx);
+  const char *zTbl = (const char*)sqlite3_value_text(argv[0]);
+  sqlite3_int64 upto = sqlite3_value_int64(argv[1]);
+  Table *pTab;
+  char *zSql;
+  int rc, nPruned = 0;
+  UNUSED_PARAMETER(argc);
+  pTab = zTbl ? sqlite3FindTable(db, zTbl, "main") : 0;
+  if( pTab==0 || (pTab->tabFlags & TF_Temporal)==0 ){
+    sqlite3_result_error(ctx,
+        "history_prune: not a system-versioned table", -1);
+    return;
+  }
+  db->mDbFlags |= DBFLAG_TemporalMaint;
+  zSql = sqlite3_mprintf(
+      "INSERT INTO main.sqlite_hist_meta(tbl, watermark) VALUES(%Q, %lld)"
+      " ON CONFLICT(tbl) DO UPDATE SET watermark=max(watermark, %lld);"
+      "DELETE FROM main.\"sqlite_hist_%w\""
+      " WHERE seq_to IS NOT NULL AND seq_to <= %lld;",
+      zTbl, upto, upto, zTbl, upto);
+  if( zSql==0 ){
+    db->mDbFlags &= ~DBFLAG_TemporalMaint;
+    sqlite3_result_error_nomem(ctx);
+    return;
+  }
+  rc = sqlite3_exec(db, zSql, 0, 0, 0);
+  nPruned = sqlite3_changes(db);
+  sqlite3_free(zSql);
+  db->mDbFlags &= ~DBFLAG_TemporalMaint;
+  if( rc!=SQLITE_OK ){
+    sqlite3_result_error(ctx, sqlite3_errmsg(db), -1);
+    return;
+  }
+  sqlite3_result_int(ctx, nPruned);
+}
+
+/* alias.col reference */
+static Expr *temporalDotRef(Parse *pParse, const char *zAlias,
+                            const char *zCol){
+  sqlite3 *db = pParse->db;
+  return sqlite3PExpr(pParse, TK_DOT,
+      sqlite3Expr(db, TK_ID, zAlias),
+      sqlite3Expr(db, TK_ID, zCol));
+}
+
+/*
+** Consume pItem->pAsOf: swap the item onto the shadow history table
+** (aliased to the user's spelling, interval columns hidden) and AND
+** the interval-containment predicate into the SELECT's WHERE.  The
+** resolver rides an uncorrelated scalar subquery so watermark checking
+** and text resolution run once per query, not once per row.
+*/
+void sqlite3TemporalAsOfRewrite(Parse *pParse, Select *pSel, SrcItem *pItem){
+  sqlite3 *db = pParse->db;
+  Table *pTab = pItem->pSTab;
+  Table *pHist;
+  char *zHist;
+  Expr *pAsOf = pItem->pAsOf;
+  Expr *pFn, *pSub, *pLe, *pNull, *pGt, *pOr, *pCond;
+  ExprList *pArgs;
+  Select *pScalar;
+  Token tkFn;
+  int iDb;
+
+  pItem->pAsOf = 0;                     /* consumed on every path */
+  if( (pTab->tabFlags & TF_Temporal)==0 ){
+    sqlite3ErrorMsg(pParse,
+       "%s is not system-versioned; FOR SYSTEM_TIME does not apply",
+       pTab->zName);
+    sqlite3ExprDelete(db, pAsOf);
+    return;
+  }
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  zHist = sqlite3MPrintf(db, "sqlite_hist_%s", pTab->zName);
+  pHist = zHist ? sqlite3FindTable(db, zHist, db->aDb[iDb].zDbSName) : 0;
+  sqlite3DbFree(db, zHist);
+  if( pHist==0 ){
+    sqlite3ErrorMsg(pParse, "history of %s is missing", pTab->zName);
+    sqlite3ExprDelete(db, pAsOf);
+    return;
+  }
+  if( pItem->zAlias==0 ){
+    pItem->zAlias = sqlite3DbStrDup(db, pTab->zName);
+  }
+  pTab->nTabRef--;
+  pItem->pSTab = pHist;
+  pHist->nTabRef++;
+
+  /* (SELECT sqlite_temporal_asof(<expr>, '<table>')) */
+  pArgs = sqlite3ExprListAppend(pParse, 0, pAsOf);
+  pArgs = sqlite3ExprListAppend(pParse, pArgs,
+      sqlite3Expr(db, TK_STRING, pTab->zName));
+  tkFn.z = "sqlite_temporal_asof";
+  tkFn.n = 20;
+  pFn = sqlite3ExprFunction(pParse, pArgs, &tkFn, 0);
+  pScalar = sqlite3SelectNew(pParse,
+      sqlite3ExprListAppend(pParse, 0, pFn), 0,0,0,0,0, 0, 0);
+  pSub = sqlite3PExpr(pParse, TK_SELECT, 0, 0);
+  if( pSub && pScalar ){
+    pSub->x.pSelect = pScalar;
+    ExprSetProperty(pSub, EP_xIsSelect|EP_Subquery);
+  }else{
+    sqlite3SelectDelete(db, pScalar);
+  }
+
+  /* alias.seq_from <= S AND (alias.seq_to IS NULL OR alias.seq_to > S) */
+  pLe = sqlite3PExpr(pParse, TK_LE,
+      temporalDotRef(pParse, pItem->zAlias, "seq_from"), pSub);
+  pNull = sqlite3PExpr(pParse, TK_ISNULL,
+      temporalDotRef(pParse, pItem->zAlias, "seq_to"), 0);
+  pGt = sqlite3PExpr(pParse, TK_GT,
+      temporalDotRef(pParse, pItem->zAlias, "seq_to"),
+      sqlite3ExprDup(db, pSub, 0));
+  pOr = sqlite3PExpr(pParse, TK_OR, pNull, pGt);
+  pCond = sqlite3PExpr(pParse, TK_AND, pLe, pOr);
+  pSel->pWhere = sqlite3ExprAnd(pParse, pSel->pWhere, pCond);
 }
 
 #endif /* !defined(SQLITE_OMIT_TEMPORAL) */

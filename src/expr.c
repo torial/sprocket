@@ -1921,6 +1921,7 @@ SrcList *sqlite3SrcListDup(sqlite3 *db, const SrcList *p, int flags){
     }
     pNewItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
     pNewItem->zAlias = sqlite3DbStrDup(db, pOldItem->zAlias);
+    pNewItem->pAsOf = sqlite3ExprDup(db, pOldItem->pAsOf, flags); /* fork */
     pNewItem->iCursor = pOldItem->iCursor;
     if( pNewItem->fg.isIndexedBy ){
       pNewItem->u1.zIndexedBy = sqlite3DbStrDup(db, pOldItem->u1.zIndexedBy);

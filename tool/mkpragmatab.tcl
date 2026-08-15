@@ -326,6 +326,11 @@ set pragma_def {
   COLS: name type reason
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
 
+  NAME: history_list
+  FLAG: NeedSchema Result0 SchemaOpt
+  COLS: name watermark nhist
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+
   NAME: queue_writer
   FLAG: NeedSchema Result0
   IF:   !defined(SQLITE_OMIT_WAL)

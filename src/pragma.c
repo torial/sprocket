@@ -1839,6 +1839,57 @@ void sqlite3Pragma(
   ** DOCKET #9): name, schema-row type, and the refusal reason retained
   ** verbatim.  Empty on a healthy database.  Sorted by name.
   */
+  /*
+  **  PRAGMA history_list
+  **
+  ** One row per system-versioned table: (name, watermark, nhist).
+  ** Counts are read live at compile of the pragma -- deterministic
+  ** values, no timing (PLAN-TEMPORAL truth surface).
+  */
+  case PragTyp_HISTORY_LIST: {
+    /* One row per system-versioned table: (name, watermark, nhist).
+    ** Counts are nested SELECTs evaluated at RUN time -- the
+    ** MViewCodeList mechanism.  (The first cut ran prepare/step at
+    ** codegen and the statement doubled its own rows; the mechanism
+    ** the fork already trusted was the fix.) */
+    HashElem *he;
+    Table **apT;
+    int nT = 0, j, k;
+    for(he=sqliteHashFirst(&pDb->pSchema->tblHash); he;
+        he=sqliteHashNext(he)){
+      Table *pT = (Table*)sqliteHashData(he);
+      if( pT->tabFlags & TF_Temporal ) nT++;
+    }
+    if( nT==0 ) break;
+    apT = sqlite3DbMallocRawNN(db, nT*sizeof(Table*));
+    if( apT==0 ) break;
+    j = 0;
+    for(he=sqliteHashFirst(&pDb->pSchema->tblHash); he;
+        he=sqliteHashNext(he)){
+      Table *pT = (Table*)sqliteHashData(he);
+      if( pT->tabFlags & TF_Temporal ) apT[j++] = pT;
+    }
+    for(j=1; j<nT; j++){
+      Table *pT = apT[j];
+      for(k=j; k>0 && sqlite3StrICmp(apT[k-1]->zName, pT->zName)>0; k--){
+        apT[k] = apT[k-1];
+      }
+      apT[k] = pT;
+    }
+    for(j=0; j<nT; j++){
+      sqlite3NestedParse(pParse,
+        "SELECT %Q,"
+        "(SELECT coalesce(max(watermark),0) FROM \"%w\".sqlite_hist_meta"
+        "  WHERE tbl=%Q),"
+        "(SELECT count(*) FROM \"%w\".\"sqlite_hist_%w\")",
+        apT[j]->zName,
+        pDb->zDbSName, apT[j]->zName,
+        pDb->zDbSName, apT[j]->zName);
+    }
+    sqlite3DbFree(db, apT);
+    break;
+  }
+
   case PragTyp_DEAD_LIST: {
     int ii;
     pParse->nMem = 3;
