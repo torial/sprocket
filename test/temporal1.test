@@ -1,0 +1,172 @@
+# 2026-08-15
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-TEMPORAL Q0 -- system-versioned tables.  THIS FILE IS WRITTEN
+# RED, ON PURPOSE, BEFORE THE FEATURE EXISTS: on first run the grammar
+# has never heard of TEMPORAL and every section dies at parse.
+#
+# Do not adjust an expectation here to make the suite pass.  If an
+# expectation is wrong, PLAN-TEMPORAL.md changes first, with the
+# reason.  The rulings these pins encode are DESIGN-TEMPORAL's eight,
+# Sean, 2026-08-15.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix temporal1
+
+# --- DDL and the shadow ---
+do_execsql_test 1.0 {
+  CREATE TEMPORAL TABLE t(a INTEGER PRIMARY KEY, b TEXT)
+    WITH SYSTEM VERSIONING;
+  SELECT name FROM sqlite_schema WHERE name LIKE '%t%' ORDER BY name;
+} {sqlite_hist_commits sqlite_hist_t t}
+
+# --- one commit, one seq; the shadow carries final images ---
+do_execsql_test 1.1 {
+  BEGIN;
+    INSERT INTO t VALUES(1,'one');
+    INSERT INTO t VALUES(2,'two');
+  COMMIT;
+  SELECT a, b FROM t ORDER BY a;
+} {1 one 2 two}
+do_execsql_test 1.2 {
+  SELECT a, b, seq_from, seq_to FROM sqlite_hist_t ORDER BY a;
+} {1 one 1 {} 2 two 1 {}}
+do_execsql_test 1.3 {
+  SELECT count(*) FROM sqlite_hist_commits;
+} {1}
+
+# --- POC 1 disease 1, pinned absent: intra-transaction intermediate
+# states never enter history.  Two updates of one row in one
+# transaction leave exactly ONE new history row, carrying the FINAL
+# value, and the seq advanced by exactly one. ---
+do_execsql_test 2.0 {
+  BEGIN;
+    UPDATE t SET b='mid'   WHERE a=1;
+    UPDATE t SET b='final' WHERE a=1;
+  COMMIT;
+  SELECT count(*) FROM sqlite_hist_t WHERE a=1;
+} {2}
+do_execsql_test 2.1 {
+  SELECT b FROM sqlite_hist_t WHERE a=1 AND seq_to IS NULL;
+} {final}
+do_execsql_test 2.2 {
+  SELECT count(*) FROM sqlite_hist_t WHERE a=1 AND b='mid';
+} {0}
+do_execsql_test 2.3 {
+  SELECT max(seq) FROM sqlite_hist_commits;
+} {2}
+
+# --- seqs advance per COMMIT, not per statement ---
+do_execsql_test 2.4 {
+  UPDATE t SET b='three' WHERE a=2;
+  DELETE FROM t WHERE a=2;
+  SELECT max(seq) FROM sqlite_hist_commits;
+} {4}
+
+# --- AS OF across the whole lifecycle ---
+do_execsql_test 3.0 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF 1 WHERE a=1;
+} {one}
+do_execsql_test 3.1 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF 2 WHERE a=1;
+} {final}
+do_execsql_test 3.2 {
+  SELECT a, b FROM t FOR SYSTEM_TIME AS OF 3 ORDER BY a;
+} {1 final 2 three}
+do_execsql_test 3.3 {
+  SELECT a FROM t FOR SYSTEM_TIME AS OF 4 ORDER BY a;
+} {1}
+do_execsql_test 3.4 {
+  SELECT count(*) FROM t FOR SYSTEM_TIME AS OF 0;
+} {0}
+
+# --- AS OF by UTC text resolves through the commit log; pinned via
+# the log's own values so no wall-clock guessing enters the suite ---
+do_execsql_test 4.0 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF
+    (SELECT utc FROM sqlite_hist_commits WHERE seq=2) WHERE a=1;
+} {final}
+do_execsql_test 4.1 {
+  SELECT count(*) FROM sqlite_hist_commits WHERE utc NOT LIKE '____-__-__ __:__:__._%';
+} {0}
+
+# --- the truth surface ---
+do_execsql_test 5.0 {
+  SELECT name, watermark, nhist FROM pragma_history_list;
+} {t 0 4}
+
+# --- reopen: temporal-ness is schema, not session state ---
+db close
+sqlite3 db test.db
+do_execsql_test 5.1 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF 1 WHERE a=1;
+} {one}
+
+# --- DROP discipline ---
+do_catchsql_test 6.0 {
+  DROP TABLE t;
+} {1 {t is system-versioned; use DROP TEMPORAL TABLE to drop it together with its history}}
+do_execsql_test 6.1 {
+  CREATE TEMPORAL TABLE scratch(x INTEGER) WITH SYSTEM VERSIONING;
+  DROP TEMPORAL TABLE scratch;
+  SELECT count(*) FROM sqlite_schema WHERE name LIKE '%scratch%';
+} {0}
+
+# --- ALTER: ADD COLUMN honest-NULL; shape changes refuse ---
+do_execsql_test 7.0 {
+  ALTER TABLE t ADD COLUMN c INTEGER;
+  UPDATE t SET c=9 WHERE a=1;
+  SELECT c FROM t FOR SYSTEM_TIME AS OF 1 WHERE a=1;
+} {{}}
+do_execsql_test 7.1 {
+  SELECT c FROM t FOR SYSTEM_TIME AS OF 6 WHERE a=1;
+} {9}
+do_catchsql_test 7.2 {
+  ALTER TABLE t RENAME COLUMN b TO bb;
+} {1 {t is system-versioned; its history carries the current shape (only ADD COLUMN is supported)}}
+do_catchsql_test 7.3 {
+  ALTER TABLE t DROP COLUMN c;
+} {1 {t is system-versioned; its history carries the current shape (only ADD COLUMN is supported)}}
+
+# --- prune: explicit, watermarked, and REFUSING rather than
+# fabricating on the far side ---
+do_execsql_test 8.0 {
+  SELECT pruned FROM pragma_history_prune('t', 2);
+} {1}
+do_execsql_test 8.1 {
+  SELECT watermark FROM pragma_history_list WHERE name='t';
+} {2}
+do_catchsql_test 8.2 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF 1 WHERE a=1;
+} {1 {history of t is pruned before seq 2; the answer would be fabricated}}
+do_execsql_test 8.3 {
+  SELECT b FROM t FOR SYSTEM_TIME AS OF 2 WHERE a=1;
+} {final}
+
+# --- interactions declared in DESIGN-TEMPORAL Q7 ---
+do_catchsql_test 9.0 {
+  CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t;
+} {1 {materialized views over system-versioned tables are not supported: t}}
+
+# --- the shadow is protected like the machinery it is ---
+do_catchsql_test 9.1 {
+  DELETE FROM sqlite_hist_t;
+} {1 {table sqlite_hist_t may not be modified}}
+
+# --- healthy-file inertness: plain tables see nothing ---
+do_execsql_test 10.0 {
+  CREATE TABLE plain(x INTEGER);
+  INSERT INTO plain VALUES(1);
+  SELECT count(*) FROM pragma_history_list WHERE name='plain';
+} {0}
+
+finish_test

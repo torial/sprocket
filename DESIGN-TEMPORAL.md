@@ -42,6 +42,25 @@ independent by construction.  Equality held at every checkpoint, and
 the control (the same interior corruption POC 2 missed) went red.
 This is the done-means instrument, proven before the feature exists.
 
+## RULINGS — Sean, 2026-08-15
+
+- **Q1: B ruled**, with the refinement that wall-clock is **UTC (GMT)**
+  — the commit log stores UTC (SQLite's native 'now'), text timestamps
+  in AS OF are interpreted UTC, and localtime is only ever the user's
+  explicit modifier.  No local zones in the axis or the chart.
+- **Q2: A ruled** (shadow history tables, sqlite_hist_*).
+- **Q3: B ruled** (engine-native capture at commit).
+- **Q4: as stated** (AS OF in v1; BETWEEN waits).
+- **Q5: ADD COLUMN ruled** (other shape changes refuse; era-stamped
+  history schema recorded for v2).
+- **Q6: watermark + refusal affirmed.**  Sean's brainstorm, recorded
+  not built: retention POLICIES (prune-on-date, prune-on-row-count
+  "temporal triggers") — his own caveats: the hard part is how much to
+  delete, it is easy to do other ways, and the motivation is history
+  growing more cumbersome than the data.  Explicit pragma stands as
+  v1; policies are a v2 shape if the cumbersomeness materializes.
+- **Q7, Q8: agreed as recommended.**
+
 ## The questions, with scenarios and my recommendations
 
 ### Q1 — What is system time?
