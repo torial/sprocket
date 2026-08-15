@@ -1280,7 +1280,14 @@ void sqlite3ExprFunctionUsable(
 ){
   assert( !IN_RENAME_OBJECT );
   assert( (pDef->funcFlags & (SQLITE_FUNC_DIRECT|SQLITE_FUNC_UNSAFE))!=0 );
-  if( ExprHasProperty(pExpr, EP_FromDDL) 
+  if( pParse->bMViewMaintProg ){
+    /* Fork: an ENGINE-SYNTHESIZED program (mview maintenance, temporal
+    ** capture) is not tainted schema -- it is the engine talking to
+    ** itself, and its internal functions (sqlite_temporal_seq et al)
+    ** stay DIRECTONLY precisely so USER triggers cannot reach them. */
+    return;
+  }
+  if( ExprHasProperty(pExpr, EP_FromDDL)
    || pParse->prepFlags & SQLITE_PREPARE_FROM_DDL
   ){
     if( (pDef->funcFlags & SQLITE_FUNC_DIRECT)!=0

@@ -208,6 +208,13 @@ cmd ::= create_table create_table_args.
 create_table ::= createkw temp(T) TABLE ifnotexists(E) nm(Y) dbnm(Z). {
    sqlite3StartTable(pParse,&Y,&Z,T,0,0,E);
 }
+// Fork (PLAN-TEMPORAL): system-versioned tables.  TEMPORAL costs zero
+// reserved words (fallback token); the WITH SYSTEM VERSIONING option is
+// validated for pairing in sqlite3EndTable.
+create_table ::= createkw TEMPORAL TABLE ifnotexists(E) nm(Y) dbnm(Z). {
+   pParse->bTemporalCreate = 1;
+   sqlite3StartTable(pParse,&Y,&Z,0,0,0,E);
+}
 createkw(A) ::= CREATE(A).  {
   disableLookaside(pParse);
 }
@@ -246,6 +253,16 @@ table_option(A) ::= nm(X). {
   }else{
     A = 0;
     sqlite3ErrorMsg(pParse, "unknown table option: %.*s", X.n, X.z);
+  }
+}
+table_option(A) ::= WITH nm(X) nm(Y). {
+  if( X.n==6 && sqlite3_strnicmp(X.z,"system",6)==0
+   && Y.n==10 && sqlite3_strnicmp(Y.z,"versioning",10)==0 ){
+    A = TF_Temporal;
+  }else{
+    A = 0;
+    sqlite3ErrorMsg(pParse, "unknown table option: WITH %.*s %.*s",
+                    X.n, X.z, Y.n, Y.z);
   }
 }
 columnlist ::= columnlist COMMA columnname carglist.
@@ -294,7 +311,7 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,A,Y);}
 %ifndef SQLITE_OMIT_GENERATED_COLUMNS
   GENERATED ALWAYS
 %endif
-  MATERIALIZED
+  MATERIALIZED TEMPORAL
   REINDEX RENAME CTIME_KW IF
   .
 %wildcard ANY.

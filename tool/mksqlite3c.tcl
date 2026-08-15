@@ -453,6 +453,7 @@ set flist {
    prepare.c
    proc.c
    mview.c
+   temporal.c
    select.c
    table.c
    trigger.c

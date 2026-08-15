@@ -3705,6 +3705,7 @@ int sqlite3VdbeHalt(Vdbe *p){
           p->nChange = 0;
         }else{
           db->nDeferredCons = 0;
+  db->pendingHistSeq = 0;  /* fork: temporal reservation dies with the txn */
           db->nDeferredImmCons = 0;
           db->flags &= ~(u64)SQLITE_DeferFKs;
           sqlite3CommitInternalChanges(db);

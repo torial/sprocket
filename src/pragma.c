@@ -1303,6 +1303,7 @@ void sqlite3Pragma(
         if( mask==SQLITE_DeferFKs ){
           db->nDeferredImmCons = 0;
           db->nDeferredCons = 0;
+  db->pendingHistSeq = 0;  /* fork: temporal reservation dies with the txn */
         }
         if( (mask & SQLITE_WriteSchema)!=0
          && sqlite3_stricmp(zRight, "reset")==0

@@ -1519,6 +1519,8 @@ struct Schema {
   Hash mviewHash;      /* MViewInfo for all materialized views, by name */
   Hash deadHash;       /* DeadObj for objects this build could not load
                        ** (degrade-at-load, DOCKET #9) */
+  Hash histHash;       /* Fork (PLAN-TEMPORAL): capture triggers per
+                       ** system-versioned table, mview lifecycle */
   Hash fkeyHash;       /* All foreign keys by referenced table name */
   Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
   u8 file_format;      /* Schema format version for this file */
@@ -1802,6 +1804,8 @@ struct sqlite3 {
   int nSavepoint;               /* Number of non-transaction savepoints */
   int nStatement;               /* Number of nested statement-transactions  */
   i64 nDeferredCons;            /* Net deferred constraints this transaction. */
+  i64 pendingHistSeq;      /* Fork (PLAN-TEMPORAL): reserved commit seq
+                           ** for the open txn; 0 = none reserved */
   i64 nDeferredImmCons;         /* Net deferred immediate constraints */
   int *pnBytesFreed;            /* If not NULL, increment this in DbFree() */
   DbClientData *pDbData;        /* sqlite3_set_clientdata() content */
@@ -2520,6 +2524,9 @@ struct Table {
 #define TF_MView          0x00040000 /* A materialized view (fork): a real
                                      ** table, engine-written only */
 #define TF_MViewDeferred  0x00080000 /* MView with MAINTENANCE DEFERRED */
+#define TF_Temporal       0x00200000 /* System-versioned (fork): writes are
+                                       ** captured into sqlite_hist_<name>
+                                       ** under a per-commit sequence */
 #define TF_MViewBase      0x00100000 /* Some materialized view is defined
                                      ** over this table (fork): TriggerList
                                      ** consults the registry */
@@ -3957,6 +3964,7 @@ struct Parse {
   bft checkSchema :1;  /* Causes schema cookie check after an error */
   bft bMViewCreate:1;  /* Inside CREATE MATERIALIZED VIEW: steers the
                        ** object-name check's type to 'mview' (fork) */
+  bft bTemporalCreate:1; /* CREATE TEMPORAL TABLE in progress (fork) */
   bft bMViewTrigSynth:1; /* Sub-parse synthesizing a maintenance trigger:
                        ** FinishTrigger builds the object but persists
                        ** nothing and registers nothing (fork) */
@@ -5632,6 +5640,13 @@ struct MViewInfo {
   void sqlite3MViewCodeCheck(Parse*, Vdbe*, const char*, const char*);
   void sqlite3MViewCodeList(Parse*, Vdbe*, const char*);
   void sqlite3MViewSynthTriggers(Parse*, Table*);
+
+/* Fork (PLAN-TEMPORAL) -- src/temporal.c */
+void sqlite3TemporalEndTable(Parse*, Table*);
+void sqlite3TemporalSynthTriggers(Parse*, Table*);
+void sqlite3TemporalFunctions(sqlite3*);
+void sqlite3TemporalTxnEnd(sqlite3*);
+void sqlite3TemporalTrigFree(sqlite3*, void*);
   void sqlite3MViewCodeRefresh(Parse*, const char*, const char*);
 #else
 # define sqlite3MViewFindDependent(A,B,C) 0

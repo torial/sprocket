@@ -274,6 +274,7 @@ static Keyword aKeywordTable[] = {
   { "LOOP",             "TK_LOOP",         PROCEDURE,        1      },
   { "MATCH",            "TK_MATCH",        ALWAYS,           2      },
   { "MATERIALIZED",     "TK_MATERIALIZED", CTE,              12     },
+  { "TEMPORAL",         "TK_TEMPORAL",     ALWAYS,           10     },
   { "NATURAL",          "TK_JOIN_KW",      ALWAYS,           3      },
   { "NO",               "TK_NO",           FKEY|WINDOWFUNC,  2      },
   { "NOT",              "TK_NOT",          ALWAYS,           10     },

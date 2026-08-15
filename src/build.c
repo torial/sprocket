@@ -1086,6 +1086,12 @@ int sqlite3CheckObjectName(
     /* Skip these error checks for writable_schema=ON */
     return SQLITE_OK;
   }
+  if( pParse->bMViewTrigSynth ){
+    /* Fork: an engine-internal synthesis sub-parse (mview maintenance,
+    ** temporal capture) may name its objects in the engine's own
+    ** reserved namespace -- that is what the namespace is FOR. */
+    return SQLITE_OK;
+  }
   if( db->init.busy ){
     if( sqlite3_stricmp(zType, db->init.azInit[0])
      || sqlite3_stricmp(zName, db->init.azInit[1])
@@ -2730,6 +2736,29 @@ void sqlite3EndTable(
   **      then all columns of the PRIMARY KEY must have a NOT NULL
   **      constraint.
   */
+  /* Fork (PLAN-TEMPORAL): TEMPORAL and WITH SYSTEM VERSIONING must
+  ** travel together -- half a declaration is refused with the fix. */
+  if( pParse->bTemporalCreate && (tabOpts & TF_Temporal)==0 ){
+    sqlite3ErrorMsg(pParse,
+       "CREATE TEMPORAL TABLE requires WITH SYSTEM VERSIONING");
+    return;
+  }
+  if( !pParse->bTemporalCreate && (tabOpts & TF_Temporal)!=0 ){
+    sqlite3ErrorMsg(pParse,
+       "WITH SYSTEM VERSIONING requires CREATE TEMPORAL TABLE");
+    return;
+  }
+  if( tabOpts & TF_Temporal ){
+    /* Table options merge selectively (TF_Strict below is the
+    ** precedent); without this line the flag dies here and the stored
+    ** DDL head loses its TEMPORAL. */
+    p->tabFlags |= TF_Temporal;
+  }
+  /* The parse flag is CONSUMED by the validation above: the nested
+  ** parses this very statement spawns (the shadow, the commit log)
+  ** are plain CREATE TABLEs on the same Parse object, and a sticky
+  ** flag would trip the pairing check on them -- it did. */
+  pParse->bTemporalCreate = 0;
   if( tabOpts & TF_Strict ){
     int ii;
     p->tabFlags |= TF_Strict;
@@ -2942,8 +2971,14 @@ void sqlite3EndTable(
       Token *pEnd2 = tabOpts ? &pParse->sLastToken : pEnd;
       n = (int)(pEnd2->z - pParse->sNameToken.z);
       if( pEnd2->z[0]!=';' ) n += pEnd2->n;
+      /* Fork (PLAN-TEMPORAL): the stored head must say what the object
+      ** IS -- reconstructing "CREATE TABLE" for a temporal table drops
+      ** the word the re-parse needs, leaving the option orphaned (the
+      ** pairing check caught exactly that at first schema load). */
       zStmt = sqlite3MPrintf(db,
-          "CREATE %s %.*s", zType2, n, pParse->sNameToken.z
+          "CREATE %s%s %.*s",
+          (p->tabFlags & TF_Temporal) ? "TEMPORAL " : "",
+          zType2, n, pParse->sNameToken.z
       );
     }
 
@@ -2966,6 +3001,14 @@ void sqlite3EndTable(
     );
     sqlite3DbFree(db, zStmt);
     sqlite3ChangeCookie(pParse, iDb);
+
+/* Fork (PLAN-TEMPORAL): a system-versioned table gets its shadow
+    ** history table plus the db-wide commit log and watermark meta --
+    ** ordinary tables in the protected namespace, created by nested
+    ** parse exactly as sqlite_sequence is below. */
+    if( (p->tabFlags & TF_Temporal)!=0 && !IN_SPECIAL_PARSE ){
+      sqlite3TemporalEndTable(pParse, p);
+    }
 
 #ifndef SQLITE_OMIT_AUTOINCREMENT
     /* Check to see if we need to create an sqlite_sequence table for

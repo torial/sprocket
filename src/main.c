@@ -1532,6 +1532,7 @@ void sqlite3RollbackAll(sqlite3 *db, int tripCode){
 
   /* Any deferred constraint violations have now been resolved. */
   db->nDeferredCons = 0;
+  db->pendingHistSeq = 0;  /* fork: temporal reservation dies with the txn */
   db->nDeferredImmCons = 0;
   db->flags &= ~(u64)(SQLITE_DeferFKs|SQLITE_CorruptRdOnly);
 
@@ -3649,6 +3650,7 @@ static int openDatabase(
   */
   sqlite3Error(db, SQLITE_OK);
   sqlite3RegisterPerConnectionBuiltinFunctions(db);
+  sqlite3TemporalFunctions(db);  /* fork (PLAN-TEMPORAL) */
   rc = sqlite3_errcode(db);
 
 

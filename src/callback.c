@@ -520,6 +520,15 @@ void sqlite3SchemaClear(void *p){
   }
 #endif
   sqlite3MViewHashClear(&xdb, &pSchema->mviewHash);
+  {
+    /* Fork (PLAN-TEMPORAL): free the capture-trigger registry with the
+    ** same stand-in-handle discipline as the mview registry above. */
+    HashElem *pE;
+    for(pE=sqliteHashFirst(&pSchema->histHash); pE; pE=sqliteHashNext(pE)){
+      sqlite3TemporalTrigFree(&xdb, sqliteHashData(pE));
+    }
+    sqlite3HashClear(&pSchema->histHash);
+  }
   sqlite3DeadHashClear(&pSchema->deadHash);
   sqlite3HashInit(&pSchema->tblHash);
   for(pElem=sqliteHashFirst(&temp1); pElem; pElem=sqliteHashNext(pElem)){
@@ -554,6 +563,7 @@ Schema *sqlite3SchemaGet(sqlite3 *db, Btree *pBt){
     sqlite3HashInit(&p->trigHash);
     sqlite3HashInit(&p->procHash);
     sqlite3HashInit(&p->mviewHash);
+    sqlite3HashInit(&p->histHash);
     sqlite3HashInit(&p->deadHash);
     sqlite3HashInit(&p->fkeyHash);
     p->enc = SQLITE_UTF8;

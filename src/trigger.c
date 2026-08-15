@@ -64,6 +64,12 @@ Trigger *sqlite3TriggerList(Parse *pParse, Table *pTab){
     ** through synthesized triggers, built lazily on the first ask */
     sqlite3MViewSynthTriggers(pParse, pTab);
   }
+  if( pTab->tabFlags & TF_Temporal ){
+    /* fork (PLAN-TEMPORAL): same lazy discipline, own guard -- the
+    ** first cut hid this call inside the mview guard above, which a
+    ** temporal table never satisfies */
+    sqlite3TemporalSynthTriggers(pParse, pTab);
+  }
 #endif
   pTmpSchema = pParse->db->aDb[1].pSchema;
   p = sqliteHashFirst(&pTmpSchema->trigHash);
@@ -899,6 +905,9 @@ Trigger *sqlite3TriggersExist(
     /* fork: synthesize materialized-view maintenance triggers before
     ** the no-triggers short-circuit below can conclude there are none */
     sqlite3MViewSynthTriggers(pParse, pTab);
+  }
+  if( (pTab->tabFlags & TF_Temporal)!=0 && !pParse->disableTriggers ){
+    sqlite3TemporalSynthTriggers(pParse, pTab);
   }
 #endif
   if( (pTab->pTrigger==0 && !tempTriggersExist(pParse->db))

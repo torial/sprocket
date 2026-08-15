@@ -27,7 +27,7 @@ do_execsql_test 1.0 {
   CREATE TEMPORAL TABLE t(a INTEGER PRIMARY KEY, b TEXT)
     WITH SYSTEM VERSIONING;
   SELECT name FROM sqlite_schema WHERE name LIKE '%t%' ORDER BY name;
-} {sqlite_hist_commits sqlite_hist_t t}
+} {sqlite_hist_commits sqlite_hist_meta sqlite_hist_t t}
 
 # --- one commit, one seq; the shadow carries final images ---
 do_execsql_test 1.1 {
