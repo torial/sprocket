@@ -3965,6 +3965,7 @@ struct Parse {
   bft bMViewCreate:1;  /* Inside CREATE MATERIALIZED VIEW: steers the
                        ** object-name check's type to 'mview' (fork) */
   bft bTemporalCreate:1; /* CREATE TEMPORAL TABLE in progress (fork) */
+  bft bTemporalDrop:1;   /* DROP TEMPORAL TABLE in progress (fork) */
   bft bMViewTrigSynth:1; /* Sub-parse synthesizing a maintenance trigger:
                        ** FinishTrigger builds the object but persists
                        ** nothing and registers nothing (fork) */

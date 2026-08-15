@@ -23,6 +23,9 @@ set testprefix degrade1
 
 # Build a database, then plant THE FUTURE in it via writable_schema:
 # a mview whose DDL carries a clause this build has never heard of
+# (re-planted 2026-08-15: CREATE TEMPORAL TABLE graduated from fiction
+# to feature, so tt's future moved to WITH QUANTUM VERSIONING --
+# tomorrow moving closer is the feature working)
 # (real rootpage -- it was a genuine view first), an object of an
 # invented TYPE entirely, and a mview whose base has vanished.
 do_execsql_test 1.0 {
@@ -47,8 +50,8 @@ do_execsql_test 1.1 {
      SET sql='CREATE MATERIALIZED VIEW mv_dangling AS SELECT a, count(*) AS n FROM no_such_table GROUP BY a'
    WHERE name='mv_dangling';
   INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)
-    VALUES('temporal','tt','tt',2,
-           'CREATE TEMPORAL TABLE tt(x INTEGER) WITH SYSTEM VERSIONING');
+    VALUES('table','tt','tt',2,
+           'CREATE TEMPORAL TABLE tt(x INTEGER) WITH QUANTUM VERSIONING');
   PRAGMA writable_schema=OFF;
 } {}
 
@@ -64,7 +67,7 @@ do_execsql_test 2.0 {
 # load either, and its retained reason is the dead-name refusal chain.
 do_execsql_test 2.1 {
   SELECT name, type FROM pragma_dead_list ORDER BY name;
-} {ivm$mv_dangling$key index ivm$mv_future$key index mv_dangling mview mv_future mview tt temporal}
+} {ivm$mv_dangling$key index ivm$mv_future$key index mv_dangling mview mv_future mview tt table}
 # ...and the chained reasons carry the ROOT cause: each cascade row's
 # reason embeds its parent's, so grepping the list for the original
 # error finds parent and dependent alike.
@@ -81,7 +84,7 @@ do_catchsql_test 2.4 {
 } {1 {mv_future is present but unusable in this build (unknown materialized view option: FROBNICATION (only WITH MAINTENANCE EAGER or WITH MAINTENANCE DEFERRED is accepted)); a newer build can use or remove it}}
 do_catchsql_test 2.5 {
   SELECT * FROM tt;
-} {1 {tt is present but unusable in this build (near "TABLE": syntax error); a newer build can use or remove it}}
+} {1 {tt is present but unusable in this build (unknown table option: WITH QUANTUM VERSIONING); a newer build can use or remove it}}
 
 # The file is READ-ONLY while it carries dead objects: an older build
 # cannot know which live tables feed them.

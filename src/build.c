@@ -2738,7 +2738,10 @@ void sqlite3EndTable(
   */
   /* Fork (PLAN-TEMPORAL): TEMPORAL and WITH SYSTEM VERSIONING must
   ** travel together -- half a declaration is refused with the fix. */
-  if( pParse->bTemporalCreate && (tabOpts & TF_Temporal)==0 ){
+  if( pParse->bTemporalCreate && (tabOpts & TF_Temporal)==0
+   && pParse->nErr==0  /* a failed option parse already named the root
+                       ** cause; do not overwrite it */
+  ){
     sqlite3ErrorMsg(pParse,
        "CREATE TEMPORAL TABLE requires WITH SYSTEM VERSIONING");
     return;
@@ -2759,6 +2762,12 @@ void sqlite3EndTable(
   ** are plain CREATE TABLEs on the same Parse object, and a sticky
   ** flag would trip the pairing check on them -- it did. */
   pParse->bTemporalCreate = 0;
+  if( sqlite3StrNICmp(p->zName, "sqlite_hist_", 12)==0 ){
+    /* Fork (PLAN-TEMPORAL): history and its bookkeeping are read-only
+    ** to users -- the engine's own programs and nested parses are
+    ** exempted where the flag is consulted. */
+    p->tabFlags |= TF_Readonly;
+  }
   if( tabOpts & TF_Strict ){
     int ii;
     p->tabFlags |= TF_Strict;
@@ -3076,7 +3085,12 @@ void sqlite3EndTable(
     if( pCons->z==0 ){
       pCons = pEnd;
     }
-    p->u.tab.addColOffset = 13 + (int)(pCons->z - pParse->sNameToken.z);
+    /* Fork (PLAN-TEMPORAL): 13 is strlen("CREATE TABLE "); a temporal
+    ** head is 9 bytes longer, and the mview scar below already warned
+    ** that this arithmetic assumes the plain prefix -- ALTER spliced a
+    ** column into the middle of PRIMARY KEY before this branch. */
+    p->u.tab.addColOffset = 13 + ((p->tabFlags & TF_Temporal) ? 9 : 0)
+                               + (int)(pCons->z - pParse->sNameToken.z);
   }
 #endif
 }
@@ -3572,6 +3586,11 @@ int sqlite3ReadOnlyShadowTables(sqlite3 *db){
 ** Return true if it is not allowed to drop the given table
 */
 static int tableMayNotBeDropped(sqlite3 *db, Table *pTab){
+  if( db->pParse && db->pParse->nested ){
+    /* Fork: a nested parse is engine-authored (DROP TEMPORAL TABLE
+    ** dropping its own shadow); the name wall is for users. */
+    return 0;
+  }
   if( sqlite3StrNICmp(pTab->zName, "sqlite_", 7)==0 ){
     if( sqlite3StrNICmp(pTab->zName+7, "stat", 4)==0 ) return 0;
     if( sqlite3StrNICmp(pTab->zName+7, "parameters", 10)==0 ) return 0;
@@ -3618,6 +3637,29 @@ void sqlite3DropTable(Parse *pParse, SrcList *pName, int isView, int noErr){
   }
   iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
   assert( iDb>=0 && iDb<db->nDb );
+
+  /* Fork (PLAN-TEMPORAL): history is data someone chose to keep.  A
+  ** bare DROP TABLE on a versioned table refuses with the fix; DROP
+  ** TEMPORAL TABLE takes the table, its shadow, and its meta row in
+  ** one intent.  The flag is consumed so this statement's own nested
+  ** drops pass through untriggered. */
+  if( (pTab->tabFlags & TF_Temporal)!=0 && !pParse->nested ){
+    if( !pParse->bTemporalDrop ){
+      sqlite3ErrorMsg(pParse, "%s is system-versioned; use DROP TEMPORAL "
+         "TABLE to drop it together with its history", pTab->zName);
+      goto exit_drop_table;
+    }
+    pParse->bTemporalDrop = 0;
+    sqlite3NestedParse(pParse, "DROP TABLE %Q.\"sqlite_hist_%w\"",
+        db->aDb[iDb].zDbSName, pTab->zName);
+    sqlite3NestedParse(pParse,
+        "DELETE FROM %Q.sqlite_hist_meta WHERE tbl=%Q",
+        db->aDb[iDb].zDbSName, pTab->zName);
+  }else if( pParse->bTemporalDrop && !pParse->nested ){
+    sqlite3ErrorMsg(pParse,
+       "%s is not system-versioned; use DROP TABLE", pTab->zName);
+    goto exit_drop_table;
+  }
 
   /* If pTab is a virtual table, call ViewGetColumnNames() to ensure
   ** it is initialized.

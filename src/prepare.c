@@ -267,6 +267,29 @@ int sqlite3InitCallback(void *pInit, int argc, char **argv, char **NotUsed){
           ** condition instead.  (corruptM-131/171 caught this.) */
           zReason = "schema row disagrees with its CREATE statement";
         }
+        /* A dead object must not ALSO be live: an error raised by a
+        ** grammar ACTION (e.g. an unknown table option) can fire after
+        ** the object registered in the schema hash, and upstream never
+        ** cared because the whole load failed.  Degrade keeps the file
+        ** alive, so the half-built object is removed here -- found by
+        ** TEMPORAL's re-planted degrade fixture loading a queryable
+        ** corpse. */
+        if( sqlite3_stricmp(argv[0],"table")==0
+         || sqlite3_stricmp(argv[0],"view")==0
+         || sqlite3_stricmp(argv[0],"mview")==0
+         || sqlite3_stricmp(argv[0],"temporal")==0 ){
+          if( sqlite3FindTable(db, argv[1], db->aDb[iDb].zDbSName) ){
+            sqlite3UnlinkAndDeleteTable(db, iDb, argv[1]);
+          }
+        }else if( sqlite3_stricmp(argv[0],"index")==0 ){
+          if( sqlite3FindIndex(db, argv[1], db->aDb[iDb].zDbSName) ){
+            sqlite3UnlinkAndDeleteIndex(db, iDb, argv[1]);
+          }
+        }else if( sqlite3_stricmp(argv[0],"trigger")==0 ){
+          if( sqlite3HashFind(&db->aDb[iDb].pSchema->trigHash, argv[1]) ){
+            sqlite3UnlinkAndDeleteTrigger(db, iDb, argv[1]);
+          }
+        }
         sqlite3DeadMark(db, iDb, argv[1], argv[0], zReason);
       }else{
         corruptSchema(pData, argv, sqlite3_errmsg(db));

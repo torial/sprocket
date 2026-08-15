@@ -619,6 +619,15 @@ static int mviewCheckSelect(
                             pB->zName);
         return sWalk.rc;
       }
+      if( (pB->tabFlags & TF_Temporal)!=0 ){
+        /* Fork (PLAN-TEMPORAL Q7): the maintenance capture and the
+        ** history capture are separate machineries; composing them --
+        ** time-travel mviews -- is a future feature, not an accident. */
+        mviewRefuse(&sWalk, "%s is system-versioned (materialized views "
+                            "over temporal tables are not yet supported)",
+                            pB->zName);
+        return sWalk.rc;
+      }
       if( (pItem->fg.jointype & JT_OUTER)!=0 ){
         mviewRefuse(&sWalk, "outer joins are not yet supported (a "
             "departing row can flip null-extended rows on the other "

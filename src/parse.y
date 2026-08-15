@@ -517,6 +517,12 @@ resolvetype(A) ::= REPLACE.                  {A = OE_Replace;}
 
 ////////////////////////// The DROP TABLE /////////////////////////////////////
 //
+// Fork (PLAN-TEMPORAL): DROP TEMPORAL TABLE drops the table together
+// with its history; a bare DROP TABLE on a versioned table refuses.
+cmd ::= DROP TEMPORAL TABLE ifexists(E) fullname(X). {
+  pParse->bTemporalDrop = 1;
+  sqlite3DropTable(pParse, X, 0, E);
+}
 cmd ::= DROP TABLE ifexists(E) fullname(X). {
   sqlite3DropTable(pParse, X, 0, E);
 }

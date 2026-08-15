@@ -29,6 +29,11 @@
 ** Or, if zName is not a system table, zero is returned.
 */
 static int isAlterableTable(Parse *pParse, Table *pTab){
+  if( pParse->nested ){
+    /* Fork: engine-authored nested ALTER (the temporal shadow gaining
+    ** its table's new column) passes the user-facing name wall. */
+    return SQLITE_OK;
+  }
   if( 0==sqlite3StrNICmp(pTab->zName, "sqlite_", 7)
 #ifndef SQLITE_OMIT_VIRTUALTABLE
    || (pTab->tabFlags & TF_Eponymous)!=0
@@ -150,6 +155,18 @@ static void renameReloadSchema(Parse *pParse, int iDb, u16 p5){
 ** Generate code to implement the "ALTER TABLE xxx RENAME TO yyy"
 ** command.
 */
+
+/* Fork (PLAN-TEMPORAL): shape changes other than ADD COLUMN refuse on
+** a system-versioned table -- its history carries the current shape. */
+static int alterTemporalRefused(Parse *pParse, Table *pTab){
+  if( pTab && (pTab->tabFlags & TF_Temporal)!=0 ){
+    sqlite3ErrorMsg(pParse, "%s is system-versioned; its history "
+       "carries the current shape (only ADD COLUMN is supported)",
+       pTab->zName);
+    return 1;
+  }
+  return 0;
+}
 void sqlite3AlterRenameTable(
   Parse *pParse,            /* Parser context. */
   SrcList *pSrc,            /* The table to rename. */
@@ -197,6 +214,9 @@ void sqlite3AlterRenameTable(
     goto exit_rename_table;
   }
   if( alterWouldBreakMView(pParse, pTab) ){
+    goto exit_rename_table;
+  }
+  if( alterTemporalRefused(pParse, pTab) ){
     goto exit_rename_table;
   }
   if( SQLITE_OK!=sqlite3CheckObjectName(pParse,zName,"table",zName) ){
@@ -495,6 +515,23 @@ void sqlite3AlterFinishAddColumn(Parse *pParse, Token *pColDef){
       );
     }
   }
+
+  /* Fork (PLAN-TEMPORAL): the shadow gains the same column, typed but
+  ** unconstrained -- absent history reads NULL, which is honest (the
+  ** column did not exist).  Runs only after the ALTER above validated. */
+  if( pParse->nErr==0 && (pTab->tabFlags & TF_Temporal)!=0 ){
+    Column *pNewCol = &pNew->aCol[pNew->nCol-1];
+    const char *zType = sqlite3ColumnType(pNewCol, "");
+    if( zType && zType[0] ){
+      sqlite3NestedParse(pParse,
+        "ALTER TABLE %Q.\"sqlite_hist_%w\" ADD COLUMN \"%w\" %s",
+        zDb, pTab->zName, pNewCol->zCnName, zType);
+    }else{
+      sqlite3NestedParse(pParse,
+        "ALTER TABLE %Q.\"sqlite_hist_%w\" ADD COLUMN \"%w\"",
+        zDb, pTab->zName, pNewCol->zCnName);
+    }
+  }
 }
 
 /*
@@ -650,6 +687,7 @@ void sqlite3AlterRenameColumn(
   /* Cannot alter a system table */
   if( SQLITE_OK!=isAlterableTable(pParse, pTab) ) goto exit_rename_column;
   if( alterWouldBreakMView(pParse, pTab) ) goto exit_rename_column;
+  if( alterTemporalRefused(pParse, pTab) ) goto exit_rename_column;
   if( SQLITE_OK!=isRealTable(pParse, pTab, 0) ) goto exit_rename_column;
 
   /* Which schema holds the table to be altered */ 
@@ -2299,6 +2337,7 @@ void sqlite3AlterDropColumn(Parse *pParse, SrcList *pSrc, const Token *pName){
   ** system table. */
   if( SQLITE_OK!=isAlterableTable(pParse, pTab) ) goto exit_drop_column;
   if( alterWouldBreakMView(pParse, pTab) ) goto exit_drop_column;
+  if( alterTemporalRefused(pParse, pTab) ) goto exit_drop_column;
   if( SQLITE_OK!=isRealTable(pParse, pTab, 1) ) goto exit_drop_column;
 
   /* Find the index of the column being dropped. */
@@ -2791,6 +2830,7 @@ static Table *alterFindTable(
 
     if( SQLITE_OK!=isRealTable(pParse, pTab, 2) 
      || SQLITE_OK!=isAlterableTable(pParse, pTab) 
+     || alterTemporalRefused(pParse, pTab)
     ){
       pTab = 0;
     }

@@ -155,7 +155,7 @@ do_execsql_test 8.3 {
 # --- interactions declared in DESIGN-TEMPORAL Q7 ---
 do_catchsql_test 9.0 {
   CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t;
-} {1 {materialized views over system-versioned tables are not supported: t}}
+} {1 {mv cannot be incrementally maintained: t is system-versioned (materialized views over temporal tables are not yet supported)}}
 
 # --- the shadow is protected like the machinery it is ---
 do_catchsql_test 9.1 {
