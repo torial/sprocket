@@ -1,0 +1,131 @@
+# 2026-08-15
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+# PLAN-TEMPORAL P6 -- the replay proof (DESIGN-TEMPORAL Q8), permanent.
+#
+# The theorem: for every commit k, from-scratch WORKLOAD replay through
+# k equals FOR SYSTEM_TIME AS OF k.  The replay side never reads the
+# history table, so the two sides are independent by construction --
+# POC 2 proved that replaying the history against itself is circular,
+# and POC 2b proved this shape catches what that one could not.  The
+# corruption control stays here FOREVER: the instrument is never
+# trusted un-red.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix temporal2
+
+# The workload: a list of TRANSACTIONS (replay must respect commit
+# granularity, because history does -- one seq per commit).
+set WORKLOAD {
+  {{INSERT INTO acct VALUES(1,100)}}
+  {{INSERT INTO acct VALUES(2,50)} {INSERT INTO acct VALUES(3,75)}}
+  {{UPDATE acct SET bal=150 WHERE id=1} {UPDATE acct SET bal=160 WHERE id=1}}
+  {{DELETE FROM acct WHERE id=2}}
+  {{UPDATE acct SET bal=80 WHERE id=3} {INSERT INTO acct VALUES(2,60)}}
+  {{DELETE FROM acct WHERE id=3} {INSERT INTO acct VALUES(4,10)}}
+}
+
+do_execsql_test 1.0 {
+  CREATE TEMPORAL TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)
+    WITH SYSTEM VERSIONING;
+} {}
+do_test 1.1 {
+  foreach txn $::WORKLOAD {
+    db eval BEGIN
+    foreach stmt $txn { db eval $stmt }
+    db eval COMMIT
+  }
+  db eval {SELECT max(seq) FROM sqlite_hist_commits}
+} [llength $WORKLOAD]
+
+# The proof: every checkpoint, both sides, exact equality.
+proc replay_state {k} {
+  set r {}
+  forcedelete tp_replay.db
+  sqlite3 dbr tp_replay.db
+  dbr eval {CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)}
+  for {set j 0} {$j < $k} {incr j} {
+    dbr eval BEGIN
+    foreach stmt [lindex $::WORKLOAD $j] { dbr eval $stmt }
+    dbr eval COMMIT
+  }
+  set r [dbr eval {SELECT id, bal FROM acct ORDER BY id}]
+  dbr close
+  forcedelete tp_replay.db
+  return $r
+}
+proc asof_state {k} {
+  db eval "SELECT id, bal FROM acct FOR SYSTEM_TIME AS OF $k ORDER BY id"
+}
+
+do_test 2.0 {
+  set nBad 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_state $k]} {
+      puts "  MISMATCH at k=$k: asof={[asof_state $k]} replay={[replay_state $k]}"
+      incr nBad
+    }
+  }
+  set nBad
+} {0}
+
+# The present anchors to the live table.
+do_test 2.1 {
+  expr {[asof_state [llength $::WORKLOAD]] eq
+        [db eval {SELECT id, bal FROM acct ORDER BY id}]}
+} {1}
+
+# CONTROL, kept forever: corrupt one interior interval; the proof MUST
+# go red -- an instrument that cannot fail proves nothing.  Then
+# restore, and the proof must recover.
+do_test 3.0 {
+  db eval {PRAGMA writable_schema=ON}
+  # (no LIMIT: that syntax needs a compile flag; id=1 has exactly one
+  # closed interval in this workload)
+  db eval {UPDATE sqlite_hist_acct SET bal=99999
+            WHERE id=1 AND seq_to IS NOT NULL}
+  db eval {PRAGMA writable_schema=OFF}
+  set caught 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_state $k]} { set caught 1 }
+  }
+  set caught
+} {1}
+do_test 3.1 {
+  db eval {PRAGMA writable_schema=ON}
+  db eval {UPDATE sqlite_hist_acct SET bal=100
+            WHERE id=1 AND bal=99999}
+  db eval {PRAGMA writable_schema=OFF}
+  set nBad 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_state $k]} { incr nBad }
+  }
+  set nBad
+} {0}
+
+# POC 1 disease 2's seq-axis cure, pinned end to end: an AS OF between
+# two commits equals the EARLIER commit's state -- never a state no
+# reader saw.  (Text-axis: resolve the commit-log UTC of k and confirm
+# it answers k's state.)
+# The text axis pins the resolver's CONTRACT -- the last commit
+# at-or-before the instant -- not injectivity: commits faster than the
+# chart's millisecond resolution share a UTC (this leg found them
+# doing exactly that), which is the design's chart-not-manifold point
+# living in the tests.
+do_test 4.0 {
+  set u [db eval {SELECT utc FROM sqlite_hist_commits WHERE seq=3}]
+  set k2 [db eval {SELECT max(seq) FROM sqlite_hist_commits WHERE utc <= $u}]
+  expr {[db eval "SELECT id, bal FROM acct FOR SYSTEM_TIME AS OF '$u'
+                   ORDER BY id"] eq [asof_state $k2]}
+} {1}
+
+finish_test
