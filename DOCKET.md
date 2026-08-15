@@ -1717,6 +1717,15 @@ in this fork (`DESIGN-NETWORK.md`); this is the exception.
 Result sets cover most cases, which is why this was deferred. Worth revisiting
 only if the typed-client work (#2) makes the absence awkward at the boundary.
 
+**EXAMINED AND CLOSED 2026-08-15, the revisit trigger having armed (#2
+complete, four emitters).**  The absence is not awkward: a write-proc
+returning values ends with a SELECT, and every generated client hands
+back a typed one-row list — one indexing step from what OUT params
+would give.  If that step ever bothers a real consumer, the remedy is
+EMITTER SUGAR (single-row single-column shapes returning scalars),
+not an engine feature: no grammar, no ABI, no wire change.  Reopens
+only on a concrete consumer complaint.
+
 ---
 
 ## Ordering I would actually recommend
