@@ -1059,8 +1059,11 @@ test_suite "rtree" -description {
 } -files [glob -nocomplain $::testdir/../ext/rtree/*.test]
 
 test_suite "session" -description {
-  All session module related tests. 
-} -files [glob -nocomplain $::testdir/../ext/session/*.test]
+  All session module related tests.
+} -files [concat \
+  [glob -nocomplain $::testdir/../ext/session/*.test] \
+  [list $::testdir/repl2.test] \
+]
 
 test_suite "session_eec" -description {
   All session module related tests with sqlite3_extended_result_codes() set. 

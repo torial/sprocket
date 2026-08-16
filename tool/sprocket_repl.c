@@ -343,6 +343,56 @@ static int replApply(sqlite3 *db, const unsigned char *aSeg, int nSeg,
     return replRefuse(db, zMsg, pzErr);
   }
 
+  /* The engine's changeset apply SILENTLY IGNORES tables that are
+  ** missing from the target, and tables with too few columns (POC 2
+  ** measured both) -- the exact fabricated success this applier exists
+  ** to refuse.  Scan the manifest first; refuse naming the table and
+  ** the fix.  Schema travels out of band in v1. */
+  {
+    sqlite3_changeset_iter *pScan = 0;
+    const char *zPrev = "";
+    if( sqlite3changeset_start(&pScan, (int)nPay,
+                               (void*)(aSeg+SEG_HDRSIZE))==SQLITE_OK ){
+      while( sqlite3changeset_next(pScan)==SQLITE_ROW ){
+        const char *zTab = 0;
+        int nCol = 0, op = 0, nHave = 0;
+        sqlite3changeset_op(pScan, &zTab, &nCol, &op, 0);
+        if( strcmp(zTab, zPrev)==0 ) continue;
+        zPrev = zTab;
+        {
+          sqlite3_stmt *p = 0;
+          char *zQ = sqlite3_mprintf(
+            "SELECT count(*) FROM pragma_table_xinfo(%Q)"
+            " WHERE hidden<=1", zTab);
+          nHave = -1;
+          if( zQ && sqlite3_prepare_v2(db, zQ, -1, &p, 0)==SQLITE_OK
+           && sqlite3_step(p)==SQLITE_ROW ){
+            nHave = sqlite3_column_int(p, 0);
+          }
+          sqlite3_finalize(p);
+          sqlite3_free(zQ);
+        }
+        if( nHave<=0 ){
+          sqlite3_snprintf(sizeof(zMsg), zMsg,
+            "segment %lld carries table %s which does not exist here;"
+            " create the replica's schema first (schema travels out of"
+            " band in v1)", iFrom, zTab);
+          sqlite3changeset_finalize(pScan);
+          return replRefuse(db, zMsg, pzErr);
+        }
+        if( nHave<nCol ){
+          sqlite3_snprintf(sizeof(zMsg), zMsg,
+            "segment %lld carries %d columns for table %s but this"
+            " replica has %d; align the replica's schema first",
+            iFrom, nCol, zTab, nHave);
+          sqlite3changeset_finalize(pScan);
+          return replRefuse(db, zMsg, pzErr);
+        }
+      }
+      sqlite3changeset_finalize(pScan);
+    }
+  }
+
   rc = sqlite3changeset_apply(db, (int)nPay,
           (void*)(aSeg+SEG_HDRSIZE), 0, replConflict, 0);
   if( rc!=SQLITE_OK ){
@@ -362,12 +412,140 @@ static int replApply(sqlite3 *db, const unsigned char *aSeg, int nSeg,
   return SQLITE_OK;
 }
 
+/* ----------------------------------------------------------- restore ---- */
+/* Peek a segment's commit clock: the utc of the sqlite_hist_commits
+** row it carries (shipped as VALUES from the primary -- Q1-C's whole
+** point).  Returns 0 and fills zOut, or nonzero when the segment
+** carries no clock (a commit that touched no temporal table). */
+static int replPeekUtc(const unsigned char *aSeg, int nSeg,
+                       char *zOut, int nOut){
+  sqlite3_changeset_iter *pIt = 0;
+  sqlite3_int64 nPay = (sqlite3_int64)getU64(aSeg+44);
+  int bFound = 1;
+  zOut[0] = 0;
+  if( nSeg<SEG_HDRSIZE ) return 1;
+  if( sqlite3changeset_start(&pIt, (int)nPay,
+                             (void*)(aSeg+SEG_HDRSIZE))!=SQLITE_OK ){
+    return 1;
+  }
+  while( sqlite3changeset_next(pIt)==SQLITE_ROW ){
+    const char *zTab = 0;
+    int nCol = 0, op = 0;
+    sqlite3changeset_op(pIt, &zTab, &nCol, &op, 0);
+    if( sqlite3_stricmp(zTab, "sqlite_hist_commits")==0
+     && op==SQLITE_INSERT && nCol>=2 ){
+      sqlite3_value *pV = 0;
+      if( sqlite3changeset_new(pIt, 1, &pV)==SQLITE_OK && pV ){
+        const char *z = (const char*)sqlite3_value_text(pV);
+        if( z ){
+          /* the LAST commits row wins (a batched segment carries one
+          ** in v1, but the contract should not depend on that) */
+          sqlite3_snprintf(nOut, zOut, "%s", z);
+          bFound = 0;
+        }
+      }
+    }
+  }
+  sqlite3changeset_finalize(pIt);
+  return bFound;
+}
+
+/* Apply archived segments to db in order, starting after the replica's
+** current receipt, stopping at the archive head or the caller's
+** target.  PITR is this loop and nothing else: the same applier, the
+** same refusals, reading the same self-describing files the daemon
+** serves.  Progress and refusals go to pLog (may be NULL for quiet).
+*/
+static int replRestoreDir(sqlite3 *db, const char *zDir,
+                          sqlite3_int64 uptoSeq, const char *zUptoUtc,
+                          FILE *pLog){
+  sqlite3_int64 seq;
+  int nApplied = 0;
+  int rc = replMetaEnsure(db);
+  if( rc!=SQLITE_OK ) return rc;
+  {
+    unsigned char aGen[16];
+    sqlite3_int64 iLast = 0;
+    if( replMetaGetBlob(db, "replica", aGen, &iLast)!=0 ) iLast = 0;
+    seq = iLast + 1;
+  }
+  for(;; seq++){
+    char zPath[1024];
+    unsigned char *aSeg = 0;
+    long nSeg = 0;
+    FILE *f;
+    char *zErr = 0;
+    if( uptoSeq>0 && seq>uptoSeq ){
+      if( pLog ) fprintf(pLog, "target seq %lld reached\n", uptoSeq);
+      break;
+    }
+    sqlite3_snprintf(sizeof(zPath), zPath, "%s/%016llx.sprkseg",
+                     zDir, (sqlite3_uint64)seq);
+    f = fopen(zPath, "rb");
+    if( f==0 ){
+      if( pLog ) fprintf(pLog, "archive head reached at seq %lld\n", seq-1);
+      break;
+    }
+    fseek(f, 0, SEEK_END);
+    nSeg = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    aSeg = (unsigned char*)sqlite3_malloc((int)(nSeg>0 ? nSeg : 1));
+    if( aSeg==0 || (long)fread(aSeg, 1, nSeg, f)!=nSeg ){
+      fclose(f);
+      sqlite3_free(aSeg);
+      if( pLog ) fprintf(pLog, "cannot read %s\n", zPath);
+      return SQLITE_IOERR;
+    }
+    fclose(f);
+    if( zUptoUtc ){
+      char zUtc[64];
+      if( replPeekUtc(aSeg, (int)nSeg, zUtc, sizeof(zUtc)) ){
+        if( pLog ){
+          fprintf(pLog, "segment %lld carries no commit clock (that "
+            "commit touched no temporal table); this lineage cannot "
+            "be restored BY TIME past seq %lld -- restore with "
+            "--upto-seq instead\n", seq, seq-1);
+        }
+        sqlite3_free(aSeg);
+        return SQLITE_CONSTRAINT;
+      }
+      if( strcmp(zUtc, zUptoUtc)>0 ){
+        if( pLog ){
+          fprintf(pLog, "segment %lld committed at %s, after the "
+            "target %s; stopping\n", seq, zUtc, zUptoUtc);
+        }
+        sqlite3_free(aSeg);
+        break;
+      }
+    }
+    rc = replApply(db, aSeg, (int)nSeg, &zErr);
+    sqlite3_free(aSeg);
+    if( rc!=SQLITE_OK ){
+      if( pLog ) fprintf(pLog, "REFUSED at seq %lld: %s\n", seq,
+                         zErr ? zErr : "(no message)");
+      sqlite3_free(zErr);
+      return rc;
+    }
+    nApplied++;
+  }
+  if( pLog ) fprintf(pLog, "applied %d segments\n", nApplied);
+  return SQLITE_OK;
+}
+
 /* ============================== selftest ================================ */
 /* Everything above is the LIBRARY: sprocketd #includes this file with
 ** SPROCKET_REPL_LIBRARY defined to reuse writer/applier/encoder (one
 ** implementation of the segment contract, two homes).  The selftest
 ** below exists only in the standalone build. */
 #ifndef SPROCKET_REPL_LIBRARY
+#ifdef _WIN32
+# include <direct.h>
+#else
+# include <sys/stat.h>
+# include <sys/types.h>
+# define _mkdir(d) mkdir((d), 0755)
+# define _rmdir rmdir
+#endif
 static int nCheck = 0, nFail = 0;
 static void check(int bOk, const char *zWhat){
   nCheck++;
@@ -382,8 +560,50 @@ int main(int argc, char **argv){
   char *zErr = 0;
   int rc;
 
+  /* --restore ARCHIVE_DIR DB [--upto-seq N] [--upto-utc "YYYY-MM-DD..."]
+  ** PITR: apply archived segments through the declared target.  The
+  ** replica's schema must exist first (out of band in v1); every
+  ** refusal the applier knows fires here identically. */
+  if( argc>=4 && strcmp(argv[1], "--restore")==0 ){
+    sqlite3 *db = 0;
+    sqlite3_int64 uptoSeq = 0;
+    const char *zUptoUtc = 0;
+    int i;
+    for(i=4; i<argc; i++){
+      if( strcmp(argv[i], "--upto-seq")==0 && i+1<argc ){
+        uptoSeq = (sqlite3_int64)strtoll(argv[++i], 0, 10);
+      }else if( strcmp(argv[i], "--upto-utc")==0 && i+1<argc ){
+        zUptoUtc = argv[++i];
+      }else{
+        fprintf(stderr, "unknown option: %s\n", argv[i]);
+        return 2;
+      }
+    }
+    if( sqlite3_open(argv[3], &db)!=SQLITE_OK ){
+      fprintf(stderr, "cannot open %s\n", argv[3]);
+      return 1;
+    }
+    rc = replRestoreDir(db, argv[2], uptoSeq, zUptoUtc, stderr);
+    {
+      sqlite3_stmt *p = 0;
+      if( sqlite3_prepare_v2(db,
+            "SELECT last_seq, coalesce(last_utc,'(none)')"
+            " FROM sprocket_repl_meta WHERE role='replica'",
+            -1, &p, 0)==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW ){
+        fprintf(stderr, "replica receipt: last_seq=%lld last_utc=%s\n",
+                sqlite3_column_int64(p, 0), sqlite3_column_text(p, 1));
+      }
+      sqlite3_finalize(p);
+    }
+    sqlite3_close(db);
+    return rc==SQLITE_OK ? 0 : 1;
+  }
+
   if( argc<2 || strcmp(argv[1], "--selftest")!=0 ){
-    fprintf(stderr, "usage: sprocket_repl --selftest\n");
+    fprintf(stderr,
+      "usage: sprocket_repl --selftest\n"
+      "       sprocket_repl --restore ARCHIVE_DIR DB"
+      " [--upto-seq N] [--upto-utc TS]\n");
     return 2;
   }
   printf("sprocket_repl selftest -- SQLite %s\n\n", sqlite3_libversion());
@@ -589,6 +809,124 @@ int main(int argc, char **argv){
       }
       sqlite3_finalize(p);
       sqlite3_close(dbF); }
+  }
+
+  /* 13 -- the TEMPORAL axis rides the segments (POC 2's chain through
+  ** the real writer and applier; the update path -- interval-close on
+  ** a hidden-column PK -- is exercised by cut 2, which the POC's
+  ** single consolidated changeset never reached). */
+  {
+    sqlite3 *dbtp = 0, *dbtr = 0;
+    ReplWriter *pWT = 0;
+    unsigned char *aT1 = 0, *aT2 = 0;
+    int nT1 = 0, nT2 = 0;
+    const char *zDDL =
+      "CREATE TEMPORAL TABLE gt(a INTEGER PRIMARY KEY, b TEXT)"
+      " WITH SYSTEM VERSIONING";
+    sqlite3_open(":memory:", &dbtp);
+    sqlite3_open(":memory:", &dbtr);
+    check( sqlite3_exec(dbtp, zDDL, 0, 0, 0)==SQLITE_OK
+        && sqlite3_exec(dbtr, zDDL, 0, 0, 0)==SQLITE_OK,
+           "temporal fixtures build" );
+    check( replWriterOpen(dbtp, &pWT)==SQLITE_OK, "temporal writer opens" );
+    sqlite3_exec(dbtp, "INSERT INTO gt VALUES(1,'v1')", 0, 0, 0);
+    check( replWriterCut(pWT, &aT1, &nT1)==SQLITE_OK, "temporal cut 1" );
+    sqlite3_exec(dbtp, "UPDATE gt SET b='v2' WHERE a=1", 0, 0, 0);
+    check( replWriterCut(pWT, &aT2, &nT2)==SQLITE_OK, "temporal cut 2" );
+    check( replApply(dbtr, aT1, nT1, 0)==SQLITE_OK
+        && replApply(dbtr, aT2, nT2, 0)==SQLITE_OK,
+           "temporal segments apply" );
+    {
+      const char *zQ =
+        "SELECT (SELECT group_concat(z,',') FROM ("
+        "  SELECT a||'/'||b||'/'||seq_from||'/'"
+        "    ||coalesce(seq_to,'open') AS z"
+        "  FROM sqlite_hist_gt ORDER BY a, seq_from))"
+        " || '|' || "
+        "(SELECT group_concat(seq||'@'||utc,',')"
+        " FROM sqlite_hist_commits)";
+      sqlite3_stmt *pp = 0, *pr = 0;
+      const char *zp = 0, *zr = 0;
+      sqlite3_prepare_v2(dbtp, zQ, -1, &pp, 0);
+      sqlite3_prepare_v2(dbtr, zQ, -1, &pr, 0);
+      if( sqlite3_step(pp)==SQLITE_ROW ) zp = (const char*)sqlite3_column_text(pp, 0);
+      if( sqlite3_step(pr)==SQLITE_ROW ) zr = (const char*)sqlite3_column_text(pr, 0);
+      check( zp && zr && strcmp(zp, zr)==0,
+             "replica history + commit log IDENTICAL (the Q5 axis "
+             "ships as values)" );
+      sqlite3_finalize(pp); sqlite3_finalize(pr);
+    }
+
+    /* 14 -- the silent-skip class killed: applying to a database
+    ** without the schema REFUSES by name (POC 2 measured the engine
+    ** ignoring such tables silently). */
+    {
+      sqlite3 *dbb = 0;
+      char *zE = 0;
+      sqlite3_open(":memory:", &dbb);
+      rc = replApply(dbb, aT1, nT1, &zE);
+      check( rc!=SQLITE_OK && zE && strstr(zE, "does not exist here")!=0,
+             "SEEN RED: missing-schema apply refused by name, "
+             "never skipped" );
+      sqlite3_free(zE);
+      sqlite3_close(dbb);
+    }
+
+    /* 15 -- PITR: the restore loop over archived files, stopping at a
+    ** declared target. */
+    {
+      const char *zRDir = "sprocket_repl_selftest_arc";
+      char zPath[1024];
+      FILE *f;
+      sqlite3 *dbpitr = 0;
+      _mkdir(zRDir);
+      sqlite3_snprintf(sizeof(zPath), zPath, "%s/%016llx.sprkseg",
+                       zRDir, (sqlite3_uint64)1);
+      f = fopen(zPath, "wb"); fwrite(aT1, 1, nT1, f); fclose(f);
+      sqlite3_snprintf(sizeof(zPath), zPath, "%s/%016llx.sprkseg",
+                       zRDir, (sqlite3_uint64)2);
+      f = fopen(zPath, "wb"); fwrite(aT2, 1, nT2, f); fclose(f);
+
+      sqlite3_open(":memory:", &dbpitr);
+      sqlite3_exec(dbpitr, zDDL, 0, 0, 0);
+      check( replRestoreDir(dbpitr, zRDir, 1, 0, 0)==SQLITE_OK,
+             "restore --upto-seq 1 succeeds" );
+      {
+        sqlite3_stmt *p = 0;
+        const char *zB = 0;
+        sqlite3_int64 iSeq = -1;
+        unsigned char aG[16];
+        sqlite3_prepare_v2(dbpitr, "SELECT b FROM gt WHERE a=1", -1, &p, 0);
+        if( sqlite3_step(p)==SQLITE_ROW ) zB = (const char*)sqlite3_column_text(p, 0);
+        check( zB && strcmp(zB, "v1")==0,
+               "PITR state is the PAST state, not the present" );
+        sqlite3_finalize(p);
+        replMetaGetBlob(dbpitr, "replica", aG, &iSeq);
+        check( iSeq==1, "PITR receipt: last_seq is the target" );
+      }
+      check( replRestoreDir(dbpitr, zRDir, 0, 0, 0)==SQLITE_OK,
+             "resume to head succeeds (same loop, no target)" );
+      {
+        sqlite3_stmt *p = 0;
+        const char *zB = 0;
+        sqlite3_prepare_v2(dbpitr, "SELECT b FROM gt WHERE a=1", -1, &p, 0);
+        if( sqlite3_step(p)==SQLITE_ROW ) zB = (const char*)sqlite3_column_text(p, 0);
+        check( zB && strcmp(zB, "v2")==0, "resumed replica is current" );
+        sqlite3_finalize(p);
+      }
+      sqlite3_close(dbpitr);
+      sqlite3_snprintf(sizeof(zPath), zPath, "%s/%016llx.sprkseg",
+                       zRDir, (sqlite3_uint64)1);
+      remove(zPath);
+      sqlite3_snprintf(sizeof(zPath), zPath, "%s/%016llx.sprkseg",
+                       zRDir, (sqlite3_uint64)2);
+      remove(zPath);
+      _rmdir(zRDir);
+    }
+
+    sqlite3_free(aT1); sqlite3_free(aT2);
+    replWriterClose(pWT);
+    sqlite3_close(dbtp); sqlite3_close(dbtr);
   }
 
   sqlite3_free(aSeg1); sqlite3_free(aSeg2); sqlite3_free(aSeg3);

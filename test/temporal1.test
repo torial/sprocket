@@ -23,11 +23,15 @@ source $testdir/tester.tcl
 set testprefix temporal1
 
 # --- DDL and the shadow ---
+# The shadow declares PRIMARY KEY(a, seq_from) -- its natural version
+# key, required so history travels in session changesets (PLAN-REPL) --
+# hence the autoindex beside it.
 do_execsql_test 1.0 {
   CREATE TEMPORAL TABLE t(a INTEGER PRIMARY KEY, b TEXT)
     WITH SYSTEM VERSIONING;
   SELECT name FROM sqlite_schema WHERE name LIKE '%t%' ORDER BY name;
-} {sqlite_hist_commits sqlite_hist_meta sqlite_hist_t t}
+} {sqlite_autoindex_sqlite_hist_t_1 sqlite_hist_commits sqlite_hist_meta
+   sqlite_hist_t t}
 
 # --- one commit, one seq; the shadow carries final images ---
 do_execsql_test 1.1 {
@@ -116,7 +120,8 @@ do_catchsql_test 6.0 {
   DROP TABLE t;
 } {1 {t is system-versioned; use DROP TEMPORAL TABLE to drop it together with its history}}
 do_execsql_test 6.1 {
-  CREATE TEMPORAL TABLE scratch(x INTEGER) WITH SYSTEM VERSIONING;
+  CREATE TEMPORAL TABLE scratch(x INTEGER PRIMARY KEY)
+    WITH SYSTEM VERSIONING;
   DROP TEMPORAL TABLE scratch;
   SELECT count(*) FROM sqlite_schema WHERE name LIKE '%scratch%';
 } {0}
@@ -172,5 +177,38 @@ do_execsql_test 10.0 {
   INSERT INTO plain VALUES(1);
   SELECT count(*) FROM pragma_history_list WHERE name='plain';
 } {0}
+
+# --- system versioning keys history by PRIMARY KEY (2026-08-16) ---
+reset_db
+
+# A PK-less temporal table is REFUSED with the fix named: its capture
+# could only key on rowid, and shadow rowids drift from base rowids
+# after the first UPDATE -- history then closes the wrong versions
+# (measured: two open intervals for one key, AS OF returning a state
+# no reader ever saw).
+do_catchsql_test 11.0 {
+  CREATE TEMPORAL TABLE nopk(a INTEGER, b TEXT) WITH SYSTEM VERSIONING;
+} {1 {TEMPORAL table nopk has no PRIMARY KEY; system versioning keys history by the PRIMARY KEY -- declare one}}
+do_execsql_test 11.1 {
+  SELECT count(*) FROM sqlite_schema WHERE name LIKE '%nopk%';
+} {0}
+
+# A rowid table with a declared non-INTEGER PK keys on that PK (this
+# case silently keyed on rowid coincidence before the fix).  The
+# divergence recipe: UPDATE makes shadow rowids outrun base rowids,
+# then a later row's UPDATE must still close ITS OWN prior version.
+do_execsql_test 11.2 {
+  CREATE TEMPORAL TABLE tpk(k TEXT PRIMARY KEY, v INTEGER)
+    WITH SYSTEM VERSIONING;
+  INSERT INTO tpk VALUES('a', 1);
+  UPDATE tpk SET v=2 WHERE k='a';
+  INSERT INTO tpk VALUES('b', 10);
+  UPDATE tpk SET v=11 WHERE k='b';
+  SELECT k, v, seq_from, coalesce(seq_to,'open')
+    FROM sqlite_hist_tpk ORDER BY k, seq_from;
+} {a 1 1 2 a 2 2 open b 10 3 4 b 11 4 open}
+do_execsql_test 11.3 {
+  SELECT k, v FROM tpk FOR SYSTEM_TIME AS OF 3 ORDER BY k;
+} {a 2 b 10}
 
 finish_test

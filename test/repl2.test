@@ -1,0 +1,146 @@
+# 2026-08-16
+#
+# DESIGN-REPL Q5, the BLESSED PIN ("go forth and multiply"): the day a
+# replica exists, temporal2's replay proof runs against the REPLICA and
+# passes identically -- replica history equal to primary history,
+# proven by the same instrument, in the suite forever.
+#
+# The replica here is built the way PLAN-REPL ships it: session
+# changesets captured per commit on the primary, applied in commit
+# order.  (The segment framing around those changesets -- headers,
+# checksums, refusals -- is pinned by tool/sprocket_repl.c --selftest;
+# this file pins the ENGINE side: capture completeness, hidden-column
+# intervals, apply-as-maintenance, trigger stand-down.)
+#
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix repl2
+
+ifcapable !session {
+  finish_test
+  return
+}
+
+# The workload is temporal2's, verbatim: replication must not need a
+# friendlier workload than the replay proof itself.
+set WORKLOAD {
+  {{INSERT INTO acct VALUES(1,100)}}
+  {{INSERT INTO acct VALUES(2,50)} {INSERT INTO acct VALUES(3,75)}}
+  {{UPDATE acct SET bal=150 WHERE id=1} {UPDATE acct SET bal=160 WHERE id=1}}
+  {{DELETE FROM acct WHERE id=2}}
+  {{UPDATE acct SET bal=80 WHERE id=3} {INSERT INTO acct VALUES(2,60)}}
+  {{DELETE FROM acct WHERE id=3} {INSERT INTO acct VALUES(4,10)}}
+}
+
+do_execsql_test 1.0 {
+  CREATE TEMPORAL TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)
+    WITH SYSTEM VERSIONING;
+} {}
+
+proc conflict_abort {args} { return "ABORT" }
+
+# 1.1: replicate per commit -- one session window per transaction, the
+# writer's live cadence.
+do_test 1.1 {
+  forcedelete repl2_replica.db
+  sqlite3 dbrep repl2_replica.db
+  dbrep eval {
+    CREATE TEMPORAL TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)
+      WITH SYSTEM VERSIONING
+  }
+  foreach txn $::WORKLOAD {
+    sqlite3session S db main
+    S attach *
+    db eval BEGIN
+    foreach stmt $txn { db eval $stmt }
+    db eval COMMIT
+    set cs [S changeset]
+    S delete
+    sqlite3changeset_apply dbrep $cs conflict_abort
+  }
+  dbrep eval {SELECT max(seq) FROM sqlite_hist_commits}
+} [llength $WORKLOAD]
+
+# The independent replay side, temporal2's shape exactly.
+proc replay_state {k} {
+  set r {}
+  forcedelete repl2_replay.db
+  sqlite3 dbr2 repl2_replay.db
+  dbr2 eval {CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER)}
+  for {set j 0} {$j < $k} {incr j} {
+    dbr2 eval BEGIN
+    foreach stmt [lindex $::WORKLOAD $j] { dbr2 eval $stmt }
+    dbr2 eval COMMIT
+  }
+  set r [dbr2 eval {SELECT id, bal FROM acct ORDER BY id}]
+  dbr2 close
+  forcedelete repl2_replay.db
+  return $r
+}
+proc asof_replica {k} {
+  dbrep eval "SELECT id, bal FROM acct FOR SYSTEM_TIME AS OF $k ORDER BY id"
+}
+
+# 2.0: THE PIN -- the replay proof, aimed at the replica.
+do_test 2.0 {
+  set nBad 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_replica $k]} {
+      puts "  MISMATCH at k=$k: replica={[asof_replica $k]}\
+            replay={[replay_state $k]}"
+      incr nBad
+    }
+  }
+  set nBad
+} {0}
+
+# 2.1: the whole history surface, both sides, value-equal: every
+# version interval and every commit-log row (UTC shipped as VALUES --
+# the chart replicates, not just the axis).
+proc hist_dump {conn} {
+  set a [$conn eval {SELECT id, bal, seq_from, coalesce(seq_to,'open')
+                     FROM sqlite_hist_acct ORDER BY id, seq_from}]
+  set b [$conn eval {SELECT seq, utc FROM sqlite_hist_commits ORDER BY seq}]
+  list $a $b
+}
+do_test 2.1 {
+  expr {[hist_dump db] eq [hist_dump dbrep]}
+} {1}
+
+# 3.0/3.1: CONTROL, kept forever -- corrupt one interior interval on
+# the REPLICA; the pin must go red, then recover when restored.  An
+# instrument never seen red proves nothing.
+do_test 3.0 {
+  dbrep eval {PRAGMA writable_schema=ON}
+  dbrep eval {UPDATE sqlite_hist_acct SET bal=99999
+               WHERE id=1 AND seq_to IS NOT NULL}
+  dbrep eval {PRAGMA writable_schema=OFF}
+  set caught 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_replica $k]} { set caught 1 }
+  }
+  set caught
+} {1}
+do_test 3.1 {
+  dbrep eval {PRAGMA writable_schema=ON}
+  dbrep eval {UPDATE sqlite_hist_acct SET bal=100
+               WHERE id=1 AND bal=99999}
+  dbrep eval {PRAGMA writable_schema=OFF}
+  set nBad 0
+  for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
+    if {[replay_state $k] ne [asof_replica $k]} { incr nBad }
+  }
+  set nBad
+} {0}
+
+# 4.0: PRAGMA replica_status on the replica file carries no receipts
+# here (this file replicates below the segment layer), so it answers
+# 'none' -- SAID, not silent.  The segment-layer receipts are pinned in
+# repl1.test and the harness.
+do_test 4.0 {
+  dbrep eval {PRAGMA replica_status}
+} {none {} {} no-replication-state {}}
+
+dbrep close
+forcedelete repl2_replica.db
+finish_test

@@ -1128,7 +1128,12 @@ static int sessionTableInfo(
   while( SQLITE_ROW==sqlite3_step(pStmt) ){
     nByte += sqlite3_column_bytes(pStmt, 1);          /* name */
     nByte += sqlite3_column_bytes(pStmt, 4);          /* dflt_value */
-    if( sqlite3_column_int(pStmt, 6)==0 ){            /* !hidden */
+    /* Explicitly-hidden columns (hidden==1: temporal shadow seq
+    ** columns and their kin) are REAL storage and travel in
+    ** changesets -- history must be replicable (PLAN-REPL).  Generated
+    ** columns (hidden==2 or 3) have no storage of their own and stay
+    ** excluded. */
+    if( sqlite3_column_int(pStmt, 6)<=1 ){            /* !generated */
       nDbCol++;
     }
     if( sqlite3_column_int(pStmt, 5) ) bRowid = 0;    /* pk */
@@ -1170,7 +1175,7 @@ static int sessionTableInfo(
       i++;
     }
     while( SQLITE_ROW==sqlite3_step(pStmt) ){
-      if( sqlite3_column_int(pStmt, 6)==0 ){            /* !hidden */
+      if( sqlite3_column_int(pStmt, 6)<=1 ){            /* !generated */
         int nName = sqlite3_column_bytes(pStmt, 1);
         int nDflt = sqlite3_column_bytes(pStmt, 4);
         const unsigned char *zName = sqlite3_column_text(pStmt, 1);
@@ -5588,6 +5593,7 @@ static int sessionChangesetApply(
   SessionApplyCtx sApply;         /* changeset_apply() context object */
   int bPatchset;
   u64 savedFlag = db->flags & SQLITE_FkNoAction;
+  u32 savedMaint = db->mDbFlags & DBFLAG_TemporalMaint;
 
   assert( xConflict!=0 );
 
@@ -5596,6 +5602,13 @@ static int sessionChangesetApply(
     db->flags |= ((u64)SQLITE_FkNoAction);
     db->aDb[0].pSchema->schema_cookie -= 32;
   }
+  /* Changeset apply is a MAINTENANCE context (PLAN-REPL): a shipped
+  ** changeset may carry sqlite_hist_* rows, which are read-only to
+  ** user statements, and while it applies the local synthesized
+  ** capture triggers must stand down -- the stream carries the
+  ** primary's history verbatim, and re-capturing it here would stamp
+  ** the replica's own seqs over the truth. */
+  db->mDbFlags |= DBFLAG_TemporalMaint;
 
   pIter->in.bNoDiscard = 1;
   memset(&sApply, 0, sizeof(sApply));
@@ -5779,6 +5792,9 @@ static int sessionChangesetApply(
     assert( db->flags & SQLITE_FkNoAction );
     db->flags &= ~((u64)SQLITE_FkNoAction);
     db->aDb[0].pSchema->schema_cookie -= 32;
+  }
+  if( savedMaint==0 ){
+    db->mDbFlags &= ~((u32)DBFLAG_TemporalMaint);
   }
 
   assert( rc!=SQLITE_OK || sApply.zErr==0 );

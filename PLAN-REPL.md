@@ -52,10 +52,20 @@ into the engine is a recorded v2 question.
   and live-tail are the same loop by construction, and the daemon
   serves the same bytes the operator sees on disk.*
 - **R5 — PITR**: apply-through-seq/UTC, composed with temporal's own
-  AS OF where both exist.
+  AS OF where both exist.  *Built 2026-08-16:
+  `sprocket_repl --restore DIR DB [--upto-seq N | --upto-utc TS]` over
+  replRestoreDir (the same applier, the same refusals, reading the
+  same files the daemon serves).  --upto-utc reads the commit clock
+  SHIPPED IN THE SEGMENTS (sqlite_hist_commits rows); a lineage whose
+  segment carries no clock refuses time-based restore past that point
+  by name, rather than guessing.  Prerequisite engine work (POC 2,
+  recorded in DESIGN-REPL): shadow PK, hidden-column capture,
+  maintenance-context apply, missing-schema refusal.*
 - **R6 — the blessed pin + gates**: temporal2 run against a replica,
   byte-equal history; sweeps + veryquick both regimes + Linux (the
-  standing lesson).
+  standing lesson).  *Pin built 2026-08-16: test/repl2.test (session
+  permutation) — the replay proof aimed at a replica, corruption
+  control kept forever.*
 - **R7 — docs**: README-REPL, DOCKET entry, DESIGN-NETWORK cross-refs.
 
 ## Controls

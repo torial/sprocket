@@ -66,13 +66,35 @@ void sqlite3TemporalEndTable(Parse *pParse, Table *pTab){
     if( i ) sqlite3_str_appendall(pCols, ", ");
     sqlite3_str_appendf(pCols, "\"%w\"", pCol->zCnName);
   }
+  sqlite3_str_appendall(pCols, ", seq_from INTEGER, seq_to INTEGER");
+  /* The shadow's natural key: (base key, seq_from) -- one row per
+  ** version of each base row.  Declared as a PRIMARY KEY because the
+  ** session module ignores tables without one (PLAN-REPL: history must
+  ** be REPLICABLE), and because AS OF resolution seeks by exactly this
+  ** key.  Every temporal table HAS a key to mirror: the PK-less case
+  ** is refused at CREATE (see sqlite3EndTable). */
+  if( HasRowid(pTab) && pTab->iPKey>=0 ){
+    sqlite3_str_appendf(pCols, ", PRIMARY KEY(\"%w\", seq_from)",
+        pTab->aCol[pTab->iPKey].zCnName);
+  }else{
+    /* Declared PK, rowid or not -- CREATE refused the PK-less case */
+    Index *pPk = sqlite3PrimaryKeyIndex(pTab);
+    if( ALWAYS(pPk) ){
+      sqlite3_str_appendall(pCols, ", PRIMARY KEY(");
+      for(i=0; i<pPk->nKeyCol; i++){
+        sqlite3_str_appendf(pCols, "\"%w\", ",
+            pTab->aCol[pPk->aiColumn[i]].zCnName);
+      }
+      sqlite3_str_appendall(pCols, "seq_from)");
+    }
+  }
   zCols = sqlite3_str_finish(pCols);
   if( zCols==0 ){
     sqlite3OomFault(db);
     return;
   }
   sqlite3NestedParse(pParse,
-    "CREATE TABLE %Q.sqlite_hist_%s(%s, seq_from INTEGER, seq_to INTEGER)",
+    "CREATE TABLE %Q.sqlite_hist_%s(%s)",
     zDb, pTab->zName, zCols);
   sqlite3_free(zCols);
   sqlite3NestedParse(pParse,
@@ -99,11 +121,15 @@ static void temporalKeyPred(sqlite3_str *p, Table *pTab, const char *zRef){
     sqlite3_str_appendf(p, "\"%w\" = %s.\"%w\"",
         pTab->aCol[pTab->iPKey].zCnName, zRef,
         pTab->aCol[pTab->iPKey].zCnName);
-  }else if( HasRowid(pTab) ){
-    sqlite3_str_appendf(p, "rowid = %s.rowid", zRef);
   }else{
+    /* A declared PRIMARY KEY -- WITHOUT ROWID, or a rowid table with a
+    ** non-INTEGER PK.  (A rowid table keyed on nothing but rowid is
+    ** REFUSED at CREATE: the shadow's rowids drift from the base's
+    ** after the first UPDATE, and history would close the wrong
+    ** versions.  Measured before it was refused.) */
     Index *pPk = sqlite3PrimaryKeyIndex(pTab);
     int i;
+    assert( pPk!=0 );
     for(i=0; i<pPk->nKeyCol; i++){
       const char *zCol = pTab->aCol[pPk->aiColumn[i]].zCnName;
       if( i ) sqlite3_str_appendall(p, " AND ");

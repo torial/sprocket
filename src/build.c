@@ -2751,6 +2751,20 @@ void sqlite3EndTable(
        "WITH SYSTEM VERSIONING requires CREATE TEMPORAL TABLE");
     return;
   }
+  /* Fork: system versioning keys history by the row's PRIMARY KEY.
+  ** Without one the capture triggers can only key on rowid, and the
+  ** shadow's rowids drift from the base's after the first UPDATE --
+  ** history then closes the WRONG versions (measured 2026-08-16: two
+  ** open intervals for one key, AS OF returning a state no reader
+  ** saw).  Fabricated history is refused at the door, with the fix. */
+  if( (tabOpts & TF_Temporal)!=0 && (p->tabFlags & TF_HasPrimaryKey)==0
+   && pParse->nErr==0
+  ){
+    sqlite3ErrorMsg(pParse,
+       "TEMPORAL table %s has no PRIMARY KEY; system versioning keys"
+       " history by the PRIMARY KEY -- declare one", p->zName);
+    return;
+  }
   if( tabOpts & TF_Temporal ){
     /* Table options merge selectively (TF_Strict below is the
     ** precedent); without this line the flag dies here and the stored

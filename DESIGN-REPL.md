@@ -71,6 +71,44 @@ restore time.  Any physical design here inherits that shape.
   primary history, proven by the same instrument, in the suite
   forever.
 
+## POC 2 (2026-08-16, during R5) — sessions vs the temporal axis
+
+Run before building PITR, because the blessed pin (Q5) depends on
+history riding the changesets.  Findings, with a scar:
+
+1. **My first instrument lied, and I briefly believed it.**  The
+   changeset-dump helper deduplicated table names wrongly and silently
+   stopped iterating; I concluded "sessions skip sqlite_* tables" and
+   began designing around a limitation that did not exist.  Arithmetic
+   implausibility (83 bytes is too many for one small row) forced a
+   hexdump, which showed the capture had been fine all along.  Kethiv:
+   sessions skip sqlite_-prefixed tables.  Qere: they never did — the
+   dump was broken.  The no-instrument-trusted-un-red rule exists for
+   exactly this.
+2. **Sessions capture trigger-context writes** (marked indirect),
+   including our synthesized capture triggers' writes to
+   sqlite_hist_commits — the commit clock ships as VALUES with no
+   engine change at all.
+3. **What did NOT ship, and why**: sqlite_hist_<name> had no PRIMARY
+   KEY (the session module's documented no-PK ignore), and hidden
+   columns are excluded from the session's column model — so history
+   rows lacked their intervals.  Both were OURS to fix: shadows now
+   declare PRIMARY KEY(base-key, seq_from) — their natural version
+   key, which also gives AS OF an index — and the fork's session
+   includes explicitly-hidden (h==1) columns while still excluding
+   generated ones.
+4. **sqlite3changeset_apply silently ignores missing tables and
+   too-few-column tables** — measured, and exactly the fabricated
+   success Q4's refuse-never-skip forbids.  The applier now pre-scans
+   the manifest and refuses by name; and apply runs as a MAINTENANCE
+   context (DBFLAG_TemporalMaint): replica shadows are writable to the
+   stream, and the replica's own capture triggers stand down so the
+   primary's history arrives verbatim instead of being re-stamped.
+
+The Q5 pin lives: test/repl2.test runs temporal2's replay proof
+against a replica built from per-commit changesets, corruption control
+included, wired into the session permutation.
+
 ## The questions for rulings
 
 ### Q1 — Physical or logical?

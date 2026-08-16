@@ -73,4 +73,12 @@ do_execsql_test -db db2 1.3 {
 
 
 db2 close
+
+# Unregister the log handler (registered at the top of this file), as
+# session3.test and sessionat.test do.  Leaving it registered poisons
+# every later file in an in-process run: the engine's informational
+# logs (e.g. the statement-aborts retry notice after apply_v2's
+# schema-cookie bump) evaluate a "log" proc that no longer exists.
+test_sqlite3_log
+
 finish_test

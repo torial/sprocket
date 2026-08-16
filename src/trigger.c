@@ -860,7 +860,16 @@ static SQLITE_NOINLINE Trigger *triggersReallyExist(
       p = pList;
     }
     do{
-      if( p->op==op && checkColumnOverlap(p->pColumns, pChanges) ){
+      if( p->bMViewMaint
+       && (pTab->tabFlags & TF_Temporal)!=0
+       && (pParse->db->mDbFlags & DBFLAG_TemporalMaint)!=0 ){
+        /* fork: under a maintenance context (changeset apply, prune)
+        ** the synthesized TEMPORAL capture triggers stand down -- an
+        ** applied changeset carries the primary's history verbatim,
+        ** and re-capturing it here would stamp local seqs over the
+        ** truth.  Materialized-view maintenance is NOT suppressed:
+        ** mview storage does not ship, so the replica must recompute. */
+      }else if( p->op==op && checkColumnOverlap(p->pColumns, pChanges) ){
         mask |= p->tr_tm;
       }else if( p->op==TK_RETURNING ){
         /* The first time a RETURNING trigger is seen, the "op" value tells
@@ -1538,9 +1547,16 @@ void sqlite3CodeRowTrigger(
     **      doing the UPDATE part of an UPSERT.
     */
     if( (p->op==op || (p->bReturning && p->op==TK_INSERT && op==TK_UPDATE))
-     && p->tr_tm==tr_tm 
+     && p->tr_tm==tr_tm
      && checkColumnOverlap(p->pColumns, pChanges)
     ){
+      if( p->bMViewMaint
+       && (pTab->tabFlags & TF_Temporal)!=0
+       && (pParse->db->mDbFlags & DBFLAG_TemporalMaint)!=0 ){
+        /* fork: maintenance context -- temporal capture stands down
+        ** (see triggersReallyExist) */
+        continue;
+      }
       if( !p->bReturning ){
         sqlite3CodeRowTriggerDirect(pParse, p, pTab, reg, orconf, ignoreJump);
       }else if( sqlite3IsToplevel(pParse) ){
