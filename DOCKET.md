@@ -1852,5 +1852,5 @@ daemon fronting a real workload. Candidate fits to explore when taken
 up: Mosaic's annotation/apparatus layers are naturally versioned
 (temporal), its reading surfaces are naturally read-replicas
 (replication), and its API shapes are naturally nested (procs +
-TSGEN). Prerequisite honesty: sprocketd is Windows-only today; a real
-deployment story likely needs the Linux socket shim first.
+TSGEN). The former prerequisite is met: sprocketd runs on Linux as of
+2026-08-16 (tool/sd_port.h), same 57 checks both platforms.

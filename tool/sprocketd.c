@@ -50,16 +50,19 @@
 ** lineage 1..head (refuse-never-skip needs the daemon to KNOW there
 ** are no holes) and that the archive belongs to this database.
 **
-** Build (from repo root, VS dev prompt):
+** Build (Windows, VS dev prompt, repo root):
 **   cl /O2 /I. /Itool -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
 **      tool\sprocketd.c sqlite3.c ws2_32.lib /Fe:sprocketd.exe
-** Run:      sprocketd.exe DB [port] [--archive DIR]   (default port 7690)
-** Selftest: sprocketd.exe --selftest       (the PLAN-DAEMON D0 matrix)
+** Build (Linux/POSIX, via tool/sd_port.h -- the 2026-08-16 shim):
+**   gcc -O2 -I. -Itool -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
+**      tool/sprocketd.c sqlite3.c -lpthread -ldl -lm -o sprocketd
+** Run:      sprocketd DB [port] [--archive DIR]       (default port 7690)
+** Selftest: sprocketd --selftest       (the PLAN-DAEMON D0 matrix; the
+**           SAME 57 checks are the cross-platform gate)
 */
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "sd_port.h"           /* sockets/threads/events/files: Win32 and
+                               ** POSIX implementations of one vocabulary
+                               ** (the Linux shim, 2026-08-16) */
 
 #define PROC_WIRE_NO_MAIN  1
 #define PROC_FRAME_NO_MAIN 1
@@ -71,8 +74,6 @@
                                ** homes -- the harness proves it standalone,
                                ** the daemon serves it */
 
-#pragma comment(lib, "ws2_32.lib")
-
 #define REQ_CALL   1
 #define REQ_HELLO  2
 #define REQ_SUB    3
@@ -83,7 +84,7 @@
 ** Borrowed shapes from proc_server.c (phase 2), which proved them: a
 ** connection OWNS its framer (a recv can hold one message's tail and the
 ** next's head), and everything gets a timeout so no failure mode wedges. */
-static int sdSendAll(SOCKET s, const unsigned char *z, int n){
+static int sdSendAll(SdSocket s, const unsigned char *z, int n){
   int i = 0;
   while( i < n ){
     int k = send(s, (const char*)z + i, n - i, 0);
@@ -92,10 +93,8 @@ static int sdSendAll(SOCKET s, const unsigned char *z, int n){
   }
   return 0;
 }
-static void sdTimeouts(SOCKET s){
-  DWORD ms = IO_TIMEOUT_MS;
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof(ms));
+static void sdTimeouts(SdSocket s){
+  sdSockTimeouts(s, IO_TIMEOUT_MS);
 }
 
 typedef struct SdMsg { unsigned char *a; int n; } SdMsg;
@@ -109,11 +108,11 @@ static void sdOnMsg(void *pArg, const unsigned char *z, int n){
   }
 }
 typedef struct SdConn {
-  SOCKET s;
+  SdSocket s;
   Framer fr;
   SdMsgQ q;                    /* messages assembled but not yet consumed */
 } SdConn;
-static void sdConnInit(SdConn *pc, SOCKET s){ memset(pc,0,sizeof(*pc)); pc->s=s; }
+static void sdConnInit(SdConn *pc, SdSocket s){ memset(pc,0,sizeof(*pc)); pc->s=s; }
 static void sdConnFree(SdConn *pc){
   int i;
   for(i=0;i<pc->q.n;i++) free(pc->q.a[i].a);
@@ -155,27 +154,27 @@ typedef struct SdItem {
   unsigned outCookie;          /* server cookie at execution               */
   int rc;
   char zErr[256];
-  HANDLE hDone;
+  SdEvent hDone;
 } SdItem;
 
 typedef struct SdQueue {
   sqlite3 *db;                 /* the declared queue_writer connection     */
-  CRITICAL_SECTION mx;
-  CONDITION_VARIABLE cvItem, cvSpace;
+  SdMutex mx;
+  SdCond cvItem, cvSpace;
   SdItem *aItem[SDQCAP];
   int iHead, iTail, nQueued;
-  volatile LONG bStop;
-  HANDLE hThread;
-  HANDLE hGate;                /* manual-reset, signalled; tests close it  */
+  SdCount bStop;
+  SdThread hThread;
+  SdEvent hGate;               /* manual-reset, signalled; tests close it  */
   /* instruments (deterministic counts + one duration) */
-  volatile LONG nDone;
-  volatile LONG lastBatch;
-  volatile LONG lastCommitMs;
-  LONGLONG oldestQueuedAt;     /* GetTickCount64 of current head, 0=empty  */
+  SdCount nDone;
+  SdCount lastBatch;
+  SdCount lastCommitMs;
+  long long oldestQueuedAt;    /* monotonic ms of current head, 0=empty    */
   /* replication (PLAN-REPL R4): set iff an archive was declared */
   ReplWriter *pRepl;           /* segment writer on THIS connection        */
   const char *zArchive;        /* declared archive directory, or 0         */
-  CONDITION_VARIABLE cvCut;    /* broadcast after each archived segment    */
+  SdCond cvCut;    /* broadcast after each archived segment    */
   sqlite3_int64 iHeadSeq;      /* highest archived seq (under mx)          */
   char zReplErr[300];          /* sticky archive failure; "" = healthy     */
 } SdQueue;
@@ -186,72 +185,76 @@ static int sdExecCall(sqlite3 *db, const unsigned char *aReq, int nReq,
 
 /* ------------------------------------------------------ archive helpers -- */
 static void sdSegPath(char *zOut, int n, const char *zDir, sqlite3_int64 seq){
-  sqlite3_snprintf(n, zOut, "%s\\%016llx.sprkseg", zDir,
+  /* forward slash: both platforms accept it, so archives carry one
+  ** spelling everywhere */
+  sqlite3_snprintf(n, zOut, "%s/%016llx.sprkseg", zDir,
                    (sqlite3_uint64)seq);
 }
 /* Write-then-rename so a segment file either exists whole or not at all
 ** -- a half-written segment would fail its own checksum, but why hand a
 ** subscriber even that. */
 static int sdWriteFileAtomic(const char *zPath, const unsigned char *a, int n){
-  char zTmp[MAX_PATH+8];
-  HANDLE h; DWORD wr = 0; BOOL ok;
+  char zTmp[SD_PATHMAX+8];
+  FILE *f;
+  int ok;
   sqlite3_snprintf(sizeof(zTmp), zTmp, "%s.tmp", zPath);
-  h = CreateFileA(zTmp, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
-                  FILE_ATTRIBUTE_NORMAL, 0);
-  if( h==INVALID_HANDLE_VALUE ) return 1;
-  ok = WriteFile(h, a, (DWORD)n, &wr, 0) && (int)wr==n;
-  ok = FlushFileBuffers(h) && ok;
-  CloseHandle(h);
-  if( !ok || !MoveFileExA(zTmp, zPath, MOVEFILE_REPLACE_EXISTING) ){
-    DeleteFileA(zTmp);
+  f = fopen(zTmp, "wb");
+  if( f==0 ) return 1;
+  ok = (int)fwrite(a, 1, n, f)==n;
+  ok = sdFsync(f)==0 && ok;
+  fclose(f);
+  if( !ok || sdFileRename(zTmp, zPath) ){
+    sdFileDelete(zTmp);
     return 1;
   }
   return 0;
 }
 /* Whole file, sqlite3_malloc'd; 0 on any failure (*pn stays 0). */
 static unsigned char *sdSegRead(const char *zPath, int *pn){
-  HANDLE h;
-  DWORD sz, rd = 0;
+  FILE *f;
+  long sz;
   unsigned char *a;
   *pn = 0;
-  h = CreateFileA(zPath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_NORMAL, 0);
-  if( h==INVALID_HANDLE_VALUE ) return 0;
-  sz = GetFileSize(h, 0);
-  if( sz==INVALID_FILE_SIZE || sz>0x7fffffff ){ CloseHandle(h); return 0; }
-  a = (unsigned char*)sqlite3_malloc((int)(sz ? sz : 1));
-  if( a==0 ){ CloseHandle(h); return 0; }
-  if( !ReadFile(h, a, sz, &rd, 0) || rd!=sz ){
-    CloseHandle(h); sqlite3_free(a); return 0;
+  f = fopen(zPath, "rb");
+  if( f==0 ) return 0;
+  if( fseek(f, 0, SEEK_END) || (sz = ftell(f))<0 || sz>0x7fffffff
+   || fseek(f, 0, SEEK_SET) ){
+    fclose(f);
+    return 0;
   }
-  CloseHandle(h);
+  a = (unsigned char*)sqlite3_malloc((int)(sz ? sz : 1));
+  if( a==0 ){ fclose(f); return 0; }
+  if( (long)fread(a, 1, sz, f)!=sz ){
+    fclose(f); sqlite3_free(a); return 0;
+  }
+  fclose(f);
   *pn = (int)sz;
   return a;
 }
 
-static DWORD WINAPI sdWriter(LPVOID pArg){
+static SdThreadRet SD_THREAD_CALL sdWriter(SdThreadArg pArg){
   SdQueue *q = (SdQueue*)pArg;
   SdItem *aBatch[SDQCAP];
   while( 1 ){
     int nBatch = 0, i;
-    EnterCriticalSection(&q->mx);
+    sdMutexEnter(&q->mx);
     while( q->nQueued==0 && !q->bStop ){
-      SleepConditionVariableCS(&q->cvItem, &q->mx, 100);
+      sdCondWaitMs(&q->cvItem, &q->mx, 100);
     }
-    if( q->bStop && q->nQueued==0 ){ LeaveCriticalSection(&q->mx); break; }
-    LeaveCriticalSection(&q->mx);
-    WaitForSingleObject(q->hGate, INFINITE);   /* after the wait: the gate
+    if( q->bStop && q->nQueued==0 ){ sdMutexLeave(&q->mx); break; }
+    sdMutexLeave(&q->mx);
+    sdEventWait(q->hGate);                     /* after the wait: the gate
                                                ** must see queued items */
-    EnterCriticalSection(&q->mx);
+    sdMutexEnter(&q->mx);
     while( q->nQueued>0 ){
       aBatch[nBatch++] = q->aItem[q->iHead];
       q->iHead = (q->iHead+1) % SDQCAP;
       q->nQueued--;
     }
     q->oldestQueuedAt = 0;
-    LeaveCriticalSection(&q->mx);
+    sdMutexLeave(&q->mx);
     if( nBatch>0 ){
-      LONGLONG t0 = GetTickCount64();
+      long long t0 = sdMonotonicMs();
       sqlite3_exec(q->db, "BEGIN IMMEDIATE;", 0, 0, 0);
       for(i=0;i<nBatch;i++){
         SdItem *it = aBatch[i];
@@ -269,58 +272,58 @@ static DWORD WINAPI sdWriter(LPVOID pArg){
         int nSeg = 0;
         int rc2 = replWriterCut(q->pRepl, &aSeg, &nSeg);
         if( rc2==SQLITE_OK ){
-          char zPath[MAX_PATH];
+          char zPath[SD_PATHMAX];
           sdSegPath(zPath, sizeof(zPath), q->zArchive, q->pRepl->iLastCut);
           if( sdWriteFileAtomic(zPath, aSeg, nSeg) ){
-            EnterCriticalSection(&q->mx);
+            sdMutexEnter(&q->mx);
             sqlite3_snprintf(sizeof(q->zReplErr), q->zReplErr,
               "archive write failed at seq %lld (%s); replication is "
               "STOPPED at the last archived segment",
               q->pRepl->iLastCut, zPath);
-            LeaveCriticalSection(&q->mx);
-            WakeAllConditionVariable(&q->cvCut);
+            sdMutexLeave(&q->mx);
+            sdCondWakeAll(&q->cvCut);
           }else{
-            EnterCriticalSection(&q->mx);
+            sdMutexEnter(&q->mx);
             q->iHeadSeq = q->pRepl->iLastCut;
-            LeaveCriticalSection(&q->mx);
-            WakeAllConditionVariable(&q->cvCut);
+            sdMutexLeave(&q->mx);
+            sdCondWakeAll(&q->cvCut);
           }
           sqlite3_free(aSeg);
         }else if( rc2!=SQLITE_DONE && q->zReplErr[0]==0 ){
-          EnterCriticalSection(&q->mx);
+          sdMutexEnter(&q->mx);
           sqlite3_snprintf(sizeof(q->zReplErr), q->zReplErr,
             "segment cut failed after seq %lld (rc=%d); replication is "
             "STOPPED at the last archived segment",
             q->pRepl->iLastCut, rc2);
-          LeaveCriticalSection(&q->mx);
-          WakeAllConditionVariable(&q->cvCut);
+          sdMutexLeave(&q->mx);
+          sdCondWakeAll(&q->cvCut);
         }
       }
-      InterlockedExchange(&q->lastCommitMs, (LONG)(GetTickCount64()-t0));
-      InterlockedExchange(&q->lastBatch, nBatch);
-      InterlockedAdd(&q->nDone, nBatch);
-      for(i=0;i<nBatch;i++) SetEvent(aBatch[i]->hDone);
-      WakeAllConditionVariable(&q->cvSpace);
+      sdAtomicExchange(&q->lastCommitMs, (long)(sdMonotonicMs()-t0));
+      sdAtomicExchange(&q->lastBatch, nBatch);
+      sdAtomicAdd(&q->nDone, nBatch);
+      for(i=0;i<nBatch;i++) sdEventSet(aBatch[i]->hDone);
+      sdCondWakeAll(&q->cvSpace);
     }
   }
   return 0;
 }
 
 static int sdQueueSubmit(SdQueue *q, SdItem *it){
-  it->hDone = CreateEvent(0, FALSE, FALSE, 0);
-  if( it->hDone==0 ) return SQLITE_NOMEM;
-  EnterCriticalSection(&q->mx);
+  it->hDone = sdEventCreate(0, 0);
+  if( !SD_EVENT_OK(it->hDone) ) return SQLITE_NOMEM;
+  sdMutexEnter(&q->mx);
   while( q->nQueued==SDQCAP ){
-    SleepConditionVariableCS(&q->cvSpace, &q->mx, INFINITE);
+    sdCondWaitMs(&q->cvSpace, &q->mx, -1);
   }
-  if( q->nQueued==0 ) q->oldestQueuedAt = GetTickCount64();
+  if( q->nQueued==0 ) q->oldestQueuedAt = sdMonotonicMs();
   q->aItem[q->iTail] = it;
   q->iTail = (q->iTail+1) % SDQCAP;
   q->nQueued++;
-  WakeConditionVariable(&q->cvItem);
-  LeaveCriticalSection(&q->mx);
-  WaitForSingleObject(it->hDone, INFINITE);
-  CloseHandle(it->hDone);
+  sdCondWakeOne(&q->cvItem);
+  sdMutexLeave(&q->mx);
+  sdEventWait(it->hDone);
+  sdEventDestroy(it->hDone);
   return SQLITE_OK;
 }
 
@@ -332,18 +335,18 @@ typedef struct RouteEnt { char *zName; int bWrites; } RouteEnt;
 typedef struct Sprocketd {
   const char *zDb;
   sqlite3 *aReader[SD_NREADER];
-  CRITICAL_SECTION aReaderMx[SD_NREADER];
-  volatile LONG iReaderRR;
+  SdMutex aReaderMx[SD_NREADER];
+  SdCount iReaderRR;
   SdQueue wq;
   RouteEnt *aRoute;
   int nRoute;
   unsigned routeCookie;        /* schema cookie the route table reflects  */
-  CRITICAL_SECTION routeMx;
-  SOCKET sListen;
+  SdMutex routeMx;
+  SdSocket sListen;
   int port;
-  volatile LONG bShutdown;
-  volatile LONG nConn, nReqIn, nReqOut;
-  HANDLE hReady;
+  SdCount bShutdown;
+  SdCount nConn, nReqIn, nReqOut;
+  SdEvent hReady;
   int bTestMisroute;           /* selftest hook: route writers to readers */
 } Sprocketd;
 
@@ -362,7 +365,7 @@ static unsigned sdSchemaCookie(sqlite3 *db){
 static int sdLoadRoutes(Sprocketd *d, sqlite3 *db){
   sqlite3_stmt *p = 0;
   int i;
-  EnterCriticalSection(&d->routeMx);
+  sdMutexEnter(&d->routeMx);
   for(i=0;i<d->nRoute;i++) sqlite3_free(d->aRoute[i].zName);
   sqlite3_free(d->aRoute);
   d->aRoute = 0; d->nRoute = 0;
@@ -381,14 +384,14 @@ static int sdLoadRoutes(Sprocketd *d, sqlite3 *db){
   }
   sqlite3_finalize(p);
   d->routeCookie = sdSchemaCookie(db);
-  LeaveCriticalSection(&d->routeMx);
+  sdMutexLeave(&d->routeMx);
   return 0;
 }
 
 /* -1 unknown, else the writes flag. */
 static int sdRouteWrites(Sprocketd *d, const char *zName, int nName){
   int i, r = -1;
-  EnterCriticalSection(&d->routeMx);
+  sdMutexEnter(&d->routeMx);
   for(i=0;i<d->nRoute;i++){
     if( (int)strlen(d->aRoute[i].zName)==nName
      && sqlite3_strnicmp(d->aRoute[i].zName, zName, nName)==0 ){
@@ -396,7 +399,7 @@ static int sdRouteWrites(Sprocketd *d, const char *zName, int nName){
       break;
     }
   }
-  LeaveCriticalSection(&d->routeMx);
+  sdMutexLeave(&d->routeMx);
   return r;
 }
 
@@ -511,16 +514,16 @@ static void sdErrorBody(WireBuf *pOut, int code, const char *zMsg){
 static void sdStatsBody(Sprocketd *d, WireBuf *pOut){
   struct { const char *z; sqlite3_int64 v; } a[7];
   int i, n = 0;
-  LONGLONG oldest;
-  EnterCriticalSection(&d->wq.mx);
+  long long oldest;
+  sdMutexEnter(&d->wq.mx);
   a[n].z = "queue_depth";      a[n++].v = d->wq.nQueued;
   oldest = d->wq.oldestQueuedAt;
   if( d->wq.zArchive ){
     a[n].z = "repl_head_seq";  a[n++].v = d->wq.iHeadSeq;
   }
-  LeaveCriticalSection(&d->wq.mx);
+  sdMutexLeave(&d->wq.mx);
   a[n].z = "oldest_waiter_ms";
-  a[n++].v = oldest ? (sqlite3_int64)(GetTickCount64()-oldest) : 0;
+  a[n++].v = oldest ? (sqlite3_int64)(sdMonotonicMs()-oldest) : 0;
   a[n].z = "last_batch";       a[n++].v = d->wq.lastBatch;
   a[n].z = "last_commit_ms";   a[n++].v = d->wq.lastCommitMs;
   a[n].z = "writes_done";      a[n++].v = d->wq.nDone;
@@ -539,9 +542,9 @@ static void sdStatsBody(Sprocketd *d, WireBuf *pOut){
 }
 
 /* --------------------------------------------------- per-connection thread -- */
-typedef struct SdConnArg { Sprocketd *d; SOCKET s; } SdConnArg;
+typedef struct SdConnArg { Sprocketd *d; SdSocket s; } SdConnArg;
 
-static DWORD WINAPI sdConnThread(LPVOID pArg){
+static SdThreadRet SD_THREAD_CALL sdConnThread(SdThreadArg pArg){
   SdConnArg *ca = (SdConnArg*)pArg;
   Sprocketd *d = ca->d;
   SdConn c;
@@ -549,14 +552,14 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
   sdConnInit(&c, ca->s);
   free(ca);
   sdTimeouts(c.s);
-  InterlockedIncrement(&d->nConn);
+  sdAtomicInc(&d->nConn);
 
   while( !d->bShutdown ){
     SdMsg m;
     WireRd rd;
     unsigned op;
     if( sdRecvMsg(&c, &m) ) break;
-    InterlockedIncrement(&d->nReqIn);
+    sdAtomicInc(&d->nReqIn);
     rdInit(&rd, m.a, m.n);
     op = rdU8(&rd);
 
@@ -574,7 +577,7 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
       { WireBuf f; memset(&f,0,sizeof(f)); frWrap(&f, b.a, b.n);
         sdSendAll(c.s, f.a, f.n); wbFree(&f); }
       wbFree(&b);
-      InterlockedIncrement(&d->nReqOut);
+      sdAtomicInc(&d->nReqOut);
       free(m.a);
       if( !bHello ) break;
       continue;
@@ -627,13 +630,13 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
             body = it.out;
             outCookie = it.outCookie;
           }else{
-            int ir = (int)(InterlockedIncrement(&d->iReaderRR)
+            int ir = (int)(sdAtomicInc(&d->iReaderRR)
                            % SD_NREADER);
             int rc;
-            EnterCriticalSection(&d->aReaderMx[ir]);
+            sdMutexEnter(&d->aReaderMx[ir]);
             rc = sdExecCall(d->aReader[ir], aCallReq, nCallReq, 0,
                             &body, &outCookie, zErr, sizeof(zErr));
-            LeaveCriticalSection(&d->aReaderMx[ir]);
+            sdMutexLeave(&d->aReaderMx[ir]);
             if( rc==SQLITE_BUSY
              && strstr(zErr, "queued-write mode")!=0 ){
               /* The backstop fired: a proc routed read-only tried to
@@ -659,7 +662,7 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
         sdSendAll(c.s, f.a, f.n);
         wbFree(&f); }
       wbFree(&hdr); wbFree(&body);
-      InterlockedIncrement(&d->nReqOut);
+      sdAtomicInc(&d->nReqOut);
       free(m.a);
       continue;
     }
@@ -675,9 +678,9 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
       memset(&hb, 0, sizeof(hb));
       memset(&bb, 0, sizeof(bb));
 
-      EnterCriticalSection(&q->mx);
+      sdMutexEnter(&q->mx);
       head = q->iHeadSeq;
-      LeaveCriticalSection(&q->mx);
+      sdMutexLeave(&q->mx);
 
       if( rd.bad ){
         sdErrorBody(&bb, SQLITE_MISUSE, "malformed request");
@@ -716,7 +719,7 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
         sdSendAll(c.s, f.a, f.n);
         wbFree(&f); }
       wbFree(&hb); wbFree(&bb);
-      InterlockedIncrement(&d->nReqOut);
+      sdAtomicInc(&d->nReqOut);
       free(m.a);
       if( bRefused ) continue;      /* a refusal is an answer, not a hangup */
 
@@ -729,13 +732,13 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
         for(seq=from; !bDead; seq++){
           unsigned char *aSeg;
           int nSeg = 0;
-          char zPath[MAX_PATH];
-          EnterCriticalSection(&q->mx);
+          char zPath[SD_PATHMAX];
+          sdMutexEnter(&q->mx);
           while( q->iHeadSeq<seq && !d->bShutdown && q->zReplErr[0]==0 ){
-            SleepConditionVariableCS(&q->cvCut, &q->mx, 200);
+            sdCondWaitMs(&q->cvCut, &q->mx, 200);
           }
           bDead = (q->zReplErr[0]!=0);
-          LeaveCriticalSection(&q->mx);
+          sdMutexLeave(&q->mx);
           if( d->bShutdown ) break;
           if( bDead ){
             WireBuf eb, f;
@@ -777,14 +780,14 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
       frWrap(&f, b.a, b.n);
       sdSendAll(c.s, f.a, f.n);
       wbFree(&f); wbFree(&b); }
-    InterlockedIncrement(&d->nReqOut);
+    sdAtomicInc(&d->nReqOut);
     free(m.a);
     break;
   }
 
-  closesocket(c.s);
+  sdSockClose(c.s);
   sdConnFree(&c);
-  InterlockedDecrement(&d->nConn);
+  sdAtomicDec(&d->nConn);
   return 0;
 }
 
@@ -795,8 +798,8 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
 ** not discovered by a subscriber at 2am. */
 static int sdArchiveOpen(SdQueue *q, const char *zDir){
   sqlite3_int64 s, head;
-  char zPath[MAX_PATH];
-  CreateDirectoryA(zDir, 0);   /* declared explicitly: create if absent */
+  char zPath[SD_PATHMAX];
+  sdDirCreate(zDir);           /* declared explicitly: create if absent */
   if( replWriterOpen(q->db, &q->pRepl)!=SQLITE_OK || q->pRepl==0 ){
     fprintf(stderr, "sprocketd: cannot open the segment writer on %s "
             "(session support missing from this build?)\n", zDir);
@@ -805,7 +808,7 @@ static int sdArchiveOpen(SdQueue *q, const char *zDir){
   head = q->pRepl->iLastCut;
   for(s=1; s<=head; s++){
     sdSegPath(zPath, sizeof(zPath), zDir, s);
-    if( GetFileAttributesA(zPath)==INVALID_FILE_ATTRIBUTES ){
+    if( !sdFileExists(zPath) ){
       fprintf(stderr, "sprocketd: this database has cut %lld segments "
               "but the archive is missing seq %lld (%s); refusing to "
               "serve a lineage with a hole.  Point --archive at the "
@@ -830,15 +833,14 @@ static int sdArchiveOpen(SdQueue *q, const char *zDir){
   /* files BEYOND the writer's head mean the database went backward
   ** under its archive (restored from a stale copy?) */
   {
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
-    char zGlob[MAX_PATH];
-    sqlite3_snprintf(sizeof(zGlob), zGlob, "%s\\*.sprkseg", zDir);
-    h = FindFirstFileA(zGlob, &fd);
-    if( h!=INVALID_HANDLE_VALUE ){
-      do{
+    SdDir dd;
+    if( sdDirOpen(&dd, zDir)==0 ){
+      const char *zName;
+      while( (zName = sdDirNext(&dd))!=0 ){
         sqlite3_int64 v = 0;
-        const char *z = fd.cFileName;
+        const char *z = zName;
+        const char *zDot = strchr(zName, '.');
+        if( zDot==0 || strcmp(zDot, ".sprkseg")!=0 ) continue;
         while( *z && *z!='.' ){
           int c = *z++;
           v = v*16 + (c<='9' ? c-'0' : (c|0x20)-'a'+10);
@@ -848,11 +850,11 @@ static int sdArchiveOpen(SdQueue *q, const char *zDir){
                   "database has only cut %lld -- the database is BEHIND "
                   "its own archive (restored from a stale copy?); "
                   "refusing to overwrite the lineage.\n", v, head);
-          FindClose(h);
+          sdDirClose(&dd);
           return 1;
         }
-      }while( FindNextFileA(h, &fd) );
-      FindClose(h);
+      }
+      sdDirClose(&dd);
     }
   }
   q->iHeadSeq = head;
@@ -866,7 +868,7 @@ static int sdOpen(Sprocketd *d, const char *zDb, int port,
   memset(d, 0, sizeof(*d));
   d->zDb = zDb;
   d->port = port;
-  InitializeCriticalSection(&d->routeMx);
+  sdMutexInit(&d->routeMx);
 
   /* The writer connection declares the mode -- checked when declared. */
   if( sqlite3_open(zDb, &d->wq.db)!=SQLITE_OK ) return 1;
@@ -888,32 +890,32 @@ static int sdOpen(Sprocketd *d, const char *zDb, int port,
     }
   }
   sqlite3_busy_timeout(d->wq.db, 5000);
-  InitializeCriticalSection(&d->wq.mx);
-  InitializeConditionVariable(&d->wq.cvItem);
-  InitializeConditionVariable(&d->wq.cvSpace);
-  InitializeConditionVariable(&d->wq.cvCut);
+  sdMutexInit(&d->wq.mx);
+  sdCondInit(&d->wq.cvItem);
+  sdCondInit(&d->wq.cvSpace);
+  sdCondInit(&d->wq.cvCut);
   if( zArchive && sdArchiveOpen(&d->wq, zArchive) ) return 1;
-  d->wq.hGate = CreateEvent(0, TRUE, TRUE, 0);
-  d->wq.hThread = CreateThread(0, 0, sdWriter, &d->wq, 0, 0);
-  if( d->wq.hGate==0 || d->wq.hThread==0 ) return 1;
+  d->wq.hGate = sdEventCreate(1, 1);
+  d->wq.hThread = sdThreadCreate(sdWriter, &d->wq);
+  if( !SD_EVENT_OK(d->wq.hGate) || !SD_THREAD_OK(d->wq.hThread) ) return 1;
 
   for(i=0;i<SD_NREADER;i++){
     if( sqlite3_open(zDb, &d->aReader[i])!=SQLITE_OK ) return 1;
     sqlite3_busy_timeout(d->aReader[i], 0);   /* the backstop must answer
                                               ** promptly, not spin */
-    InitializeCriticalSection(&d->aReaderMx[i]);
+    sdMutexInit(&d->aReaderMx[i]);
   }
   sdLoadRoutes(d, d->wq.db);
 
   d->sListen = socket(AF_INET, SOCK_STREAM, 0);
-  if( d->sListen==INVALID_SOCKET ) return 1;
+  if( d->sListen==SD_INVALID_SOCKET ) return 1;
   {
     struct sockaddr_in a;
-    int n = sizeof(a);
+    SdSockLen n = (SdSockLen)sizeof(a);
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons((u_short)d->port);
+    a.sin_port = htons((unsigned short)d->port);
     if( bind(d->sListen, (struct sockaddr*)&a, sizeof(a))!=0 ) return 1;
     if( d->port==0 ){
       getsockname(d->sListen, (struct sockaddr*)&a, &n);
@@ -921,23 +923,24 @@ static int sdOpen(Sprocketd *d, const char *zDb, int port,
     }
   }
   if( listen(d->sListen, 16)!=0 ) return 1;
-  d->hReady = CreateEvent(0, TRUE, FALSE, 0);
+  d->hReady = sdEventCreate(1, 0);
   return 0;
 }
 
-static DWORD WINAPI sdAcceptLoop(LPVOID pArg){
+static SdThreadRet SD_THREAD_CALL sdAcceptLoop(SdThreadArg pArg){
   Sprocketd *d = (Sprocketd*)pArg;
-  SetEvent(d->hReady);
+  sdEventSet(d->hReady);
   while( !d->bShutdown ){
-    SOCKET s = accept(d->sListen, 0, 0);
-    if( s==INVALID_SOCKET ) break;
+    SdSocket s = accept(d->sListen, 0, 0);
+    if( s==SD_INVALID_SOCKET ) break;
     {
       SdConnArg *ca = (SdConnArg*)malloc(sizeof(*ca));
-      HANDLE h;
-      if( ca==0 ){ closesocket(s); continue; }
+      if( ca==0 ){ sdSockClose(s); continue; }
       ca->d = d; ca->s = s;
-      h = CreateThread(0, 0, sdConnThread, ca, 0, 0);
-      if( h ) CloseHandle(h); else { closesocket(s); free(ca); }
+      if( sdThreadCreateDetached(sdConnThread, ca) ){
+        sdSockClose(s);
+        free(ca);
+      }
     }
   }
   return 0;
@@ -946,44 +949,43 @@ static DWORD WINAPI sdAcceptLoop(LPVOID pArg){
 /* Graceful: stop accepting, drain the queue, close everything. */
 static void sdClose(Sprocketd *d){
   int i;
-  InterlockedExchange(&d->bShutdown, 1);
-  if( d->sListen!=INVALID_SOCKET ){ closesocket(d->sListen); }
-  WakeAllConditionVariable(&d->wq.cvCut);   /* subscribers re-check */
+  sdAtomicExchange(&d->bShutdown, 1);
+  if( d->sListen!=SD_INVALID_SOCKET ){ sdSockClose(d->sListen); }
+  sdCondWakeAll(&d->wq.cvCut);   /* subscribers re-check */
   /* connections notice bShutdown at their next message or timeout */
-  for(i=0;i<200 && d->nConn>0;i++) Sleep(25);
-  EnterCriticalSection(&d->wq.mx);
+  for(i=0;i<200 && d->nConn>0;i++) sdSleepMs(25);
+  sdMutexEnter(&d->wq.mx);
   d->wq.bStop = 1;
-  WakeAllConditionVariable(&d->wq.cvItem);
-  LeaveCriticalSection(&d->wq.mx);
-  WaitForSingleObject(d->wq.hThread, INFINITE);
-  CloseHandle(d->wq.hThread);
-  CloseHandle(d->wq.hGate);
-  DeleteCriticalSection(&d->wq.mx);
+  sdCondWakeAll(&d->wq.cvItem);
+  sdMutexLeave(&d->wq.mx);
+  sdThreadJoin(d->wq.hThread, -1);
+  sdEventDestroy(d->wq.hGate);
+  sdMutexDestroy(&d->wq.mx);
   if( d->wq.pRepl ) replWriterClose(d->wq.pRepl);
   sqlite3_close(d->wq.db);
   for(i=0;i<SD_NREADER;i++){
     sqlite3_close(d->aReader[i]);
-    DeleteCriticalSection(&d->aReaderMx[i]);
+    sdMutexDestroy(&d->aReaderMx[i]);
   }
   for(i=0;i<d->nRoute;i++) sqlite3_free(d->aRoute[i].zName);
   sqlite3_free(d->aRoute);
-  DeleteCriticalSection(&d->routeMx);
-  if( d->hReady ) CloseHandle(d->hReady);
+  sdMutexDestroy(&d->routeMx);
+  sdEventDestroy(d->hReady);
 }
 
 /* ================================ selftest =============================== */
 #ifndef SPROCKETD_NO_MAIN
 
 /* -- tiny client ---------------------------------------------------------- */
-static SOCKET stConnect(int port){
-  SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+static SdSocket stConnect(int port){
+  SdSocket s = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = htons((u_short)port);
   if( connect(s, (struct sockaddr*)&a, sizeof(a))!=0 ){
-    closesocket(s); return INVALID_SOCKET;
+    sdSockClose(s); return SD_INVALID_SOCKET;
   }
   sdTimeouts(s);
   return s;
@@ -1083,7 +1085,7 @@ static int memmem_like(const unsigned char *z, int n, const char *zN){
 
 static void stFixture(const char *zDb){
   sqlite3 *db = 0;
-  DeleteFileA(zDb);
+  sdFileDelete(zDb);
   sqlite3_open(zDb, &db);
   sqlite3_exec(db,
     "PRAGMA journal_mode=wal2;"
@@ -1107,7 +1109,7 @@ static void stFixture(const char *zDb){
 ** stays as a naturally-occurring control that never reaches a session. */
 static void stFixtureRepl(const char *zDb){
   sqlite3 *db = 0;
-  DeleteFileA(zDb);
+  sdFileDelete(zDb);
   sqlite3_open(zDb, &db);
   sqlite3_exec(db,
     "PRAGMA journal_mode=wal2;"
@@ -1120,20 +1122,17 @@ static void stFixtureRepl(const char *zDb){
   sqlite3_close(db);
 }
 static void stRmArchive(const char *zDir){
-  WIN32_FIND_DATAA fd;
-  HANDLE h;
-  char zGlob[MAX_PATH], zP[MAX_PATH];
-  sqlite3_snprintf(sizeof(zGlob), zGlob, "%s\\*", zDir);
-  h = FindFirstFileA(zGlob, &fd);
-  if( h!=INVALID_HANDLE_VALUE ){
-    do{
-      if( fd.cFileName[0]=='.' ) continue;
-      sqlite3_snprintf(sizeof(zP), zP, "%s\\%s", zDir, fd.cFileName);
-      DeleteFileA(zP);
-    }while( FindNextFileA(h, &fd) );
-    FindClose(h);
+  SdDir dd;
+  char zP[SD_PATHMAX];
+  if( sdDirOpen(&dd, zDir)==0 ){
+    const char *zName;
+    while( (zName = sdDirNext(&dd))!=0 ){
+      sqlite3_snprintf(sizeof(zP), zP, "%s/%s", zDir, zName);
+      sdFileDelete(zP);
+    }
+    sdDirClose(&dd);
   }
-  RemoveDirectoryA(zDir);
+  sdDirRemove(zDir);
 }
 
 /* Route the engine's error log to stderr.  sqlite3_log carries the
@@ -1148,13 +1147,12 @@ static void sdLogTo(void *pArg, int iErrCode, const char *zMsg){
 }
 
 int main(int argc, char **argv){
-  WSADATA w;
   sqlite3_config(SQLITE_CONFIG_LOG, sdLogTo, 0);
-  WSAStartup(MAKEWORD(2,2), &w);
+  sdSockInit();
 
   if( argc>=2 && strcmp(argv[1], "--selftest")==0 ){
     Sprocketd d;
-    HANDLE hAcc;
+    SdThread hAcc;
     SdConn c;
     SdMsg hdr, body;
     const char *zDb = "sprocketd_test.db";
@@ -1162,12 +1160,12 @@ int main(int argc, char **argv){
     printf("sprocketd selftest -- SQLite %s\n\n", sqlite3_libversion());
     stFixture(zDb);
     check( sdOpen(&d, zDb, 0, 0)==0, "daemon opens (declares queue_writer)" );
-    hAcc = CreateThread(0, 0, sdAcceptLoop, &d, 0, 0);
-    WaitForSingleObject(d.hReady, 5000);
+    hAcc = sdThreadCreate(sdAcceptLoop, &d);
+    sdEventWaitMs(d.hReady, 5000);
 
     /* 1 -- HELLO */
     sdConnInit(&c, stConnect(d.port));
-    check( c.s!=INVALID_SOCKET, "client connects" );
+    check( c.s!=SD_INVALID_SOCKET, "client connects" );
     check( stHello(&c), "HELLO round-trips at version 1" );
     {
       SdConn c2;
@@ -1182,7 +1180,7 @@ int main(int argc, char **argv){
       rdInit(&rd, m.a, m.n);
       check( rdU32(&rd)==0, "CONTROL: version 99 is refused (ver=0)" );
       free(m.a);
-      closesocket(c2.s); sdConnFree(&c2);
+      sdSockClose(c2.s); sdConnFree(&c2);
     }
 
     /* 2 -- read CALL + shape cache */
@@ -1296,8 +1294,8 @@ int main(int argc, char **argv){
         SdConn cm;
         WireBuf b, f; SdMsg m;
         sdConnInit(&cm, stConnect(d.port));
-        if( cm.s==INVALID_SOCKET ) continue;
-        if( !stHello(&cm) ){ closesocket(cm.s); sdConnFree(&cm); continue; }
+        if( cm.s==SD_INVALID_SOCKET ) continue;
+        if( !stHello(&cm) ){ sdSockClose(cm.s); sdConnFree(&cm); continue; }
         memset(&b,0,sizeof(b)); memset(&f,0,sizeof(f));
         wbU8(&b, REQ_CALL); wbU32(&b, 1);
         wbU32(&b, 0xFFFFFFF0u);            /* absurd name length */
@@ -1320,7 +1318,7 @@ int main(int argc, char **argv){
         }else{
           nRejected++;
         }
-        closesocket(cm.s); sdConnFree(&cm);
+        sdSockClose(cm.s); sdConnFree(&cm);
       }
       printf("  malformed sweep: %d/%d rejected\n", nRejected, nProbe);
       check( nProbe>=30, "malformed sweep actually probed" );
@@ -1351,23 +1349,22 @@ int main(int argc, char **argv){
 
     /* 9 -- graceful shutdown: everything answered */
     {
-      LONG in, out;
-      closesocket(c.s); sdConnFree(&c);
-      Sleep(100);
+      long in, out;
+      sdSockClose(c.s); sdConnFree(&c);
+      sdSleepMs(100);
       in = d.nReqIn; out = d.nReqOut;
       check( in==out, "count in == count out at shutdown "
              "(no request silently dropped)" );
     }
 
     sdClose(&d);
-    WaitForSingleObject(hAcc, 5000);
-    CloseHandle(hAcc);
-    DeleteFileA(zDb);
+    sdThreadJoin(hAcc, 5000);
+    sdFileDelete(zDb);
 
     /* ============ 10 -- R4: the archive daemon ============ */
     {
       Sprocketd d2;
-      HANDLE hAcc2;
+      SdThread hAcc2;
       SdConn c4, cs;
       SdMsg h2, b2;
       const char *zDb2 = "sprocketd_repl.db";
@@ -1377,11 +1374,11 @@ int main(int argc, char **argv){
       stRmArchive(zArc);
       check( sdOpen(&d2, zDb2, 0, zArc)==0,
              "daemon opens with a DECLARED archive" );
-      hAcc2 = CreateThread(0, 0, sdAcceptLoop, &d2, 0, 0);
-      WaitForSingleObject(d2.hReady, 5000);
+      hAcc2 = sdThreadCreate(sdAcceptLoop, &d2);
+      sdEventWaitMs(d2.hReady, 5000);
 
       sdConnInit(&c4, stConnect(d2.port));
-      check( c4.s!=INVALID_SOCKET && stHello(&c4),
+      check( c4.s!=SD_INVALID_SOCKET && stHello(&c4),
              "client connects to the archive daemon" );
       { sqlite3_int64 v = 700;
         check( stCall(&c4, 80, "addrow", 0, 1, &v, &h2, &b2)==0,
@@ -1391,17 +1388,17 @@ int main(int argc, char **argv){
         check( stCall(&c4, 81, "addrow", 0, 1, &v, &h2, &b2)==0,
                "write 2 answers" );
         free(h2.a); free(b2.a); }
-      { char zP[MAX_PATH];
+      { char zP[SD_PATHMAX];
         sdSegPath(zP, sizeof(zP), zArc, 1);
-        check( GetFileAttributesA(zP)!=INVALID_FILE_ATTRIBUTES,
+        check( sdFileExists(zP),
                "segment 1 is ON DISK where the operator looks" );
         sdSegPath(zP, sizeof(zP), zArc, 2);
-        check( GetFileAttributesA(zP)!=INVALID_FILE_ATTRIBUTES,
+        check( sdFileExists(zP),
                "segment 2 beside it" ); }
 
       /* 10b -- subscribe from 1: catch-up, then LIVE, one loop */
       sdConnInit(&cs, stConnect(d2.port));
-      check( cs.s!=INVALID_SOCKET && stHello(&cs), "subscriber connects" );
+      check( cs.s!=SD_INVALID_SOCKET && stHello(&cs), "subscriber connects" );
       {
         SdMsg sh, sb, m1, m2, m3;
         check( stSub(&cs, 90, 1, &sh, &sb)==0, "SUBSCRIBE from 1 acks" );
@@ -1416,7 +1413,7 @@ int main(int argc, char **argv){
         check( sdRecvMsg(&cs, &m2)==0 && memcmp(m2.a, SEG_MAGIC, 8)==0
             && getU64(m2.a+28)==2, "segment 2 follows in order" );
         /* Q4-C's central claim: the same bytes at different addresses */
-        { char zP[MAX_PATH]; int nf = 0; unsigned char *af;
+        { char zP[SD_PATHMAX]; int nf = 0; unsigned char *af;
           sdSegPath(zP, sizeof(zP), zArc, 1);
           af = sdSegRead(zP, &nf);
           check( af && nf==m1.n && memcmp(af, m1.a, nf)==0,
@@ -1463,41 +1460,40 @@ int main(int argc, char **argv){
       {
         SdConn cf; SdMsg fh, fb;
         sdConnInit(&cf, stConnect(d2.port));
-        check( cf.s!=INVALID_SOCKET && stHello(&cf),
+        check( cf.s!=SD_INVALID_SOCKET && stHello(&cf),
                "future-subscriber connects" );
         check( stSub(&cf, 91, 99, &fh, &fb)==0, "future SUBSCRIBE answered" );
         check( stBodyIsError(&fb, "head is seq 3"),
                "refused naming the archive head (a diverged replica is "
                "told, not fed)" );
         free(fh.a); free(fb.a);
-        closesocket(cf.s); sdConnFree(&cf);
+        sdSockClose(cf.s); sdConnFree(&cf);
       }
 
-      closesocket(cs.s); sdConnFree(&cs);
-      closesocket(c4.s); sdConnFree(&c4);
+      sdSockClose(cs.s); sdConnFree(&cs);
+      sdSockClose(c4.s); sdConnFree(&c4);
       sdClose(&d2);
-      WaitForSingleObject(hAcc2, 5000);
-      CloseHandle(hAcc2);
+      sdThreadJoin(hAcc2, 5000);
 
       /* 10d -- CONTROL: a gapped archive is refused at STARTUP, not
       ** discovered by a subscriber later */
       {
         Sprocketd d3;
-        char zP[MAX_PATH];
+        char zP[SD_PATHMAX];
         sdSegPath(zP, sizeof(zP), zArc, 2);
-        DeleteFileA(zP);
+        sdFileDelete(zP);
         check( sdOpen(&d3, zDb2, 0, zArc)!=0,
                "SEEN RED: archive with a hole refused at startup" );
         if( d3.wq.pRepl ) replWriterClose(d3.wq.pRepl);
         sqlite3_close(d3.wq.db);   /* the failed open's connection */
       }
 
-      DeleteFileA(zDb2);
+      sdFileDelete(zDb2);
       stRmArchive(zArc);
     }
     printf("\n%s: %d checks, %d failures\n",
            nFail ? "SPROCKETD FAILED" : "SPROCKETD OK", nCheck, nFail);
-    WSACleanup();
+    sdSockShutdown();
     return nFail ? 1 : 0;
   }
 
@@ -1531,7 +1527,7 @@ int main(int argc, char **argv){
     sdAcceptLoop(&d);
     sdClose(&d);
   }
-  WSACleanup();
+  sdSockShutdown();
   return 0;
 }
 #endif /* SPROCKETD_NO_MAIN */
