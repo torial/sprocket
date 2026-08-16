@@ -49,8 +49,27 @@ restore time.  Any physical design here inherits that shape.
   v2 campaign.
 - **Q3: ruled as leaned** — `PRAGMA replica_status` (last_seq,
   last_utc, lag_source); freshness always carries a receipt.
-- Q4: under drill-down (transport/UX tradeoffs) — see below.
-- Q5: restated for clarity; awaiting.
+- **Q4: C ruled** (segments canonical; subscription one delivery
+  method) — WITH Sean's UNGIT caveat worked through and three
+  commitments made part of the ruling:
+    1. segments are self-describing (format version, database
+       lineage/genesis identity, seq range, checksum) and live on disk
+       where the operator already looks — nothing exists only in
+       flight;
+    2. APPLY REFUSES on gap, lineage mismatch, or checksum failure —
+       by name, with the fix, never skipping (POC 1b's silent-freeze
+       class made structurally impossible);
+    3. no ambient directory magic: a replica DECLARES its source
+       (subscription address or archive path), and the declaration is
+       checked when declared (lineage validated at HELLO / at first
+       segment).
+  Sean accepted the sidecar-shipper unavailability as a tradeoff of
+  Q1-C.
+- **Q5: BLESSED as a test obligation** ("go forth and multiply"): the
+  day a replica exists, temporal2's replay proof runs against the
+  REPLICA and passes identically — replica history byte-equal to
+  primary history, proven by the same instrument, in the suite
+  forever.
 
 ## The questions for rulings
 
