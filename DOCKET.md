@@ -1839,3 +1839,18 @@ PRIMARY KEY.  Receipts: veryquick 0/394,007 release + 0/394,984 debug,
 session suite 0/19,256 Windows + 0/17,893 Linux, daemon 57/57.
 Recorded, not built (v2): promotion/failover, DDL replication,
 engine-resident writer, compression, browser/HTTP delivery.
+
+## Radar (not work items yet)
+
+**Showcase surface (Sean, 2026-08-16):** think about how Mosaic can
+showcase the fork's features — or whether another app is the right
+vehicle. The bar is NATURAL use, not a simplified demo: procs/shapes
+serving real request patterns, temporal answering a question a reader
+actually asks (what did this text/annotation look like when I cited
+it?), replication backing a real read-replica or PITR story, the
+daemon fronting a real workload. Candidate fits to explore when taken
+up: Mosaic's annotation/apparatus layers are naturally versioned
+(temporal), its reading surfaces are naturally read-replicas
+(replication), and its API shapes are naturally nested (procs +
+TSGEN). Prerequisite honesty: sprocketd is Windows-only today; a real
+deployment story likely needs the Linux socket shim first.
