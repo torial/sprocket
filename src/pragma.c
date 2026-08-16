@@ -619,6 +619,10 @@ void sqlite3Pragma(
    && ((pPragma->mPragFlg & PragFlg_NoColumns1)==0 || zRight==0)
   ){
     setPragmaResultColumnNames(v, pPragma);
+    /* The DECLARED names are the pragma's surface: suppress the
+    ** renaming a nested SELECT would otherwise apply (history_list,
+    ** replica_status build their rows that way). */
+    pParse->colNamesSet = 1;
   }
 
   /* Jump to the appropriate pragma handler */
@@ -1887,6 +1891,35 @@ void sqlite3Pragma(
         pDb->zDbSName, apT[j]->zName);
     }
     sqlite3DbFree(db, apT);
+    break;
+  }
+
+  /*
+  **  PRAGMA [schema.]replica_status
+  **
+  ** The replication truth surface (PLAN-REPL R3): one row per role
+  ** in sprocket_repl_meta -- (role, last_seq, last_utc, lag_source,
+  ** last_error).  lag_source names the BASIS of last_utc (apply-
+  ** clock: the replica's wall clock when the segment applied;
+  ** cut-clock: the primary's wall clock at cut) so freshness never
+  ** arrives without its receipt.  When no replication state exists
+  ** the pragma still answers -- role 'none', lag_source
+  ** 'no-replication-state' -- because a silent empty result is
+  ** indistinguishable from an unrecognized pragma.
+  */
+  case PragTyp_REPLICA_STATUS: {
+    if( sqlite3FindTable(db, "sprocket_repl_meta", pDb->zDbSName)!=0 ){
+      sqlite3NestedParse(pParse,
+        "SELECT role, last_seq, last_utc,"
+        " CASE role WHEN 'replica' THEN 'apply-clock'"
+        "           WHEN 'primary' THEN 'cut-clock'"
+        "           ELSE 'unknown' END, last_error"
+        " FROM \"%w\".sprocket_repl_meta ORDER BY role",
+        pDb->zDbSName);
+    }else{
+      sqlite3NestedParse(pParse,
+        "SELECT 'none', NULL, NULL, 'no-replication-state', NULL");
+    }
     break;
   }
 

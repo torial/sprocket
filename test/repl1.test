@@ -1,0 +1,71 @@
+# 2026-08-16
+#
+# Tests for PRAGMA replica_status (PLAN-REPL R3) -- the engine's truth
+# surface over sprocket_repl_meta receipts.  The library harness
+# (tool/sprocket_repl.c --selftest) proves the writer and applier; this
+# file pins the pragma's contract in the standard suite, where it runs
+# without the session extension (the receipts table is ordinary SQL).
+#
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix repl1
+
+# 1.0: no replication state is SAID, not silence -- an empty result
+# would be indistinguishable from an unrecognized pragma.
+do_execsql_test 1.0 {
+  PRAGMA replica_status;
+} {none {} {} no-replication-state {}}
+
+# 1.1: the declared column names are the surface (a nested SELECT
+# builds the rows; its expression names must NOT leak through).
+do_test 1.1 {
+  set names {}
+  db eval {PRAGMA replica_status} v {
+    set names $v(*)
+    break
+  }
+  set names
+} {role last_seq last_utc lag_source last_error}
+
+# 1.2: a replica's receipts surface with their basis (lag_source names
+# what last_utc means -- freshness never arrives without its receipt).
+do_execsql_test 1.2 {
+  CREATE TABLE sprocket_repl_meta(role TEXT PRIMARY KEY, genesis BLOB,
+    last_seq INTEGER, last_utc TEXT, last_error TEXT);
+  INSERT INTO sprocket_repl_meta VALUES
+    ('replica', x'00', 7, '2026-08-16 00:00:00.000', NULL);
+  PRAGMA replica_status;
+} {replica 7 {2026-08-16 00:00:00.000} apply-clock {}}
+
+# 1.3: a retained refusal is VISIBLE at the surface, not only in a
+# table the operator would have to know about.
+do_execsql_test 1.3 {
+  UPDATE sprocket_repl_meta SET last_error='gap: expected seq 8, got 11';
+  PRAGMA replica_status;
+} {replica 7 {2026-08-16 00:00:00.000} apply-clock
+   {gap: expected seq 8, got 11}}
+
+# 1.4: every role listed in order; a role the pragma does not know is
+# SAID to be unknown rather than guessed at.
+do_execsql_test 1.4 {
+  INSERT INTO sprocket_repl_meta VALUES('primary', x'00', 9,
+    '2026-08-16 00:00:01.000', NULL);
+  INSERT INTO sprocket_repl_meta VALUES('watcher', NULL, 1, NULL, NULL);
+  PRAGMA replica_status;
+} {primary 9 {2026-08-16 00:00:01.000} cut-clock {}
+   replica 7 {2026-08-16 00:00:00.000} apply-clock
+   {gap: expected seq 8, got 11}
+   watcher 1 {} unknown {}}
+
+# 1.5: schema-qualified form reads the named database's receipts.
+do_test 1.5 {
+  forcedelete test2.db
+  sqlite3 db2 test2.db
+  db2 close
+  execsql {
+    ATTACH 'test2.db' AS aux;
+    PRAGMA aux.replica_status;
+  }
+} {none {} {} no-replication-state {}}
+
+finish_test

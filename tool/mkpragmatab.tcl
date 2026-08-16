@@ -331,6 +331,11 @@ set pragma_def {
   COLS: name watermark nhist
   IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
 
+  NAME: replica_status
+  FLAG: NeedSchema Result0 SchemaOpt
+  COLS: role last_seq last_utc lag_source last_error
+  IF:   !defined(SQLITE_OMIT_SCHEMA_PRAGMAS)
+
   NAME: queue_writer
   FLAG: NeedSchema Result0
   IF:   !defined(SQLITE_OMIT_WAL)

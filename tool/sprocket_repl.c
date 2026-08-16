@@ -231,10 +231,12 @@ static int replWriterCut(ReplWriter *pW, unsigned char **paSeg, int *pnSeg){
   }
   if( rc!=SQLITE_OK ){ sqlite3_free(aSeg); return rc; }
 
-  /* the cut receipt (outside the capture window by construction) */
+  /* the cut receipt (filtered out of the capture window) */
   {
     char *zSql = sqlite3_mprintf(
-      "UPDATE sprocket_repl_meta SET last_seq=%lld WHERE role='primary'",
+      "UPDATE sprocket_repl_meta SET last_seq=%lld,"
+      " last_utc=strftime('%%Y-%%m-%%d %%H:%%M:%%f','now')"
+      " WHERE role='primary'",
       iSeq);
     sqlite3_exec(pW->db, zSql, 0, 0, 0);
     sqlite3_free(zSql);
@@ -361,6 +363,11 @@ static int replApply(sqlite3 *db, const unsigned char *aSeg, int nSeg,
 }
 
 /* ============================== selftest ================================ */
+/* Everything above is the LIBRARY: sprocketd #includes this file with
+** SPROCKET_REPL_LIBRARY defined to reuse writer/applier/encoder (one
+** implementation of the segment contract, two homes).  The selftest
+** below exists only in the standalone build. */
+#ifndef SPROCKET_REPL_LIBRARY
 static int nCheck = 0, nFail = 0;
 static void check(int bOk, const char *zWhat){
   nCheck++;
@@ -527,6 +534,63 @@ int main(int argc, char **argv){
     sqlite3_free(aRe1); sqlite3_free(aRe2);
   }
 
+  /* 12 -- R3: PRAGMA replica_status, the truth surface over the
+  ** receipts.  Freshness never arrives without its basis (lag_source);
+  ** a refusal is VISIBLE at the surface, not only in a table the
+  ** operator would have to know about; and a database with no
+  ** replication state says so in words -- an empty result would be
+  ** indistinguishable from an unrecognized pragma. */
+  {
+    sqlite3_stmt *p = 0;
+    rc = sqlite3_prepare_v2(dbR, "PRAGMA replica_status", -1, &p, 0);
+    check( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW,
+           "replica_status answers on the replica" );
+    check( p && sqlite3_column_count(p)==5
+        && strcmp(sqlite3_column_name(p,3), "lag_source")==0,
+           "replica_status: five columns, basis column named" );
+    {
+      const char *zRole = (const char*)sqlite3_column_text(p, 0);
+      const char *zSrc  = (const char*)sqlite3_column_text(p, 3);
+      const char *zLE   = (const char*)sqlite3_column_text(p, 4);
+      check( zRole && strcmp(zRole, "replica")==0
+          && sqlite3_column_int64(p, 1)==3
+          && sqlite3_column_type(p, 2)==SQLITE_TEXT
+          && zSrc && strcmp(zSrc, "apply-clock")==0,
+             "replica row: seq 3, a UTC, and its basis" );
+      check( zLE && strstr(zLE, "diverged")!=0,
+             "the divergence refusal is VISIBLE at the pragma surface" );
+    }
+    sqlite3_finalize(p); p = 0;
+
+    rc = sqlite3_prepare_v2(dbP, "PRAGMA replica_status", -1, &p, 0);
+    check( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW, "answers on the primary" );
+    {
+      const char *zRole = (const char*)sqlite3_column_text(p, 0);
+      const char *zSrc  = (const char*)sqlite3_column_text(p, 3);
+      check( zRole && strcmp(zRole, "primary")==0
+          && sqlite3_column_int64(p, 1)==4
+          && sqlite3_column_type(p, 2)==SQLITE_TEXT
+          && zSrc && strcmp(zSrc, "cut-clock")==0
+          && sqlite3_column_type(p, 4)==SQLITE_NULL,
+             "primary row: seq 4, cut-clock basis, no error" );
+    }
+    sqlite3_finalize(p); p = 0;
+
+    { sqlite3 *dbF = 0;
+      sqlite3_open(":memory:", &dbF);
+      rc = sqlite3_prepare_v2(dbF, "PRAGMA replica_status", -1, &p, 0);
+      check( rc==SQLITE_OK && sqlite3_step(p)==SQLITE_ROW, "answers on a fresh db" );
+      {
+        const char *zRole = (const char*)sqlite3_column_text(p, 0);
+        const char *zSrc  = (const char*)sqlite3_column_text(p, 3);
+        check( zRole && strcmp(zRole, "none")==0
+            && zSrc && strcmp(zSrc, "no-replication-state")==0,
+               "no replication state is SAID, not silence" );
+      }
+      sqlite3_finalize(p);
+      sqlite3_close(dbF); }
+  }
+
   sqlite3_free(aSeg1); sqlite3_free(aSeg2); sqlite3_free(aSeg3);
   sqlite3_free(aSegX);
   replWriterClose(pW); replWriterClose(pWX);
@@ -537,3 +601,4 @@ int main(int argc, char **argv){
          nCheck, nFail);
   return nFail ? 1 : 0;
 }
+#endif /* SPROCKET_REPL_LIBRARY */
