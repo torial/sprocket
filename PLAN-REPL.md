@@ -44,7 +44,13 @@ into the engine is a recorded v2 question.
   receipts.
 - **R4 — daemon subscription**: sprocketd serves segments over the
   ruled protocol (a subscribe request beside CALL); catch-up = archive
-  fetch then resume, one code path.
+  fetch then resume, one code path.  *Design note (2026-08-16): the
+  archive IS the one code path.  The writer cuts a segment per commit
+  into a declared archive directory (one file per seq, self-describing
+  bytes); the subscriber loop always serves seq N from the archive
+  file, waiting on the cut event when N does not exist yet.  Catch-up
+  and live-tail are the same loop by construction, and the daemon
+  serves the same bytes the operator sees on disk.*
 - **R5 — PITR**: apply-through-seq/UTC, composed with temporal's own
   AS OF where both exist.
 - **R6 — the blessed pin + gates**: temporal2 run against a replica,

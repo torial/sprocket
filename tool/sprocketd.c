@@ -32,9 +32,28 @@
 ** ordinary result-set frames: (metric TEXT, value INT) rows -- no new
 ** frame kinds, so every generated client can already read it.
 **
+** REPLICATION (PLAN-REPL R4; needs -DSQLITE_ENABLE_SESSION and
+** -DSQLITE_ENABLE_PREUPDATE_HOOK)
+**
+**   SUB:    [u8 3][u32 reqId][i64 fromSeq]
+**        -> framed [u32 reqId][u32 serverCookie]
+**           framed <(metric,value) ack carrying head_seq; or WF_ERROR>
+**           then one framed SEGMENT per commit, forever (each frame is
+**           the raw self-describing segment bytes -- the same bytes as
+**           the archive file on disk).  Catch-up and live-tail are ONE
+**           loop: the daemon always serves seq N from the archive,
+**           waiting on the cut signal when N does not exist yet.
+**
+** The archive is a DECLARED source (--archive DIR): nothing is watched
+** ambiently, and a daemon started without one refuses SUBSCRIBE naming
+** the fix.  At startup the daemon verifies it can serve the whole
+** lineage 1..head (refuse-never-skip needs the daemon to KNOW there
+** are no holes) and that the archive belongs to this database.
+**
 ** Build (from repo root, VS dev prompt):
-**   cl /O2 /I. /Itool tool\sprocketd.c sqlite3.c ws2_32.lib /Fe:sprocketd.exe
-** Run:      sprocketd.exe DB [port]        (default port 7690)
+**   cl /O2 /I. /Itool -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
+**      tool\sprocketd.c sqlite3.c ws2_32.lib /Fe:sprocketd.exe
+** Run:      sprocketd.exe DB [port] [--archive DIR]   (default port 7690)
 ** Selftest: sprocketd.exe --selftest       (the PLAN-DAEMON D0 matrix)
 */
 #define WIN32_LEAN_AND_MEAN
@@ -46,10 +65,17 @@
 #define PROC_FRAME_NO_MAIN 1
 #include "proc_frame.c"        /* framer + codec + check()/nFail */
 
+#define SPROCKET_REPL_LIBRARY 1
+#include "sprocket_repl.c"     /* segment writer/applier/encoder (PLAN-REPL):
+                               ** one implementation of the contract, two
+                               ** homes -- the harness proves it standalone,
+                               ** the daemon serves it */
+
 #pragma comment(lib, "ws2_32.lib")
 
 #define REQ_CALL   1
 #define REQ_HELLO  2
+#define REQ_SUB    3
 #define PROTO_VER  1
 #define IO_TIMEOUT_MS 5000
 
@@ -146,11 +172,62 @@ typedef struct SdQueue {
   volatile LONG lastBatch;
   volatile LONG lastCommitMs;
   LONGLONG oldestQueuedAt;     /* GetTickCount64 of current head, 0=empty  */
+  /* replication (PLAN-REPL R4): set iff an archive was declared */
+  ReplWriter *pRepl;           /* segment writer on THIS connection        */
+  const char *zArchive;        /* declared archive directory, or 0         */
+  CONDITION_VARIABLE cvCut;    /* broadcast after each archived segment    */
+  sqlite3_int64 iHeadSeq;      /* highest archived seq (under mx)          */
+  char zReplErr[300];          /* sticky archive failure; "" = healthy     */
 } SdQueue;
 
 static int sdExecCall(sqlite3 *db, const unsigned char *aReq, int nReq,
                       unsigned clientCookie, WireBuf *pOut,
                       unsigned *pOutCookie, char *zErr, int nErr);
+
+/* ------------------------------------------------------ archive helpers -- */
+static void sdSegPath(char *zOut, int n, const char *zDir, sqlite3_int64 seq){
+  sqlite3_snprintf(n, zOut, "%s\\%016llx.sprkseg", zDir,
+                   (sqlite3_uint64)seq);
+}
+/* Write-then-rename so a segment file either exists whole or not at all
+** -- a half-written segment would fail its own checksum, but why hand a
+** subscriber even that. */
+static int sdWriteFileAtomic(const char *zPath, const unsigned char *a, int n){
+  char zTmp[MAX_PATH+8];
+  HANDLE h; DWORD wr = 0; BOOL ok;
+  sqlite3_snprintf(sizeof(zTmp), zTmp, "%s.tmp", zPath);
+  h = CreateFileA(zTmp, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
+                  FILE_ATTRIBUTE_NORMAL, 0);
+  if( h==INVALID_HANDLE_VALUE ) return 1;
+  ok = WriteFile(h, a, (DWORD)n, &wr, 0) && (int)wr==n;
+  ok = FlushFileBuffers(h) && ok;
+  CloseHandle(h);
+  if( !ok || !MoveFileExA(zTmp, zPath, MOVEFILE_REPLACE_EXISTING) ){
+    DeleteFileA(zTmp);
+    return 1;
+  }
+  return 0;
+}
+/* Whole file, sqlite3_malloc'd; 0 on any failure (*pn stays 0). */
+static unsigned char *sdSegRead(const char *zPath, int *pn){
+  HANDLE h;
+  DWORD sz, rd = 0;
+  unsigned char *a;
+  *pn = 0;
+  h = CreateFileA(zPath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL, 0);
+  if( h==INVALID_HANDLE_VALUE ) return 0;
+  sz = GetFileSize(h, 0);
+  if( sz==INVALID_FILE_SIZE || sz>0x7fffffff ){ CloseHandle(h); return 0; }
+  a = (unsigned char*)sqlite3_malloc((int)(sz ? sz : 1));
+  if( a==0 ){ CloseHandle(h); return 0; }
+  if( !ReadFile(h, a, sz, &rd, 0) || rd!=sz ){
+    CloseHandle(h); sqlite3_free(a); return 0;
+  }
+  CloseHandle(h);
+  *pn = (int)sz;
+  return a;
+}
 
 static DWORD WINAPI sdWriter(LPVOID pArg){
   SdQueue *q = (SdQueue*)pArg;
@@ -183,6 +260,42 @@ static DWORD WINAPI sdWriter(LPVOID pArg){
                             it->zErr, sizeof(it->zErr));
       }
       sqlite3_exec(q->db, "COMMIT;", 0, 0, 0);
+      /* R4: one commit -> one segment, archived BEFORE the callers wake,
+      ** so an acknowledged write is never invisible to a subscriber.  A
+      ** batch that changed nothing (every item refused) cuts nothing --
+      ** SQLITE_DONE, not a fabricated empty segment. */
+      if( q->pRepl ){
+        unsigned char *aSeg = 0;
+        int nSeg = 0;
+        int rc2 = replWriterCut(q->pRepl, &aSeg, &nSeg);
+        if( rc2==SQLITE_OK ){
+          char zPath[MAX_PATH];
+          sdSegPath(zPath, sizeof(zPath), q->zArchive, q->pRepl->iLastCut);
+          if( sdWriteFileAtomic(zPath, aSeg, nSeg) ){
+            EnterCriticalSection(&q->mx);
+            sqlite3_snprintf(sizeof(q->zReplErr), q->zReplErr,
+              "archive write failed at seq %lld (%s); replication is "
+              "STOPPED at the last archived segment",
+              q->pRepl->iLastCut, zPath);
+            LeaveCriticalSection(&q->mx);
+            WakeAllConditionVariable(&q->cvCut);
+          }else{
+            EnterCriticalSection(&q->mx);
+            q->iHeadSeq = q->pRepl->iLastCut;
+            LeaveCriticalSection(&q->mx);
+            WakeAllConditionVariable(&q->cvCut);
+          }
+          sqlite3_free(aSeg);
+        }else if( rc2!=SQLITE_DONE && q->zReplErr[0]==0 ){
+          EnterCriticalSection(&q->mx);
+          sqlite3_snprintf(sizeof(q->zReplErr), q->zReplErr,
+            "segment cut failed after seq %lld (rc=%d); replication is "
+            "STOPPED at the last archived segment",
+            q->pRepl->iLastCut, rc2);
+          LeaveCriticalSection(&q->mx);
+          WakeAllConditionVariable(&q->cvCut);
+        }
+      }
       InterlockedExchange(&q->lastCommitMs, (LONG)(GetTickCount64()-t0));
       InterlockedExchange(&q->lastBatch, nBatch);
       InterlockedAdd(&q->nDone, nBatch);
@@ -396,12 +509,15 @@ static void sdErrorBody(WireBuf *pOut, int code, const char *zMsg){
 
 /* The reserved stats CALL: (metric TEXT, value INT) rows. */
 static void sdStatsBody(Sprocketd *d, WireBuf *pOut){
-  struct { const char *z; sqlite3_int64 v; } a[6];
+  struct { const char *z; sqlite3_int64 v; } a[7];
   int i, n = 0;
   LONGLONG oldest;
   EnterCriticalSection(&d->wq.mx);
   a[n].z = "queue_depth";      a[n++].v = d->wq.nQueued;
   oldest = d->wq.oldestQueuedAt;
+  if( d->wq.zArchive ){
+    a[n].z = "repl_head_seq";  a[n++].v = d->wq.iHeadSeq;
+  }
   LeaveCriticalSection(&d->wq.mx);
   a[n].z = "oldest_waiter_ms";
   a[n++].v = oldest ? (sqlite3_int64)(GetTickCount64()-oldest) : 0;
@@ -548,6 +664,112 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
       continue;
     }
 
+    if( op==REQ_SUB && bHello ){
+      unsigned reqId = rdU32(&rd);
+      sqlite3_int64 from = rdI64(&rd);
+      SdQueue *q = &d->wq;
+      WireBuf hb, bb;
+      sqlite3_int64 head;
+      int bRefused = 1;
+      char zMsg[360];
+      memset(&hb, 0, sizeof(hb));
+      memset(&bb, 0, sizeof(bb));
+
+      EnterCriticalSection(&q->mx);
+      head = q->iHeadSeq;
+      LeaveCriticalSection(&q->mx);
+
+      if( rd.bad ){
+        sdErrorBody(&bb, SQLITE_MISUSE, "malformed request");
+      }else if( q->zArchive==0 ){
+        sdErrorBody(&bb, SQLITE_MISUSE,
+          "this daemon serves no replication archive; restart sprocketd "
+          "with --archive DIR to declare one");
+      }else if( q->zReplErr[0] ){
+        sdErrorBody(&bb, SQLITE_IOERR, q->zReplErr);
+      }else if( from<1 ){
+        sdErrorBody(&bb, SQLITE_MISUSE,
+          "segments begin at seq 1; a fresh replica subscribes from 1");
+      }else if( from>head+1 ){
+        sqlite3_snprintf(sizeof(zMsg), zMsg,
+          "archive head is seq %lld; cannot subscribe from %lld (the "
+          "future).  A replica ahead of its primary has diverged -- "
+          "check which database this replica followed.", head, from);
+        sdErrorBody(&bb, SQLITE_MISUSE, zMsg);
+      }else{
+        /* the ack carries head_seq: the subscriber knows its catch-up
+        ** span before the first segment arrives */
+        wbU8(&bb, WF_SHAPE);
+        wbU32(&bb, 1);
+        wbStr(&bb, "head_seq");
+        wbU8(&bb, WF_ROW);
+        wbU8(&bb, WV_INT);  wbI64(&bb, head);
+        wbU8(&bb, WF_SETEND);
+        wbU8(&bb, WF_DONE);
+        bRefused = 0;
+      }
+      wbU32(&hb, reqId);
+      wbU32(&hb, sdSchemaCookie(d->wq.db));
+      { WireBuf f; memset(&f,0,sizeof(f));
+        frWrap(&f, hb.a, hb.n);
+        frWrap(&f, bb.a, bb.n);
+        sdSendAll(c.s, f.a, f.n);
+        wbFree(&f); }
+      wbFree(&hb); wbFree(&bb);
+      InterlockedIncrement(&d->nReqOut);
+      free(m.a);
+      if( bRefused ) continue;      /* a refusal is an answer, not a hangup */
+
+      /* The serve loop: this connection is now a segment stream.  Always
+      ** serve seq N from the archive file, waiting on the cut signal when
+      ** N does not exist yet -- catch-up and live-tail are ONE loop. */
+      {
+        sqlite3_int64 seq;
+        int bDead = 0;
+        for(seq=from; !bDead; seq++){
+          unsigned char *aSeg;
+          int nSeg = 0;
+          char zPath[MAX_PATH];
+          EnterCriticalSection(&q->mx);
+          while( q->iHeadSeq<seq && !d->bShutdown && q->zReplErr[0]==0 ){
+            SleepConditionVariableCS(&q->cvCut, &q->mx, 200);
+          }
+          bDead = (q->zReplErr[0]!=0);
+          LeaveCriticalSection(&q->mx);
+          if( d->bShutdown ) break;
+          if( bDead ){
+            WireBuf eb, f;
+            memset(&eb,0,sizeof(eb)); memset(&f,0,sizeof(f));
+            sdErrorBody(&eb, SQLITE_IOERR, q->zReplErr);
+            frWrap(&f, eb.a, eb.n);
+            sdSendAll(c.s, f.a, f.n);
+            wbFree(&f); wbFree(&eb);
+            break;
+          }
+          sdSegPath(zPath, sizeof(zPath), q->zArchive, seq);
+          aSeg = sdSegRead(zPath, &nSeg);
+          if( aSeg==0 ){
+            WireBuf eb, f;
+            memset(&eb,0,sizeof(eb)); memset(&f,0,sizeof(f));
+            sqlite3_snprintf(sizeof(zMsg), zMsg,
+              "archive segment %lld unreadable at %s; the stream cannot "
+              "continue without a hole", seq, zPath);
+            sdErrorBody(&eb, SQLITE_IOERR, zMsg);
+            frWrap(&f, eb.a, eb.n);
+            sdSendAll(c.s, f.a, f.n);
+            wbFree(&f); wbFree(&eb);
+            break;
+          }
+          { WireBuf f; memset(&f,0,sizeof(f));
+            frWrap(&f, aSeg, nSeg);
+            bDead = sdSendAll(c.s, f.a, f.n);   /* client went away: done */
+            wbFree(&f); }
+          sqlite3_free(aSeg);
+        }
+      }
+      break;                        /* subscription ends the connection */
+    }
+
     /* Unknown opcode or CALL before HELLO: refuse and close. */
     { WireBuf b, f; memset(&b,0,sizeof(b)); memset(&f,0,sizeof(f));
       sdErrorBody(&b, SQLITE_MISUSE,
@@ -567,7 +789,79 @@ static DWORD WINAPI sdConnThread(LPVOID pArg){
 }
 
 /* ------------------------------------------------------------- lifecycle -- */
-static int sdOpen(Sprocketd *d, const char *zDb, int port){
+/* Open the declared archive: verify at startup that the daemon can
+** serve the WHOLE lineage 1..head with this database's genesis --
+** refuse-never-skip is only honest if holes are found when declared,
+** not discovered by a subscriber at 2am. */
+static int sdArchiveOpen(SdQueue *q, const char *zDir){
+  sqlite3_int64 s, head;
+  char zPath[MAX_PATH];
+  CreateDirectoryA(zDir, 0);   /* declared explicitly: create if absent */
+  if( replWriterOpen(q->db, &q->pRepl)!=SQLITE_OK || q->pRepl==0 ){
+    fprintf(stderr, "sprocketd: cannot open the segment writer on %s "
+            "(session support missing from this build?)\n", zDir);
+    return 1;
+  }
+  head = q->pRepl->iLastCut;
+  for(s=1; s<=head; s++){
+    sdSegPath(zPath, sizeof(zPath), zDir, s);
+    if( GetFileAttributesA(zPath)==INVALID_FILE_ATTRIBUTES ){
+      fprintf(stderr, "sprocketd: this database has cut %lld segments "
+              "but the archive is missing seq %lld (%s); refusing to "
+              "serve a lineage with a hole.  Point --archive at the "
+              "directory holding this lineage.\n", head, s, zPath);
+      return 1;
+    }
+  }
+  if( head>0 ){
+    int nSeg = 0;
+    unsigned char *aSeg;
+    sdSegPath(zPath, sizeof(zPath), zDir, 1);
+    aSeg = sdSegRead(zPath, &nSeg);
+    if( aSeg==0 || nSeg<SEG_HDRSIZE
+     || memcmp(aSeg+12, q->pRepl->aGenesis, 16)!=0 ){
+      fprintf(stderr, "sprocketd: the archive at %s belongs to a "
+              "different database lineage; refusing to mix them.\n", zDir);
+      sqlite3_free(aSeg);
+      return 1;
+    }
+    sqlite3_free(aSeg);
+  }
+  /* files BEYOND the writer's head mean the database went backward
+  ** under its archive (restored from a stale copy?) */
+  {
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char zGlob[MAX_PATH];
+    sqlite3_snprintf(sizeof(zGlob), zGlob, "%s\\*.sprkseg", zDir);
+    h = FindFirstFileA(zGlob, &fd);
+    if( h!=INVALID_HANDLE_VALUE ){
+      do{
+        sqlite3_int64 v = 0;
+        const char *z = fd.cFileName;
+        while( *z && *z!='.' ){
+          int c = *z++;
+          v = v*16 + (c<='9' ? c-'0' : (c|0x20)-'a'+10);
+        }
+        if( v>head ){
+          fprintf(stderr, "sprocketd: archive holds seq %lld but this "
+                  "database has only cut %lld -- the database is BEHIND "
+                  "its own archive (restored from a stale copy?); "
+                  "refusing to overwrite the lineage.\n", v, head);
+          FindClose(h);
+          return 1;
+        }
+      }while( FindNextFileA(h, &fd) );
+      FindClose(h);
+    }
+  }
+  q->iHeadSeq = head;
+  q->zArchive = zDir;
+  return 0;
+}
+
+static int sdOpen(Sprocketd *d, const char *zDb, int port,
+                  const char *zArchive){
   int i;
   memset(d, 0, sizeof(*d));
   d->zDb = zDb;
@@ -597,6 +891,8 @@ static int sdOpen(Sprocketd *d, const char *zDb, int port){
   InitializeCriticalSection(&d->wq.mx);
   InitializeConditionVariable(&d->wq.cvItem);
   InitializeConditionVariable(&d->wq.cvSpace);
+  InitializeConditionVariable(&d->wq.cvCut);
+  if( zArchive && sdArchiveOpen(&d->wq, zArchive) ) return 1;
   d->wq.hGate = CreateEvent(0, TRUE, TRUE, 0);
   d->wq.hThread = CreateThread(0, 0, sdWriter, &d->wq, 0, 0);
   if( d->wq.hGate==0 || d->wq.hThread==0 ) return 1;
@@ -652,6 +948,7 @@ static void sdClose(Sprocketd *d){
   int i;
   InterlockedExchange(&d->bShutdown, 1);
   if( d->sListen!=INVALID_SOCKET ){ closesocket(d->sListen); }
+  WakeAllConditionVariable(&d->wq.cvCut);   /* subscribers re-check */
   /* connections notice bShutdown at their next message or timeout */
   for(i=0;i<200 && d->nConn>0;i++) Sleep(25);
   EnterCriticalSection(&d->wq.mx);
@@ -662,6 +959,7 @@ static void sdClose(Sprocketd *d){
   CloseHandle(d->wq.hThread);
   CloseHandle(d->wq.hGate);
   DeleteCriticalSection(&d->wq.mx);
+  if( d->wq.pRepl ) replWriterClose(d->wq.pRepl);
   sqlite3_close(d->wq.db);
   for(i=0;i<SD_NREADER;i++){
     sqlite3_close(d->aReader[i]);
@@ -722,6 +1020,21 @@ static int stCall(SdConn *pc, unsigned reqId, const char *zName,
   return 0;
 }
 static int memmem_like(const unsigned char *z, int n, const char *zN);
+
+/* Send SUBSCRIBE; returns the ack pair (hdr, body).  Segment frames
+** after the ack are read by the caller with sdRecvMsg directly. */
+static int stSub(SdConn *pc, unsigned reqId, sqlite3_int64 from,
+                 SdMsg *pHdr, SdMsg *pBody){
+  WireBuf b, f;
+  memset(&b,0,sizeof(b)); memset(&f,0,sizeof(f));
+  wbU8(&b, REQ_SUB); wbU32(&b, reqId); wbI64(&b, from);
+  frWrap(&f, b.a, b.n);
+  if( sdSendAll(pc->s, f.a, f.n) ){ wbFree(&f); wbFree(&b); return 1; }
+  wbFree(&f); wbFree(&b);
+  if( sdRecvMsg(pc, pHdr) ) return 1;
+  if( sdRecvMsg(pc, pBody) ){ free(pHdr->a); return 1; }
+  return 0;
+}
 
 /* First WV_INT found in the body's rows, or -1. */
 static sqlite3_int64 stFirstInt(SdMsg *pBody){
@@ -787,6 +1100,42 @@ static void stFixture(const char *zDb){
   sqlite3_close(db);
 }
 
+/* The replication fixture is its OWN database: the session module
+** silently skips tables without a declared PRIMARY KEY (the capture
+** would be EMPTY -- the fabricated-silence class again), so the
+** replicated table declares one, and the main fixture's PK-less table
+** stays as a naturally-occurring control that never reaches a session. */
+static void stFixtureRepl(const char *zDb){
+  sqlite3 *db = 0;
+  DeleteFileA(zDb);
+  sqlite3_open(zDb, &db);
+  sqlite3_exec(db,
+    "PRAGMA journal_mode=wal2;"
+    "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);"
+    "CREATE PROCEDURE addrow(v INTEGER)"
+    "  RETURNS TABLE(n INTEGER)"
+    "BEGIN INSERT INTO t(a,b) VALUES(v, 'w'); "
+    "SELECT count(*) AS n FROM t; END;",
+    0, 0, 0);
+  sqlite3_close(db);
+}
+static void stRmArchive(const char *zDir){
+  WIN32_FIND_DATAA fd;
+  HANDLE h;
+  char zGlob[MAX_PATH], zP[MAX_PATH];
+  sqlite3_snprintf(sizeof(zGlob), zGlob, "%s\\*", zDir);
+  h = FindFirstFileA(zGlob, &fd);
+  if( h!=INVALID_HANDLE_VALUE ){
+    do{
+      if( fd.cFileName[0]=='.' ) continue;
+      sqlite3_snprintf(sizeof(zP), zP, "%s\\%s", zDir, fd.cFileName);
+      DeleteFileA(zP);
+    }while( FindNextFileA(h, &fd) );
+    FindClose(h);
+  }
+  RemoveDirectoryA(zDir);
+}
+
 /* Route the engine's error log to stderr.  sqlite3_log carries the
 ** reports that have no connection to land on -- "API called with NULL
 ** prepared statement" and its kin -- and an unregistered log callback
@@ -812,7 +1161,7 @@ int main(int argc, char **argv){
 
     printf("sprocketd selftest -- SQLite %s\n\n", sqlite3_libversion());
     stFixture(zDb);
-    check( sdOpen(&d, zDb, 0)==0, "daemon opens (declares queue_writer)" );
+    check( sdOpen(&d, zDb, 0, 0)==0, "daemon opens (declares queue_writer)" );
     hAcc = CreateThread(0, 0, sdAcceptLoop, &d, 0, 0);
     WaitForSingleObject(d.hReady, 5000);
 
@@ -984,6 +1333,22 @@ int main(int argc, char **argv){
         free(hdr.a); free(body.a); }
     }
 
+    /* 8b -- R4: SUBSCRIBE without a declared archive: refused, the
+    ** refusal names the fix, and the connection still serves CALLs
+    ** (a refusal is an answer, not a hangup). */
+    {
+      SdMsg sh, sb;
+      check( stSub(&c, 70, 1, &sh, &sb)==0,
+             "SUBSCRIBE answered on an archiveless daemon" );
+      check( stBodyIsError(&sb, "--archive"),
+             "refusal names the fix (restart with --archive DIR)" );
+      free(sh.a); free(sb.a);
+      { sqlite3_int64 lim = 1;
+        check( stCall(&c, 71, "readn", 0, 1, &lim, &hdr, &body)==0,
+               "the connection still serves CALLs after the refusal" );
+        free(hdr.a); free(body.a); }
+    }
+
     /* 9 -- graceful shutdown: everything answered */
     {
       LONG in, out;
@@ -998,6 +1363,138 @@ int main(int argc, char **argv){
     WaitForSingleObject(hAcc, 5000);
     CloseHandle(hAcc);
     DeleteFileA(zDb);
+
+    /* ============ 10 -- R4: the archive daemon ============ */
+    {
+      Sprocketd d2;
+      HANDLE hAcc2;
+      SdConn c4, cs;
+      SdMsg h2, b2;
+      const char *zDb2 = "sprocketd_repl.db";
+      const char *zArc = "sprocketd_test_archive";
+
+      stFixtureRepl(zDb2);
+      stRmArchive(zArc);
+      check( sdOpen(&d2, zDb2, 0, zArc)==0,
+             "daemon opens with a DECLARED archive" );
+      hAcc2 = CreateThread(0, 0, sdAcceptLoop, &d2, 0, 0);
+      WaitForSingleObject(d2.hReady, 5000);
+
+      sdConnInit(&c4, stConnect(d2.port));
+      check( c4.s!=INVALID_SOCKET && stHello(&c4),
+             "client connects to the archive daemon" );
+      { sqlite3_int64 v = 700;
+        check( stCall(&c4, 80, "addrow", 0, 1, &v, &h2, &b2)==0,
+               "write 1 answers" );
+        free(h2.a); free(b2.a);
+        v = 701;
+        check( stCall(&c4, 81, "addrow", 0, 1, &v, &h2, &b2)==0,
+               "write 2 answers" );
+        free(h2.a); free(b2.a); }
+      { char zP[MAX_PATH];
+        sdSegPath(zP, sizeof(zP), zArc, 1);
+        check( GetFileAttributesA(zP)!=INVALID_FILE_ATTRIBUTES,
+               "segment 1 is ON DISK where the operator looks" );
+        sdSegPath(zP, sizeof(zP), zArc, 2);
+        check( GetFileAttributesA(zP)!=INVALID_FILE_ATTRIBUTES,
+               "segment 2 beside it" ); }
+
+      /* 10b -- subscribe from 1: catch-up, then LIVE, one loop */
+      sdConnInit(&cs, stConnect(d2.port));
+      check( cs.s!=INVALID_SOCKET && stHello(&cs), "subscriber connects" );
+      {
+        SdMsg sh, sb, m1, m2, m3;
+        check( stSub(&cs, 90, 1, &sh, &sb)==0, "SUBSCRIBE from 1 acks" );
+        check( !stBodyIsError(&sb, 0), "the ack is not an error" );
+        check( stFirstInt(&sb)==2,
+               "ack carries head_seq 2 (the catch-up span is announced)" );
+        free(sh.a); free(sb.a);
+        check( sdRecvMsg(&cs, &m1)==0 && m1.n>SEG_HDRSIZE
+            && memcmp(m1.a, SEG_MAGIC, 8)==0
+            && getU64(m1.a+28)==1,
+               "segment 1 arrives on the wire, self-describing" );
+        check( sdRecvMsg(&cs, &m2)==0 && memcmp(m2.a, SEG_MAGIC, 8)==0
+            && getU64(m2.a+28)==2, "segment 2 follows in order" );
+        /* Q4-C's central claim: the same bytes at different addresses */
+        { char zP[MAX_PATH]; int nf = 0; unsigned char *af;
+          sdSegPath(zP, sizeof(zP), zArc, 1);
+          af = sdSegRead(zP, &nf);
+          check( af && nf==m1.n && memcmp(af, m1.a, nf)==0,
+                 "wire segment 1 is BYTE-EQUAL to the archive file" );
+          sqlite3_free(af); }
+        /* live tail: a write on the CALL connection arrives on the open
+        ** subscription without re-subscribing */
+        { sqlite3_int64 v = 702;
+          check( stCall(&c4, 82, "addrow", 0, 1, &v, &h2, &b2)==0,
+                 "live write answers" );
+          free(h2.a); free(b2.a); }
+        check( sdRecvMsg(&cs, &m3)==0 && memcmp(m3.a, SEG_MAGIC, 8)==0
+            && getU64(m3.a+28)==3,
+               "segment 3 arrives LIVE on the open subscription" );
+        /* end to end: a replica built from the wire matches the primary */
+        {
+          sqlite3 *dbrep = 0;
+          sqlite3_stmt *p = 0;
+          char *zE = 0;
+          int nRow = -1, sum = 0, rcA;
+          sqlite3_open(":memory:", &dbrep);
+          sqlite3_exec(dbrep,
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", 0, 0, 0);
+          rcA = replApply(dbrep, m1.a, m1.n, &zE);
+          if( rcA==SQLITE_OK ) rcA = replApply(dbrep, m2.a, m2.n, &zE);
+          if( rcA==SQLITE_OK ) rcA = replApply(dbrep, m3.a, m3.n, &zE);
+          check( rcA==SQLITE_OK, "all three wire segments apply cleanly" );
+          sqlite3_free(zE);
+          if( sqlite3_prepare_v2(dbrep,
+                "SELECT count(*), sum(a) FROM t", -1, &p, 0)==SQLITE_OK
+           && sqlite3_step(p)==SQLITE_ROW ){
+            nRow = sqlite3_column_int(p, 0);
+            sum = sqlite3_column_int(p, 1);
+          }
+          sqlite3_finalize(p);
+          sqlite3_close(dbrep);
+          check( nRow==3 && sum==700+701+702,
+                 "the wire-built replica equals the primary" );
+        }
+        free(m1.a); free(m2.a); free(m3.a);
+      }
+
+      /* 10c -- a subscription from the future is refused naming head */
+      {
+        SdConn cf; SdMsg fh, fb;
+        sdConnInit(&cf, stConnect(d2.port));
+        check( cf.s!=INVALID_SOCKET && stHello(&cf),
+               "future-subscriber connects" );
+        check( stSub(&cf, 91, 99, &fh, &fb)==0, "future SUBSCRIBE answered" );
+        check( stBodyIsError(&fb, "head is seq 3"),
+               "refused naming the archive head (a diverged replica is "
+               "told, not fed)" );
+        free(fh.a); free(fb.a);
+        closesocket(cf.s); sdConnFree(&cf);
+      }
+
+      closesocket(cs.s); sdConnFree(&cs);
+      closesocket(c4.s); sdConnFree(&c4);
+      sdClose(&d2);
+      WaitForSingleObject(hAcc2, 5000);
+      CloseHandle(hAcc2);
+
+      /* 10d -- CONTROL: a gapped archive is refused at STARTUP, not
+      ** discovered by a subscriber later */
+      {
+        Sprocketd d3;
+        char zP[MAX_PATH];
+        sdSegPath(zP, sizeof(zP), zArc, 2);
+        DeleteFileA(zP);
+        check( sdOpen(&d3, zDb2, 0, zArc)!=0,
+               "SEEN RED: archive with a hole refused at startup" );
+        if( d3.wq.pRepl ) replWriterClose(d3.wq.pRepl);
+        sqlite3_close(d3.wq.db);   /* the failed open's connection */
+      }
+
+      DeleteFileA(zDb2);
+      stRmArchive(zArc);
+    }
     printf("\n%s: %d checks, %d failures\n",
            nFail ? "SPROCKETD FAILED" : "SPROCKETD OK", nCheck, nFail);
     WSACleanup();
@@ -1006,13 +1503,23 @@ int main(int argc, char **argv){
 
   /* ---- serve mode ---- */
   if( argc<2 ){
-    fprintf(stderr, "usage: sprocketd DB [port]   (or --selftest)\n");
+    fprintf(stderr,
+      "usage: sprocketd DB [port] [--archive DIR]   (or --selftest)\n");
     return 2;
   }
   {
     Sprocketd d;
-    int port = argc>=3 ? atoi(argv[2]) : 7690;
-    if( sdOpen(&d, argv[1], port) ){
+    int port = 7690;
+    const char *zArchive = 0;
+    int i;
+    for(i=2; i<argc; i++){
+      if( strcmp(argv[i], "--archive")==0 && i+1<argc ){
+        zArchive = argv[++i];
+      }else{
+        port = atoi(argv[i]);
+      }
+    }
+    if( sdOpen(&d, argv[1], port, zArchive) ){
       fprintf(stderr, "sprocketd: failed to open %s on port %d\n",
               argv[1], port);
       return 1;
