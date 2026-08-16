@@ -1812,3 +1812,30 @@ cookie bookkeeping books write intents that are not writes.  Recorded,
 not built: the v2 degraded-write marker protocol; dead-object DROP.
 Temporal tables (#6), when built, inherit this loader for free --
 older fork builds will open files carrying them, minus the feature.
+
+## 10. Replication — *shipping the fold* 
+
+**✅ BUILT 2026-08-16 — R0 through R7 in one campaign (DESIGN-REPL:
+five rulings, Sean; PLAN-REPL: eight phases), POC-first twice.**
+Session changesets in commit order (Q1-C), cut into self-describing
+segments (magic/version/genesis/seq-range/CRC) — the Q4-C ruling's
+three UNGIT commitments each pinned by a check: self-description,
+refuse-never-skip (gap, lineage, checksum, truncation, divergence,
+missing schema — by name, inert, receipt retained), declared sources.
+Surfaces: `tool/sprocket_repl.c` (writer/applier/encoder/PITR, 44
+checks), `sprocketd --archive` + `SUBSCRIBE` (catch-up and live-tail
+are ONE loop over the archive files; wire bytes == disk bytes,
+byte-compared), `PRAGMA replica_status` (freshness never without its
+basis; no-replication-state SAID, not silent), and
+`--restore [--upto-seq | --upto-utc]` where the time target reads the
+commit clock shipped inside the segments.  The crown: the TEMPORAL
+axis replicates verbatim — shadow PKs, hidden-column capture,
+apply-as-maintenance with the replica's own capture standing down —
+and test/repl2.test aims temporal2's replay proof at a REPLICA,
+corruption control kept, wired into the session permutation.  Found
+on the way and refused at the door: PK-less temporal tables fabricated
+history via rowid coincidence; a temporal table now requires a
+PRIMARY KEY.  Receipts: veryquick 0/394,007 release + 0/394,984 debug,
+session suite 0/19,256 Windows + 0/17,893 Linux, daemon 57/57.
+Recorded, not built (v2): promotion/failover, DDL replication,
+engine-resident writer, compression, browser/HTTP delivery.
