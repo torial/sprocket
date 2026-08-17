@@ -99,18 +99,60 @@ must measure the double-write risk before this is trusted.
 - Outer joins, subqueries, window functions, CTEs: **stay refused**,
   each by name (no consumer, real algebra cost).
 
-## POC obligations (before rulings are requested to be acted on)
+## POC obligations — PAID 2026-08-16 (results, and what they changed)
 
-- **POC-T1**: temporal base + hand-built maintenance-shaped triggers —
-  do the two synthesized families fire in stable order?  Does the
-  storm test + view_check stay clean?  (Blocks Q1.)
-- **POC-T2**: a temporal mview mock (temporal table maintained by a
-  user trigger from a base) run through capture -> segment -> apply —
-  measure whether replica recompute + shipped shadow rows double-write
-  or agree.  (Blocks Q4.)
-- **POC-T3**: DISTINCT refcount delta under the one-row trigger CTE —
-  the Tier-1 identity survived joins only by deletion; check the
-  dcount identity early.  (Blocks Q5's DISTINCT lean.)
+- **POC-T1 (blocks Q1) — CLEAN.**  In a throwaway build with only the
+  refusal lifted, a REAL mview over a REAL temporal base survived a
+  1500-op storm (inserts/updates/deletes/REPLACEs): mview
+  oracle-equal at every step, history invariant (exactly one open
+  interval per live key) intact throughout, 780 commits.  Write order
+  is deterministic: base -> commit log -> history -> mview.  **The Q1
+  refusal was purely precautionary; lifting it is low-risk.**  Cost
+  characteristic: both trigger families serialize per row on the
+  write path — a temporal+mview base pays both captures per write.
+- **POC-T2 (blocks Q4) — the fork is REAL and today's applier picks
+  neither side.**  User/maintenance triggers DO fire during
+  changeset apply (measured: one firing per applied row), so a
+  replica recomputes rollups locally — AND the shipped rollup rows
+  collide with that recompute (2 conflicts measured).  A permissive
+  OMIT handler happens to converge (recompute is deterministic and
+  local capture stands down, so shipped history applies cleanly), but
+  the REAL applier refuses on conflict — a temporal mview would read
+  as false divergence today.  Also measured: plain mview storage has
+  NO PK, so it never ships — today's replication of plain mviews is
+  recompute-only BY ACCIDENT of the session no-PK skip.  **Q4 must
+  choose one writer explicitly**; see tradeoffs below.
+- **POC-T3 (blocks Q5 DISTINCT) — identity HOLDS; found a live bug on
+  the way.**  Single-table DISTINCT refcounts survived a 2000-op
+  storm with NULLs exactly (refcounts equal true multiplicities
+  throughout); cost ~43 opcodes per maintained insert.  The sharp
+  edge: REPLACE under recursive_triggers=OFF broke the refcounts —
+  and the SAME hole existed in SHIPPED Tier-1 and SHIPPED temporal
+  capture (UNIQUE-displaced rows left ghost open intervals; AS OF
+  returned states no reader saw).  **Fixed in the engine the same
+  day**: displaced rows always reach synthesized capture; user
+  delete triggers stay gated on the pragma exactly as upstream
+  (insert.c/trigger.c; pinned by ivm4.test and temporal1 section 12).
+
+## Q4 tradeoffs, made concrete by POC-T2
+
+- **Ship-and-stand-down** (extend the apply-time stand-down to mview
+  maintenance; shipped rows authoritative): one writer, byte-faithful
+  rollups and rollup-history, no recompute cost at apply.  Cost:
+  segments carry rollup rows (size), and the temporal-mview storage
+  must gain a PK so it ships at all.
+- **Recompute-and-filter** (never ship maintained tables; replicas
+  recompute during apply): smaller segments, and it matches what
+  plain mviews already do implicitly.  Cost: apply pays maintenance
+  per row; correctness leans on maintenance determinism (holds for
+  Tier 1/2 by construction); the temporal mview's HISTORY would then
+  be re-stamped locally — the seq axis matches (same commits) but it
+  must be proven, not assumed.
+- **My lean after measurement: ship-and-stand-down.**  It extends the
+  R5 principle (the stream carries the primary's truth verbatim) and
+  the blessed-pin instrument can verify it end to end; the implicit
+  recompute path for PLAIN mviews can stay as-is (it works and ships
+  nothing extra), with the stand-down scoped to TEMPORAL mviews.
 
 ## Not in scope
 

@@ -211,4 +211,47 @@ do_execsql_test 11.3 {
   SELECT k, v FROM tpk FOR SYSTEM_TIME AS OF 3 ORDER BY k;
 } {a 2 b 10}
 
+# --- REPLACE displacement reaches capture (2026-08-16) ---
+# A REPLACE-displaced row is a real deletion.  Upstream gates the
+# displaced row's DELETE triggers on PRAGMA recursive_triggers; the
+# engine's own capture is exempt (insert.c/trigger.c), while USER
+# delete triggers stay gated exactly as upstream.  Found by POC-T3's
+# sharp edge: before the fix, a UNIQUE-displaced row left a GHOST open
+# interval and AS OF returned a state that never existed (two rows
+# sharing a UNIQUE value).
+reset_db
+do_execsql_test 12.0 {
+  PRAGMA recursive_triggers=OFF;
+  CREATE TEMPORAL TABLE r(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)
+    WITH SYSTEM VERSIONING;
+  CREATE TABLE audit(msg TEXT);
+  CREATE TRIGGER r_userdel AFTER DELETE ON r BEGIN
+    INSERT INTO audit VALUES(OLD.id);
+  END;
+  INSERT INTO r VALUES(1, 'alpha', 'first');
+  REPLACE INTO r VALUES(2, 'alpha', 'second');
+  SELECT id, v, seq_from, coalesce(seq_to,'open')
+    FROM sqlite_hist_r ORDER BY seq_from, id;
+} {1 first 1 2 2 second 2 open}
+do_execsql_test 12.1 {
+  SELECT id, u FROM r FOR SYSTEM_TIME AS OF 2 ORDER BY id;
+} {2 alpha}
+do_execsql_test 12.2 {
+  SELECT count(*) FROM audit;
+} {0}
+do_execsql_test 12.3 {
+  PRAGMA recursive_triggers=ON;
+  INSERT INTO r VALUES(3, 'beta', 'x');
+  REPLACE INTO r VALUES(4, 'beta', 'y');
+  SELECT (SELECT count(*) FROM audit),
+         (SELECT count(*) FROM sqlite_hist_r
+           WHERE id=3 AND seq_to IS NOT NULL);
+} {1 1}
+# Same-PK REPLACE: the INSERT capture closes by key; still exact.
+do_execsql_test 12.4 {
+  PRAGMA recursive_triggers=OFF;
+  REPLACE INTO r VALUES(4, 'beta', 'y2');
+  SELECT count(*) FROM sqlite_hist_r WHERE id=4 AND seq_to IS NULL;
+} {1}
+
 finish_test

@@ -2211,13 +2211,25 @@ void sqlite3GenerateConstraintChecks(
   ** used to link together these tests which are separated from each other
   ** in the generate bytecode.
   */
-  if( (db->flags & (SQLITE_RecTriggers|SQLITE_ForeignKeys))==0 ){
+  if( (db->flags & (SQLITE_RecTriggers|SQLITE_ForeignKeys))==0
+   && (pTab->tabFlags & (TF_Temporal|TF_MViewBase))==0
+  ){
     /* There are not DELETE triggers nor FK constraints.  No constraint
     ** rechecks are needed. */
     pTrigger = 0;
     regTrigCnt = 0;
   }else{
-    if( db->flags&SQLITE_RecTriggers ){
+    if( (db->flags&SQLITE_RecTriggers)!=0
+     || (pTab->tabFlags & (TF_Temporal|TF_MViewBase))!=0
+    ){
+      /* Fork: a REPLACE-displaced row is a real deletion, and the
+      ** synthesized capture triggers (temporal history, mview
+      ** maintenance) MUST see it even when recursive triggers are
+      ** off -- measured 2026-08-16: a UNIQUE-displaced row left a
+      ** ghost open interval in history, and an mview kept counting a
+      ** row that no longer existed.  sqlite3CodeRowTrigger keeps USER
+      ** delete triggers gated on the pragma for this path; only the
+      ** engine's own bookkeeping is exempt. */
       pTrigger = sqlite3TriggersExist(pParse, pTab, TK_DELETE, 0, 0);
       regTrigCnt = pTrigger!=0 || sqlite3FkRequired(pParse, pTab, 0, 0);
     }else{
@@ -2498,6 +2510,9 @@ void sqlite3GenerateConstraintChecks(
     if( (ix==0 && pIdx->pNext==0)                   /* Condition 3 */
      && pPk==pIdx                                   /* Condition 2 */
      && onError==OE_Replace                         /* Condition 1 */
+     && (pTab->tabFlags & (TF_Temporal|TF_MViewBase))==0 /* fork: the
+          ** overwrite shortcut would hide the displaced row from
+          ** synthesized capture */
      && ( 0==(db->flags&SQLITE_RecTriggers) ||      /* Condition 4 */
           0==sqlite3TriggersExist(pParse, pTab, TK_DELETE, 0, 0))
      && ( 0==(db->flags&SQLITE_ForeignKeys) ||      /* Condition 5 */

@@ -1557,6 +1557,16 @@ void sqlite3CodeRowTrigger(
         ** (see triggersReallyExist) */
         continue;
       }
+      if( op==TK_DELETE && orconf==OE_Replace
+       && (pParse->db->flags & SQLITE_RecTriggers)==0
+       && !p->bMViewMaint ){
+        /* fork: this is the REPLACE-displacement cleanup path reached
+        ** only because the table carries synthesized capture (see
+        ** insert.c) -- USER delete triggers stay gated on the
+        ** recursive_triggers pragma exactly as upstream; the engine's
+        ** own bookkeeping fires regardless. */
+        continue;
+      }
       if( !p->bReturning ){
         sqlite3CodeRowTriggerDirect(pParse, p, pTab, reg, orconf, ignoreJump);
       }else if( sqlite3IsToplevel(pParse) ){
