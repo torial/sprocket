@@ -17,13 +17,19 @@
   naming CREATE TABLE ... AS SELECT ... FOR SYSTEM_TIME AS OF as the
   fix.  Sean's reasoning recorded: it would open a set of complex
   interactions that would inherently be bug-prone.
-- **Q5 PARTIAL: HAVING agreed** (read-side filter over fully-tracked
-  groups).  DISTINCT: Sean asked for a POC of DISTINCT-OVER-JOINS
-  before ruling — his motivation from practice: normalization does not
-  always map uniqueness onto the root row, so recovering entity
-  uniqueness through a join (COUNT(DISTINCT root) over a multiplying
-  join) is a real consumer shape, not a corner.  POC-T4 below.
-- **Build order after Q5 is decided** (Sean): Q1 -> Q2+Q4 -> Q5.
+- **Q5 RULED 2026-08-16: DISTINCT in, INCLUDING over joins** (POC-T4
+  measured the identity holding; Sean's consumer shape from practice —
+  normalization does not always map uniqueness onto the root row —
+  motivated the join case and the POC confirmed it).  **HAVING in**
+  (fully-tracked groups, filter applied when maintaining the visible
+  table).  SUM(DISTINCT)/AVG(DISTINCT) refused by name in v1.
+- **Build order** (Sean): Q1 -> Q2+Q4 -> Q5.  Campaign plan:
+  PLAN-IVMT.md.
+- **Campaign-tail item (Sean, 2026-08-16): an INDEX NEED ANALYZER** —
+  generalize IVM3's probe advisory into a surface that recommends
+  indices for key join/filtered tables (procs, mview definitions,
+  and/or arbitrary SQL), each recommendation carrying the runnable
+  CREATE INDEX.  Designed when reached, at campaign end.
 
 *Opened 2026-08-16 after the replication campaign closed, as the
 decision packet for DOCKET #4's remainder: Tier-3 aggregates and the
