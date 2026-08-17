@@ -81,7 +81,7 @@ do_execsql_test 2.3 {
 # Touching a dead object refuses by NAME with the retained reason.
 do_catchsql_test 2.4 {
   SELECT * FROM mv_future;
-} {1 {mv_future is present but unusable in this build (unknown materialized view option: FROBNICATION (only WITH MAINTENANCE EAGER or WITH MAINTENANCE DEFERRED is accepted)); a newer build can use or remove it}}
+} {1 {mv_future is present but unusable in this build (unknown materialized view option: FROBNICATION QUANTUM (accepted: WITH MAINTENANCE EAGER|DEFERRED, WITH SYSTEM VERSIONING)); a newer build can use or remove it}}
 do_catchsql_test 2.5 {
   SELECT * FROM tt;
 } {1 {tt is present but unusable in this build (unknown table option: WITH QUANTUM VERSIONING); a newer build can use or remove it}}

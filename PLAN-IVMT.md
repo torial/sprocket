@@ -83,6 +83,34 @@ filter applied when maintaining the visible table.
   CREATE INDEX; the IVM3 advisory generalized).  Sean rules its
   design before it is built.
 
+## Phase log
+
+- **P1 EXECUTED 2026-08-16** (commit "IVMT P1"): refusal lifted, ivmt1
+  section 1 green, REPLACE-composition pinned.
+- **P2 EXECUTED 2026-08-16** (commit "IVMT P2"): TEMPORAL MATERIALIZED
+  VIEW live -- shadow via the existing tabFlags gate, flag-derived
+  keys (COLFLAG_PRIMKEY at derivation; global aggregates key on
+  seq_from alone), pairing refusals, DROP cascade.  Sections 2-3 green
+  including the rollup replay proof, control seen red.  Scar: a
+  comment containing the two constant-family names glob-star-slash
+  terminated itself and broke the amalgamation.
+- **P3 EXECUTED 2026-08-16** (commit "IVMT P3"): bTemporalMView
+  stand-down; the mview write gate learned the apply exemption (found
+  by repl3's first contact: shipped storage rows got SQLITE_ERROR,
+  not even a conflict).  repl3 0/8 both platforms.  Gates: veryquick
+  both regimes clean except ivmt1's 17 by-design P4 reds; session
+  suite 0/19,265; Linux sweep green; degrade1-2.4's pinned option
+  message updated to the combiner's richer text (behavior unchanged).
+- **P4 NEXT -- the bench is lit**: sections 4-6 + 7.0/7.1 of ivmt1
+  are the spec (17 reds).  The work: MVIEW_COL_DCOUNT in the walk
+  (SUM/AVG(DISTINCT) refusal messages pinned at 7.0/7.1); side tables
+  sqlite_ivm_d_<view>_<n>(keycols, val, cnt) fed per POC-T4's
+  construction (join deltas via the IVM3 machinery); HAVING via a
+  fully-tracked hidden group table with the visible table carrying
+  passing groups; view_check over both layers; DROP/load/dump
+  awareness for the new side tables.  POC-T4 (tmp/poct4.tcl shape,
+  recorded in DESIGN-IVM-TEMPORAL) is the trigger-step template.
+
 ## Controls (stated before running)
 
 - ivmt1.test is written RED before P1 code; sections map to phases.
