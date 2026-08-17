@@ -861,14 +861,16 @@ static SQLITE_NOINLINE Trigger *triggersReallyExist(
     }
     do{
       if( p->bMViewMaint
-       && (pTab->tabFlags & TF_Temporal)!=0
+       && ((pTab->tabFlags & TF_Temporal)!=0 || p->bTemporalMView)
        && (pParse->db->mDbFlags & DBFLAG_TemporalMaint)!=0 ){
         /* fork: under a maintenance context (changeset apply, prune)
         ** the synthesized TEMPORAL capture triggers stand down -- an
         ** applied changeset carries the primary's history verbatim,
         ** and re-capturing it here would stamp local seqs over the
-        ** truth.  Materialized-view maintenance is NOT suppressed:
-        ** mview storage does not ship, so the replica must recompute. */
+        ** truth.  A TEMPORAL VIEW's maintenance stands down likewise
+        ** (Q4 ship-and-stand-down: its storage and history arrive in
+        ** the stream).  PLAIN mview maintenance is NOT suppressed:
+        ** that storage does not ship, so the replica must recompute. */
       }else if( p->op==op && checkColumnOverlap(p->pColumns, pChanges) ){
         mask |= p->tr_tm;
       }else if( p->op==TK_RETURNING ){
@@ -1551,10 +1553,11 @@ void sqlite3CodeRowTrigger(
      && checkColumnOverlap(p->pColumns, pChanges)
     ){
       if( p->bMViewMaint
-       && (pTab->tabFlags & TF_Temporal)!=0
+       && ((pTab->tabFlags & TF_Temporal)!=0 || p->bTemporalMView)
        && (pParse->db->mDbFlags & DBFLAG_TemporalMaint)!=0 ){
-        /* fork: maintenance context -- temporal capture stands down
-        ** (see triggersReallyExist) */
+        /* fork: maintenance context -- temporal capture and
+        ** temporal-view maintenance stand down (see
+        ** triggersReallyExist) */
         continue;
       }
       if( op==TK_DELETE && orconf==OE_Replace

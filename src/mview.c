@@ -1884,6 +1884,9 @@ void sqlite3MViewSynthTriggers(Parse *pParse, Table *pTab){
       sqlite3_free(zSql);
       if( pInfo->apTrig[3*iBase+k]==0 ) return;
       pInfo->apTrig[3*iBase+k]->bMViewMaint = 1;
+      if( pView->tabFlags & TF_Temporal ){
+        pInfo->apTrig[3*iBase+k]->bTemporalMView = 1;
+      }
     }
     /* All three built: link them into THIS base's list so every DML
     ** compile sees them (and so the xfer/truncate fast paths disable

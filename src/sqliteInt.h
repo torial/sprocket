@@ -4177,6 +4177,11 @@ struct Trigger {
   u8 bReturning;          /* This trigger implements a RETURNING clause */
   u8 bMViewMaint;         /* Synthesized materialized-view maintenance
                           ** (fork): its program may write the view */
+  u8 bTemporalMView;      /* Fork (PLAN-IVMT P3): this maintenance
+                          ** trigger's TARGET view is system-versioned,
+                          ** so it stands down during changeset apply --
+                          ** the stream ships the rollup verbatim
+                          ** (Q4: ship-and-stand-down) */
   Expr *pWhen;            /* The WHEN clause of the expression (may be NULL) */
   IdList *pColumns;       /* If this is an UPDATE OF <column-list> trigger,
                              the <column-list> is stored here */

@@ -1,0 +1,119 @@
+# 2026-08-16
+#
+# PLAN-IVMT P3 -- Q4's ruling (ship-and-stand-down) pinned: a TEMPORAL
+# materialized view replicates VERBATIM.  The stream carries the
+# rollup's storage and its history; the replica's maintenance for that
+# view STANDS DOWN during apply (firing it would collide with the
+# shipped rows -- POC-T2 measured exactly that collision).  Plain
+# mviews keep their recompute path, which is pinned here too so the
+# policy fork stays visible.
+#
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix repl3
+
+ifcapable !session {
+  finish_test
+  return
+}
+
+proc conflict_abort {args} { return "ABORT" }
+
+set SCHEMA {
+  CREATE TABLE ev(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER);
+  CREATE TEMPORAL MATERIALIZED VIEW tmv
+    WITH SYSTEM VERSIONING AS
+    SELECT g, count(*) AS n, sum(x) AS s FROM ev GROUP BY g;
+  CREATE MATERIALIZED VIEW plain AS
+    SELECT count(*) AS total FROM ev;
+}
+
+do_test 1.0 {
+  db eval $::SCHEMA
+  forcedelete repl3_replica.db
+  sqlite3 dbrep repl3_replica.db
+  dbrep eval $::SCHEMA
+  set ok 1
+} {1}
+
+# 1.1: replicate per commit; every segment must apply WITHOUT conflict
+# (the ABORT handler is the instrument: a stand-down failure collides
+# with the shipped rollup rows and aborts the apply).
+do_test 1.1 {
+  set rc ""
+  foreach txn {
+    {INSERT INTO ev VALUES(1, 1, 10)}
+    {INSERT INTO ev VALUES(2, 1, 20); INSERT INTO ev VALUES(3, 2, 5)}
+    {UPDATE ev SET x=25 WHERE id=2}
+    {DELETE FROM ev WHERE id=1}
+  } {
+    sqlite3session S db main
+    S attach *
+    db eval BEGIN
+    db eval $txn
+    db eval COMMIT
+    set cs [S changeset]
+    S delete
+    if {[catch {sqlite3changeset_apply dbrep $cs conflict_abort} msg]} {
+      set rc "APPLY FAILED: $msg"
+      break
+    }
+  }
+  set rc
+} {}
+
+# 1.2: the rollup and its ENTIRE history, value-equal
+proc tmv_dump {conn} {
+  list \
+    [$conn eval {SELECT g, n, s FROM tmv ORDER BY g}] \
+    [$conn eval {SELECT g, n, s, seq_from, coalesce(seq_to,'open')
+                 FROM sqlite_hist_tmv ORDER BY seq_from, g}] \
+    [$conn eval {SELECT seq, utc FROM sqlite_hist_commits ORDER BY seq}]
+}
+do_test 1.2 {
+  expr {[tmv_dump db] eq [tmv_dump dbrep]}
+} {1}
+
+# 1.3: AS OF answers identically on the replica -- the citation-stable
+# rollup, distributed.
+do_test 1.3 {
+  set same 1
+  for {set k 1} {$k <= 4} {incr k} {
+    set a [db eval "SELECT g,n,s FROM tmv FOR SYSTEM_TIME AS OF $k ORDER BY g"]
+    set b [dbrep eval "SELECT g,n,s FROM tmv FOR SYSTEM_TIME AS OF $k ORDER BY g"]
+    if {$a ne $b} { set same 0 }
+  }
+  set same
+} {1}
+
+# 1.4: the PLAIN mview recomputed on the replica (its storage never
+# ships -- no PK -- so agreement here proves the recompute path ran).
+do_test 1.4 {
+  list [db eval {SELECT total FROM plain}] \
+       [dbrep eval {SELECT total FROM plain}]
+} {2 2}
+
+# 2.0: CONTROL, kept forever -- corrupt one closed interval of the
+# replica's rollup history; 1.3's equality must go red, then recover.
+do_test 2.0 {
+  dbrep eval {PRAGMA writable_schema=ON}
+  dbrep eval {UPDATE sqlite_hist_tmv SET s=s+100000 WHERE seq_to IS NOT NULL}
+  dbrep eval {PRAGMA writable_schema=OFF}
+  set same 1
+  for {set k 1} {$k <= 4} {incr k} {
+    set a [db eval "SELECT g,n,s FROM tmv FOR SYSTEM_TIME AS OF $k ORDER BY g"]
+    set b [dbrep eval "SELECT g,n,s FROM tmv FOR SYSTEM_TIME AS OF $k ORDER BY g"]
+    if {$a ne $b} { set same 0 }
+  }
+  set same
+} {0}
+do_test 2.1 {
+  dbrep eval {PRAGMA writable_schema=ON}
+  dbrep eval {UPDATE sqlite_hist_tmv SET s=s-100000 WHERE s>=100000}
+  dbrep eval {PRAGMA writable_schema=OFF}
+  expr {[tmv_dump db] eq [tmv_dump dbrep]}
+} {1}
+
+dbrep close
+forcedelete repl3_replica.db
+finish_test

@@ -1062,7 +1062,7 @@ test_suite "session" -description {
   All session module related tests.
 } -files [concat \
   [glob -nocomplain $::testdir/../ext/session/*.test] \
-  [list $::testdir/repl2.test] \
+  [list $::testdir/repl2.test $::testdir/repl3.test] \
 ]
 
 test_suite "session_eec" -description {

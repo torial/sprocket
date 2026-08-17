@@ -132,6 +132,10 @@ int sqlite3IsReadOnly(Parse *pParse, Table *pTab, Trigger *pTrigger){
    && !pParse->bMViewMaintProg
    && sqlite3WritableSchema(pParse->db)==0
    && (pParse->db->mDbFlags & DBFLAG_Vacuum)==0
+   && (pParse->db->mDbFlags & DBFLAG_TemporalMaint)==0 /* fork, PLAN-IVMT
+        ** P3: changeset apply ships a temporal view's storage verbatim
+        ** -- the stream is the engine writing (plain mview storage
+        ** never ships, so this exemption is inert for it) */
   ){
     sqlite3ErrorMsg(pParse, "%s is a materialized view and is maintained "
        "by the engine; write to its base table instead", pTab->zName);
