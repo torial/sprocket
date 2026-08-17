@@ -1,5 +1,16 @@
 # DESIGN-IVM-TEMPORAL — the remaining tier, and time-travel rollups
 
+## RULINGS — Sean
+
+- **Q4 RULED 2026-08-16: ship-and-stand-down for temporal mviews.**
+  ("I'm liking your leaning as well.")  The stream carries the
+  primary's rollups and rollup-history verbatim; apply-time stand-down
+  extends to temporal-mview maintenance; temporal-mview storage gains
+  a PK so it ships.  Plain mviews stay on their recompute path, which
+  this ruling makes EXPLICIT policy rather than an accident of the
+  session's no-PK skip.
+- Q1, Q2, Q3, Q5: awaiting rulings.
+
 *Opened 2026-08-16 after the replication campaign closed, as the
 decision packet for DOCKET #4's remainder: Tier-3 aggregates and the
 temporal x mview composition (the refusal at mview.c:622 says "a
