@@ -161,10 +161,13 @@ do_execsql_test 8.3 {
   SELECT b FROM t FOR SYSTEM_TIME AS OF 2 WHERE a=1;
 } {final}
 
-# --- interactions declared in DESIGN-TEMPORAL Q7 ---
-do_catchsql_test 9.0 {
+# --- interactions declared in DESIGN-TEMPORAL Q7, superseded by
+# --- DESIGN-IVM-TEMPORAL Q1 (ruled 2026-08-16): the composition is
+# --- ACCEPTED now; ivmt1 section 1 carries the full pins.
+do_execsql_test 9.0 {
   CREATE MATERIALIZED VIEW mv AS SELECT count(*) AS n FROM t;
-} {1 {mv cannot be incrementally maintained: t is system-versioned (materialized views over temporal tables are not yet supported)}}
+  SELECT n FROM mv;
+} {1}
 
 # --- the shadow is protected like the machinery it is ---
 do_catchsql_test 9.1 {
