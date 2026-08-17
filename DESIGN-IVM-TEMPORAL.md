@@ -9,7 +9,21 @@
   a PK so it ships.  Plain mviews stay on their recompute path, which
   this ruling makes EXPLICIT policy rather than an accident of the
   session's no-PK skip.
-- Q1, Q2, Q3, Q5: awaiting rulings.
+- **Q1 RULED 2026-08-16: lift the refusal** (current-state mviews over
+  temporal bases).
+- **Q2 RULED 2026-08-16: TEMPORAL MATERIALIZED VIEW, EAGER-only in
+  v1**; DEFERRED+TEMPORAL refused by name.
+- **Q3 RULED 2026-08-16: AS OF in definitions refused permanently**,
+  naming CREATE TABLE ... AS SELECT ... FOR SYSTEM_TIME AS OF as the
+  fix.  Sean's reasoning recorded: it would open a set of complex
+  interactions that would inherently be bug-prone.
+- **Q5 PARTIAL: HAVING agreed** (read-side filter over fully-tracked
+  groups).  DISTINCT: Sean asked for a POC of DISTINCT-OVER-JOINS
+  before ruling — his motivation from practice: normalization does not
+  always map uniqueness onto the root row, so recovering entity
+  uniqueness through a join (COUNT(DISTINCT root) over a multiplying
+  join) is a real consumer shape, not a corner.  POC-T4 below.
+- **Build order after Q5 is decided** (Sean): Q1 -> Q2+Q4 -> Q5.
 
 *Opened 2026-08-16 after the replication campaign closed, as the
 decision packet for DOCKET #4's remainder: Tier-3 aggregates and the
@@ -144,6 +158,32 @@ must measure the double-write risk before this is trusted.
   day**: displaced rows always reach synthesized capture; user
   delete triggers stay gated on the pragma exactly as upstream
   (insert.c/trigger.c; pinned by ivm4.test and temporal1 section 12).
+
+## POC-T4 (2026-08-16, at Sean's request) — DISTINCT-over-joins
+
+Sean's consumer shape from practice: normalization does not always map
+uniqueness onto the root row; COUNT(DISTINCT root) over a multiplying
+join recovers entity uniqueness.  The construction probed: IVM3's
+per-base delta triggers computing the join-row delta for the one
+changed row, feeding T3's refcounts — dcounts(value, cnt) counts JOIN
+ROWS per distinct value, one HIDDEN SIDE TABLE per DISTINCT aggregate
+(per-value bookkeeping, which is exactly why it survives the join
+lesson that killed per-row hidden columns).
+
+**Verdict: the identity HOLDS over joins.**  2500-op storm — inserts,
+deletes, child-rebind updates (i.oid), counted-value updates (o.cust),
+REPLACEs, NULLs, dangling children — zero mismatches, refcounts equal
+to true multiplicities throughout, and the survival case exact (a
+value outliving one of its parents via another).  Costs: child-insert
+~52 opcodes, parent-delete ~68, counted-value update ~143 (the
+heaviest: it moves count-of-children refs between values).  The
+parent-side deltas scan the child table by join key unless indexed —
+IVM3's probe advisory (view_check emitting the runnable CREATE INDEX)
+applies unchanged.  Composition note: the engine version feeds IVM3's
+shadowed-definition delta rows (already proven exact for count(*))
+into the refcounts, so multi-table joins and arbitrary INNER
+conditions inherit that machinery rather than new algebra.
+SUM(DISTINCT)/AVG(DISTINCT): not probed, refuse by name in v1.
 
 ## Q4 tradeoffs, made concrete by POC-T2
 
