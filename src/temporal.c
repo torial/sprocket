@@ -77,16 +77,26 @@ void sqlite3TemporalEndTable(Parse *pParse, Table *pTab){
     sqlite3_str_appendf(pCols, ", PRIMARY KEY(\"%w\", seq_from)",
         pTab->aCol[pTab->iPKey].zCnName);
   }else{
-    /* Declared PK, rowid or not -- CREATE refused the PK-less case */
     Index *pPk = sqlite3PrimaryKeyIndex(pTab);
-    if( ALWAYS(pPk) ){
-      sqlite3_str_appendall(pCols, ", PRIMARY KEY(");
+    sqlite3_str_appendall(pCols, ", PRIMARY KEY(");
+    if( pPk ){
+      /* Declared PK: WITHOUT ROWID, or rowid with a non-INTEGER PK */
       for(i=0; i<pPk->nKeyCol; i++){
         sqlite3_str_appendf(pCols, "\"%w\", ",
             pTab->aCol[pPk->aiColumn[i]].zCnName);
       }
-      sqlite3_str_appendall(pCols, "seq_from)");
+    }else{
+      /* PLAN-IVMT P2: temporal mview storage -- COLFLAG_PRIMKEY-marked
+      ** key columns (possibly none: a global aggregate's shadow keys
+      ** on seq_from alone, one version live at a time). */
+      for(i=0; i<pTab->nCol; i++){
+        if( pTab->aCol[i].colFlags & COLFLAG_PRIMKEY ){
+          sqlite3_str_appendf(pCols, "\"%w\", ",
+              pTab->aCol[i].zCnName);
+        }
+      }
     }
+    sqlite3_str_appendall(pCols, "seq_from)");
   }
   zCols = sqlite3_str_finish(pCols);
   if( zCols==0 ){
@@ -117,24 +127,37 @@ void sqlite3TemporalEndTable(Parse *pParse, Table *pTab){
 ** tables key on their primary-key columns.
 */
 static void temporalKeyPred(sqlite3_str *p, Table *pTab, const char *zRef){
+  Index *pPk;
   if( HasRowid(pTab) && pTab->iPKey>=0 ){
     sqlite3_str_appendf(p, "\"%w\" = %s.\"%w\"",
         pTab->aCol[pTab->iPKey].zCnName, zRef,
         pTab->aCol[pTab->iPKey].zCnName);
-  }else{
+  }else if( (pPk = sqlite3PrimaryKeyIndex(pTab))!=0 ){
     /* A declared PRIMARY KEY -- WITHOUT ROWID, or a rowid table with a
     ** non-INTEGER PK.  (A rowid table keyed on nothing but rowid is
     ** REFUSED at CREATE: the shadow's rowids drift from the base's
     ** after the first UPDATE, and history would close the wrong
     ** versions.  Measured before it was refused.) */
-    Index *pPk = sqlite3PrimaryKeyIndex(pTab);
     int i;
-    assert( pPk!=0 );
     for(i=0; i<pPk->nKeyCol; i++){
       const char *zCol = pTab->aCol[pPk->aiColumn[i]].zCnName;
       if( i ) sqlite3_str_appendall(p, " AND ");
       sqlite3_str_appendf(p, "\"%w\" = %s.\"%w\"", zCol, zRef, zCol);
     }
+  }else{
+    /* PLAN-IVMT P2: a temporal materialized view's storage carries no
+    ** PK index; its key columns are COLFLAG_PRIMKEY-marked at column
+    ** derivation.  Zero marked columns = a global aggregate: one live
+    ** row, keyed by the empty predicate (every open interval is THE
+    ** row's). */
+    int i, n = 0;
+    for(i=0; i<pTab->nCol; i++){
+      if( (pTab->aCol[i].colFlags & COLFLAG_PRIMKEY)==0 ) continue;
+      if( n++ ) sqlite3_str_appendall(p, " AND ");
+      sqlite3_str_appendf(p, "\"%w\" = %s.\"%w\"",
+          pTab->aCol[i].zCnName, zRef, pTab->aCol[i].zCnName);
+    }
+    if( n==0 ) sqlite3_str_appendall(p, "1");
   }
 }
 

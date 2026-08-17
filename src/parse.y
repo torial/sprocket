@@ -556,10 +556,18 @@ cmd ::= createkw(B) temp(T) nm(M) VIEW ifnotexists(E) nm(Y) dbnm(Z)
         mvmaint(MM) AS(A) select(S). {
   sqlite3CreateMView(pParse, &B, &M, &Y, &Z, MM, &A, S, T, E);
 }
+// Fork (PLAN-IVMT P2): the TEMPORAL prefix versions the rollup itself.
+// The WITH options repeat (SYSTEM VERSIONING and MAINTENANCE compose),
+// accumulated as bits by sqlite3MViewWithOption.
+cmd ::= createkw(B) TEMPORAL nm(M) VIEW ifnotexists(E) nm(Y) dbnm(Z)
+        mvmaint(MM) AS(A) select(S). {
+  sqlite3CreateMView(pParse, &B, &M, &Y, &Z, MM|MVIEW_OPT_TEMPORALKW,
+                     &A, S, 0, E);
+}
 %type mvmaint {int}
 mvmaint(A) ::= . { A = MVIEW_MAINT_UNSPEC; }
-mvmaint(A) ::= WITH nm(X) nm(Y). {
-  A = sqlite3MViewMaintOption(pParse, &X, &Y);
+mvmaint(A) ::= mvmaint(X) WITH nm(N1) nm(N2). {
+  A = sqlite3MViewWithOption(pParse, X, &N1, &N2);
 }
 cmd ::= DROP nm(M) VIEW ifexists(E) fullname(X). {
   sqlite3DropMView(pParse, &M, X, E);

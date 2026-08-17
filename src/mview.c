@@ -61,27 +61,47 @@ static char *mviewLogName(sqlite3 *db, const char *zView){
 }
 
 /*
-** Grammar helper for the optional WITH MAINTENANCE clause.  The words
-** MAINTENANCE, EAGER and DEFERRED are checked identifiers, not keywords.
-** Returns one of the MVIEW_MAINT_* constants; on an unrecognized word the
-** error names what was seen and what is accepted.
+** Grammar helper for the repeatable WITH options.  MAINTENANCE, EAGER,
+** DEFERRED, SYSTEM and VERSIONING are checked identifiers, not
+** keywords.  Accumulates MVIEW_MAINT and MVIEW_OPT bits into prev; on
+** an unrecognized word the error names what was seen and what is
+** accepted; a repeated option is refused rather than silently merged.
 */
-int sqlite3MViewMaintOption(Parse *pParse, Token *pWord, Token *pValue){
-  if( pWord->n!=11 || sqlite3_strnicmp(pWord->z, "maintenance", 11)!=0 ){
-    sqlite3ErrorMsg(pParse,
-       "unknown materialized view option: %T (only WITH MAINTENANCE "
-       "EAGER or WITH MAINTENANCE DEFERRED is accepted)", pWord);
-    return MVIEW_MAINT_UNSPEC;
+int sqlite3MViewWithOption(Parse *pParse, int prev, Token *pWord,
+                           Token *pValue){
+  if( pWord->n==11 && sqlite3_strnicmp(pWord->z, "maintenance", 11)==0 ){
+    int m = MVIEW_MAINT_UNSPEC;
+    if( pValue->n==5 && sqlite3_strnicmp(pValue->z, "eager", 5)==0 ){
+      m = MVIEW_MAINT_EAGER;
+    }else if( pValue->n==8
+           && sqlite3_strnicmp(pValue->z, "deferred", 8)==0 ){
+      m = MVIEW_MAINT_DEFERRED;
+    }else{
+      sqlite3ErrorMsg(pParse,
+         "unknown MAINTENANCE mode: %T (accepted: EAGER, DEFERRED)",
+         pValue);
+      return prev;
+    }
+    if( (prev & MVIEW_OPT_MAINTMASK)!=MVIEW_MAINT_UNSPEC ){
+      sqlite3ErrorMsg(pParse, "WITH MAINTENANCE appears more than once");
+      return prev;
+    }
+    return prev | m;
   }
-  if( pValue->n==5 && sqlite3_strnicmp(pValue->z, "eager", 5)==0 ){
-    return MVIEW_MAINT_EAGER;
-  }
-  if( pValue->n==8 && sqlite3_strnicmp(pValue->z, "deferred", 8)==0 ){
-    return MVIEW_MAINT_DEFERRED;
+  if( pWord->n==6 && sqlite3_strnicmp(pWord->z, "system", 6)==0
+   && pValue->n==10 && sqlite3_strnicmp(pValue->z, "versioning", 10)==0 ){
+    if( prev & MVIEW_OPT_VERSIONED ){
+      sqlite3ErrorMsg(pParse,
+         "WITH SYSTEM VERSIONING appears more than once");
+      return prev;
+    }
+    return prev | MVIEW_OPT_VERSIONED;
   }
   sqlite3ErrorMsg(pParse,
-     "unknown MAINTENANCE mode: %T (accepted: EAGER, DEFERRED)", pValue);
-  return MVIEW_MAINT_UNSPEC;
+     "unknown materialized view option: %T %T (accepted: WITH "
+     "MAINTENANCE EAGER|DEFERRED, WITH SYSTEM VERSIONING)",
+     pWord, pValue);
+  return prev;
 }
 
 /*
@@ -1040,6 +1060,31 @@ void sqlite3CreateMView(
         "MATERIALIZED)", pMat);
     goto create_mview_fail;
   }
+  /* PLAN-IVMT P2: TEMPORAL and WITH SYSTEM VERSIONING travel together
+  ** (the temporal-table precedent), and a temporal view must be EAGER
+  ** -- deferred maintenance would version fold-times, not commit-times
+  ** (DESIGN-IVM-TEMPORAL Q2). */
+  if( (maintMode & MVIEW_OPT_TEMPORALKW)!=0
+   && (maintMode & MVIEW_OPT_VERSIONED)==0 ){
+    sqlite3ErrorMsg(pParse,
+       "CREATE TEMPORAL MATERIALIZED VIEW requires WITH SYSTEM "
+       "VERSIONING");
+    goto create_mview_fail;
+  }
+  if( (maintMode & MVIEW_OPT_TEMPORALKW)==0
+   && (maintMode & MVIEW_OPT_VERSIONED)!=0 ){
+    sqlite3ErrorMsg(pParse,
+       "WITH SYSTEM VERSIONING requires CREATE TEMPORAL MATERIALIZED "
+       "VIEW");
+    goto create_mview_fail;
+  }
+  if( (maintMode & MVIEW_OPT_TEMPORALKW)!=0
+   && (maintMode & MVIEW_OPT_MAINTMASK)==MVIEW_MAINT_DEFERRED ){
+    sqlite3ErrorMsg(pParse,
+       "a TEMPORAL materialized view must be EAGER: deferred "
+       "maintenance would version fold-times, not commit-times");
+    goto create_mview_fail;
+  }
   if( pParse->nVar>0 ){
     sqlite3ErrorMsg(pParse,
         "parameters are not allowed in materialized views");
@@ -1060,7 +1105,16 @@ void sqlite3CreateMView(
   p = pParse->pNewTable;
   if( p==0 || pParse->nErr ) goto create_mview_fail;
   p->tabFlags |= TF_MView;
-  if( maintMode==MVIEW_MAINT_DEFERRED ) p->tabFlags |= TF_MViewDeferred;
+  if( (maintMode & MVIEW_OPT_MAINTMASK)==MVIEW_MAINT_DEFERRED ){
+    p->tabFlags |= TF_MViewDeferred;
+  }
+  if( maintMode & MVIEW_OPT_TEMPORALKW ){
+    /* The storage table is system-versioned: sqlite3EndTable builds
+    ** its shadow (the tabFlags gate at its TemporalEndTable call), and
+    ** the synthesized capture fires on maintenance writes exactly as
+    ** it does on user writes to a temporal table. */
+    p->tabFlags |= TF_Temporal;
+  }
 
   sqlite3TwoPartName(pParse, pName1, pName2, &pName);
   iDb = sqlite3SchemaToIndex(db, p->pSchema);
@@ -1141,6 +1195,21 @@ void sqlite3CreateMView(
   if( mviewCheckSelect(pParse, p->zName, pSelect, aColKind,
                        azColl, azBaseCol) ){
     goto create_mview_fail;
+  }
+  /* PLAN-IVMT P2: a temporal view's key columns are marked as PRIMARY
+  ** KEY members (no PK index exists -- the ivm$key UNIQUE index is the
+  ** physical enforcer).  The flag is what the temporal shadow builder,
+  ** the capture key predicate, and session capture all read; set at
+  ** CREATE and at every load, since this code runs on both paths.  A
+  ** global aggregate has no key columns: its single row versions
+  ** through the empty key (seq_from alone keys the shadow). */
+  if( p->tabFlags & TF_Temporal ){
+    int i;
+    for(i=0; i<nVis; i++){
+      if( aColKind[i]==MVIEW_COL_KEY ){
+        p->aCol[i].colFlags |= COLFLAG_PRIMKEY;
+      }
+    }
   }
   /* Join-probe capture for the advisory: each base's plain columns in
   ** top-level equality conjuncts against another table.  Overflowing
@@ -1366,6 +1435,16 @@ void sqlite3DropMView(Parse *pParse, Token *pMat, SrcList *pName, int noErr){
         sqlite3CodeDropTable(pParse, pLog, iDb, 0);
       }
       sqlite3DbFree(db, zLog);
+    }
+    /* PLAN-IVMT P2: a temporal view's shadow and meta row leave with
+    ** it -- DROP MATERIALIZED VIEW is the one intent, so no separate
+    ** DROP TEMPORAL spelling exists for views. */
+    if( pTab->tabFlags & TF_Temporal ){
+      sqlite3NestedParse(pParse, "DROP TABLE %Q.\"sqlite_hist_%w\"",
+          db->aDb[iDb].zDbSName, pTab->zName);
+      sqlite3NestedParse(pParse,
+          "DELETE FROM %Q.sqlite_hist_meta WHERE tbl=%Q",
+          db->aDb[iDb].zDbSName, pTab->zName);
     }
   }
 

@@ -5619,10 +5619,14 @@ struct MViewInfo {
   u8 bDeferred;            /* True for WITH MAINTENANCE DEFERRED */
   u8 bTrigBuilt;           /* Maintenance triggers synthesized+attached */
 };
-/* Values returned by sqlite3MViewMaintOption / mvmaint in the grammar */
+/* Values accumulated by sqlite3MViewWithOption / mvmaint in the grammar.
+** Low two bits are the maintenance mode; higher bits are flags. */
 #define MVIEW_MAINT_UNSPEC   0    /* No WITH MAINTENANCE clause: eager */
 #define MVIEW_MAINT_EAGER    1
 #define MVIEW_MAINT_DEFERRED 2
+#define MVIEW_OPT_MAINTMASK  0x03
+#define MVIEW_OPT_VERSIONED  0x04 /* WITH SYSTEM VERSIONING appeared */
+#define MVIEW_OPT_TEMPORALKW 0x08 /* the TEMPORAL keyword appeared */
 /* What each visible column of a materialized view is, decided by the
 ** conformance walk and recorded in MViewInfo.aColKind */
 #define MVIEW_COL_KEY    0   /* GROUP BY expression or constant */
@@ -5638,7 +5642,7 @@ struct MViewInfo {
   void sqlite3CreateMView(Parse*,Token*,Token*,Token*,Token*,int,Token*,
                           Select*,int,int);
   void sqlite3DropMView(Parse*, Token*, SrcList*, int);
-  int sqlite3MViewMaintOption(Parse*, Token*, Token*);
+  int sqlite3MViewWithOption(Parse*, int, Token*, Token*);
   const char *sqlite3MViewFindDependent(sqlite3*, int, const char*);
   void sqlite3MViewHashClear(sqlite3*, Hash*);
   void sqlite3UnlinkAndDeleteMView(sqlite3*, int, const char*);

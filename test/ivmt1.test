@@ -56,8 +56,7 @@ do_execsql_test 2.0 {
     WITH SYSTEM VERSIONING AS
     SELECT g, count(*) AS n, sum(x) AS s FROM ev GROUP BY g;
   SELECT name FROM sqlite_schema WHERE name LIKE '%tmv%' ORDER BY name;
-} {sqlite_autoindex_sqlite_hist_tmv_1 sqlite_autoindex_tmv_1
-   sqlite_hist_tmv tmv}
+} {ivm$tmv$key sqlite_autoindex_sqlite_hist_tmv_1 sqlite_hist_tmv tmv}
 # one commit stamps base-cause and rollup-effect with the SAME seq
 do_execsql_test 2.1 {
   INSERT INTO ev VALUES(1, 5, 10);
@@ -145,7 +144,7 @@ do_test 3.1 {
 # must go red, then recover.
 do_test 3.2 {
   db eval {PRAGMA writable_schema=ON}
-  db eval {UPDATE sqlite_hist_tmv SET s=99999
+  db eval {UPDATE sqlite_hist_tmv SET s=s+100000
             WHERE seq_to IS NOT NULL AND g=1 AND n=2}
   db eval {PRAGMA writable_schema=OFF}
   set caught 0
@@ -156,7 +155,7 @@ do_test 3.2 {
 } {1}
 do_test 3.3 {
   db eval {PRAGMA writable_schema=ON}
-  db eval {UPDATE sqlite_hist_tmv SET s=45 WHERE s=99999}
+  db eval {UPDATE sqlite_hist_tmv SET s=s-100000 WHERE s>=100000}
   db eval {PRAGMA writable_schema=OFF}
   set nBad 0
   for {set k 1} {$k <= [llength $::WORKLOAD]} {incr k} {
